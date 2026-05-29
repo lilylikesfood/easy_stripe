@@ -3,14 +3,23 @@ from app.services.automation_service import AutomationService
 
 import os
 
+import uuid
+from datetime import datetime, timezone
+
 scheduler = BackgroundScheduler()
 
 # scheduler runs daily
 # logic runs only on June 1
 def start_scheduler(app):
     def job_wrapper():
+        run_id = str(uuid.uuid4())
+        started_at = datetime.now(timezone.utc)
+
         with app.app_context():
-            AutomationService.process_annual_increases()
+            AutomationService.process_annual_increases(
+                run_id=run_id,
+                started_at=started_at
+            )
 
     print("SCHEDULER PID:", os.getpid())
 

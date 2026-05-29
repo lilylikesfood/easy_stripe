@@ -11,7 +11,7 @@ INCREASE_PERCENTAGE = 0.03
 class PricingService:
 
     @staticmethod
-    def apply_annual_increase(subscription_id):
+    def apply_annual_increase(subscription_id, run_id, started_at):
 
         subscription = stripe.Subscription.retrieve(subscription_id)
 
@@ -28,10 +28,12 @@ class PricingService:
 
         if last_year == current_year:
             log = BillingIncreaseLog(
+                run_id=run_id,
                 subscription_id=subscription_id,
                 status="skipped",
                 reason="already applied this year",
-                created_at=datetime.now(timezone.utc)
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
             )
 
             db.session.add(log)
@@ -129,14 +131,23 @@ class PricingService:
             # 8. WRITE SUCCESS LOG
             # -----------------------------
             log = BillingIncreaseLog(
+                run_id=run_id,
                 subscription_id=subscription_id,
+                customer_id=subscription["customer"],
+                product_id=product_id,
+
                 stripe_price_id_old=current_price_id,
                 stripe_price_id_new=new_price.id,
+
                 old_amount=current_amount,
                 new_amount=new_amount,
+                increase_percentage=INCREASE_PERCENTAGE,
+
                 status="success",
-                reason=None,
-                created_at=datetime.now(timezone.utc)
+                reason="price increased successfully by 3%",
+
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
             )
 
             db.session.add(log)
@@ -150,10 +161,12 @@ class PricingService:
             }
 
         log = BillingIncreaseLog(
+            run_id=run_id,
             subscription_id=subscription_id,
             status="skipped",
             reason="no increaseable item found",
-            created_at=datetime.now(timezone.utc)
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc),
         )
 
         db.session.add(log)

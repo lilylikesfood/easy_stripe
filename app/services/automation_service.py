@@ -7,7 +7,7 @@ from datetime import datetime,timezone
 class AutomationService:
 
     @staticmethod
-    def process_annual_increases():
+    def process_annual_increases(run_id, started_at):
         print("🔥 JOB TRIGGERED")
 
         stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
@@ -30,7 +30,9 @@ class AutomationService:
             try:
 
                 result = PricingService.apply_annual_increase(
-                    subscription.id
+                    subscription.id,
+                    run_id=run_id,
+                    started_at=started_at
                 )
 
                 if result["status"] == "skipped":
