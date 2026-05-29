@@ -14,6 +14,8 @@ from app.extensions import db
 
 from app.models.contract import Contract
 
+from app.models.billing_log import BillingIncreaseLog
+
 main = Blueprint("main", __name__)
 
 
@@ -129,3 +131,26 @@ def contracts():
         })
 
     return data
+
+# billing-dashboard
+@main.route("/billing-dashboard")
+def billing_dashboard():
+
+    logs = BillingIncreaseLog.query.order_by(
+        BillingIncreaseLog.created_at.desc()
+    ).all()
+
+    return {
+        "total": len(logs),
+        "logs": [
+            {
+                "subscription_id": l.subscription_id,
+                "old_amount": l.old_amount,
+                "new_amount": l.new_amount,
+                "status": l.status,
+                "reason": l.reason,
+                "created_at": str(l.created_at)
+            }
+            for l in logs
+        ]
+    }

@@ -19,12 +19,14 @@ def start_scheduler(app):
         func=job_wrapper,
         # Run this job based on a time schedule (like a calendar rule)
         # trigger="cron",
+        # month=6,
+        # day=1,
         # hour=0,
         # minute=5,
         id="annual_increase_job",
         # testing
         trigger="interval",
-        seconds=10,
+        seconds=20,
     )
 
     print("REGISTERED JOBS:", scheduler.get_jobs())

@@ -1,6 +1,9 @@
 import stripe
 
-from datetime import date
+from datetime import date,datetime, timezone
+
+from app.models.billing_log import BillingIncreaseLog
+from app.extensions import db
 
 INCREASE_PERCENTAGE = 0.03
 
@@ -24,6 +27,15 @@ class PricingService:
         current_year = str(date.today().year)
 
         if last_year == current_year:
+            log = BillingIncreaseLog(
+                subscription_id=subscription_id,
+                status="skipped",
+                reason="already applied this year",
+                created_at=datetime.now(timezone.utc)
+            )
+
+            db.session.add(log)
+            db.session.commit()
 
             return {
                 "status": "skipped",
@@ -113,12 +125,39 @@ class PricingService:
                 }
             )
 
+            # -----------------------------
+            # 8. WRITE SUCCESS LOG
+            # -----------------------------
+            log = BillingIncreaseLog(
+                subscription_id=subscription_id,
+                stripe_price_id_old=current_price_id,
+                stripe_price_id_new=new_price.id,
+                old_amount=current_amount,
+                new_amount=new_amount,
+                status="success",
+                reason=None,
+                created_at=datetime.now(timezone.utc)
+            )
+
+            db.session.add(log)
+            db.session.commit()
+
             return {
                 "status": "success",
                 "old_amount": current_amount,
                 "new_amount": new_amount,
                 "new_price_id": new_price.id
             }
+
+        log = BillingIncreaseLog(
+            subscription_id=subscription_id,
+            status="skipped",
+            reason="no increaseable item found",
+            created_at=datetime.now(timezone.utc)
+        )
+
+        db.session.add(log)
+        db.session.commit()
 
         # No increaseable item found
         return {
