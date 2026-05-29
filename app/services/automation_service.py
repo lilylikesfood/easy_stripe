@@ -1,58 +1,45 @@
-from datetime import date
-from dateutil.relativedelta import relativedelta
-
-from app.extensions import db
-
-from app.models.contract import Contract
+import stripe
 
 from app.services.pricing_service import PricingService
-
 from flask import current_app
-import stripe
 
 
 class AutomationService:
 
     @staticmethod
     def process_annual_increases():
+        stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
-        today = date.today()
+        subscriptions = stripe.Subscription.list(
+            status="active",
+            limit=100
+        )
 
-        contracts = Contract.query.filter(
-            Contract.contract_active == True,
-            Contract.annual_increase_date <= today
-        ).all()
-
-        for contract in contracts:
+        for subscription in subscriptions.auto_paging_iter():
 
             try:
 
                 result = PricingService.apply_annual_increase(
-                    contract.stripe_subscription_id
+                    subscription.id
                 )
 
                 if result["status"] == "skipped":
-                    print(f"SKIPPED: {contract.stripe_subscription_id}")
+
+                    print(
+                        f"SKIPPED: {subscription.id} "
+                        f"({result['reason']})"
+                    )
+
                     continue
 
-                contract.annual_increase_date = (
-                    contract.annual_increase_date
-                    + relativedelta(years=1)
-                )
-
-                db.session.commit()
-
                 print(
-                    f"SUCCESS: Increased subscription "
-                    f"{contract.stripe_subscription_id} "
-                    f"from {result['old_amount']} "
-                    f"to {result['new_amount']}"
+                    f"SUCCESS: {subscription.id} "
+                    f"{result['old_amount']} "
+                    f"→ {result['new_amount']}"
                 )
 
             except Exception as e:
-
-                db.session.rollback()
-
-                print(
-                    f"ERROR processing contract {contract.id}: {str(e)}"
-                )
+                print("========== ERROR ==========")
+                print(type(e))
+                print(e)
+                print("===========================")

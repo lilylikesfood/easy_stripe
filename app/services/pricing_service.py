@@ -15,9 +15,11 @@ class PricingService:
         # -----------------------------
         # 1. IDEMPOTENCY CHECK
         # -----------------------------
-        metadata = subscription.get("metadata", {})
+        metadata = subscription["metadata"] or {}
 
-        last_year = metadata.get("last_increase_year")
+        last_year = metadata["last_increase_year"] \
+            if "last_increase_year" in metadata \
+            else None
 
         current_year = str(date.today().year)
 
@@ -41,10 +43,13 @@ class PricingService:
 
             product = stripe.Product.retrieve(product_id)
 
-            increaseable = product.get(
-                "metadata",
-                {}
-            ).get("increaseable")
+            product_metadata = product["metadata"] or {}
+
+            increaseable = (
+                product_metadata["increaseable"]
+                if "increaseable" in product_metadata
+                else None
+            )
 
             # Skip non-increaseable items
             if increaseable != "true":
@@ -104,7 +109,6 @@ class PricingService:
                 subscription_id,
 
                 metadata={
-                    **metadata,
                     "last_increase_year": current_year
                 }
             )
