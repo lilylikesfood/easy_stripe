@@ -27,8 +27,8 @@ def home():
 def test_stripe():
 
     customer = create_customer(
-        name="Test Customer",
-        email="test@example.com"
+        name="529finaljen",
+        email="529finaljen@example.com"
     )
 
     return {

@@ -2,13 +2,23 @@ import stripe
 
 from app.services.pricing_service import PricingService
 from flask import current_app
-
+from datetime import datetime,timezone
 
 class AutomationService:
 
     @staticmethod
     def process_annual_increases():
+        print("🔥 JOB TRIGGERED")
+
         stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+        now= datetime.now(timezone.utc)
+
+        # ONLY RUN ON JUNE 1
+        # if now.month != 6 or now.day != 1:
+        if False:
+            print("SKIPPED: not June 1")
+            return
 
         subscriptions = stripe.Subscription.list(
             status="active",

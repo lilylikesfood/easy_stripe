@@ -23,6 +23,6 @@ def create_app():
 
     app.register_blueprint(main)
 
-    start_scheduler()
+    start_scheduler(app)
 
     return app
