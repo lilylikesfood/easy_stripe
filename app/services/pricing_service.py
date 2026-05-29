@@ -95,8 +95,13 @@ class PricingService:
                 currency=current_price["currency"],
                 recurring={"interval": "month"},
                 product=current_price["product"],
+                
                 metadata={
-                    "annual_increase": "true"
+                    "annual_increase": "true",
+                    "increase_year": current_year,
+                    "previous_price_id": current_price_id,
+                    "source_subscription": subscription_id,
+                    "run_id": run_id
                 }
             )
 
