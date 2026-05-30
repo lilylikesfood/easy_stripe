@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Billing Dashboard</title>
+    <style>
+        body {
+            font-family: Arial;
+            margin: 20px;
+            background: #f7f7f7;
+        }
+
+        h1 {
+            margin-bottom: 20px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+        }
+
+        th, td {
+            padding: 12px;
+            border-bottom: 1px solid #eee;
+            text-align: left;
+            font-size: 14px;
+        }
+
+        th {
+            background: #111827;
+            color: white;
+        }
+
+        .success { color: green; font-weight: bold; }
+        .skipped { color: #999; }
+        .failed { color: red; font-weight: bold; }
+    </style>
+</head>
+
+<body>
+
+<h1>Billing Dashboard</h1>
+
+<div style="display:flex; gap:15px; margin-bottom:20px;">
+
+    <div style="background:white; padding:15px; flex:1;">
+        <h3>Total</h3>
+        <p>{{ stats.total }}</p>
+    </div>
+
+    <div style="background:white; padding:15px; flex:1;">
+        <h3>Success</h3>
+        <p style="color:green;">{{ stats.success }}</p>
+    </div>
+
+    <div style="background:white; padding:15px; flex:1;">
+        <h3>Skipped</h3>
+        <p style="color:gray;">{{ stats.skipped }}</p>
+    </div>
+
+    <div style="background:white; padding:15px; flex:1;">
+        <h3>Failed</h3>
+        <p style="color:red;">{{ stats.failed }}</p>
+    </div>
+
+</div>
+
+<table>
+    <thead>
+        <tr>
+            <th>Time</th>
+            <th>Run ID</th>
+            <th>Subscription</th>
+            <th>Product</th>
+            <th>Status</th>
+            <th>Old Price</th>
+            <th>New Price</th>
+        </tr>
+    </thead>
+
+    <tbody>
+        {% for log in logs %}
+        <tr>
+            <td>{{ log.created_at }}</td>
+            <td>{{ log.run_id }}</td>
+            <td>{{ log.subscription_id }}</td>
+            <td>{{ log.product_id }}</td>
+
+            <td>
+                {% if log.status == "success" %}
+                    <span class="success">SUCCESS</span>
+                {% elif log.status == "skipped" %}
+                    <span class="skipped">SKIPPED</span>
+                {% else %}
+                    <span class="failed">FAILED</span>
+                {% endif %}
+            </td>
+
+            <td>${{ log.old_amount / 100 if log.old_amount is not none else "-" }}</td>
+            <td>${{ log.new_amount / 100 if log.new_amount is not none else "-" }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+</body>
+</html>

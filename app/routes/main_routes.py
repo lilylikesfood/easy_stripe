@@ -1,4 +1,4 @@
-from flask import Blueprint
+from flask import Blueprint, render_template
 from app.services.stripe_service import create_customer
 
 from app.services.automation_service import AutomationService
@@ -135,22 +135,15 @@ def contracts():
 # billing-dashboard
 @main.route("/billing-dashboard")
 def billing_dashboard():
-
     logs = BillingIncreaseLog.query.order_by(
         BillingIncreaseLog.created_at.desc()
-    ).all()
+    ).limit(200).all()
 
-    return {
+    stats = {
         "total": len(logs),
-        "logs": [
-            {
-                "subscription_id": l.subscription_id,
-                "old_amount": l.old_amount,
-                "new_amount": l.new_amount,
-                "status": l.status,
-                "reason": l.reason,
-                "created_at": str(l.created_at)
-            }
-            for l in logs
-        ]
+        "success": len([l for l in logs if l.status == "success"]),
+        "skipped": len([l for l in logs if l.status == "skipped"]),
+        "failed": len([l for l in logs if l.status == "failed"]),
     }
+
+    return render_template("billing_dashboard.html", logs=logs, stats=stats)
