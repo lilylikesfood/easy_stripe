@@ -160,6 +160,7 @@ def billing_dashboard():
 
 # admin dashboard
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+# print("ADMIN PASSWORD:", os.getenv("ADMIN_PASSWORD"))
 
 @main.route("/login", methods=["GET", "POST"])
 def login():
