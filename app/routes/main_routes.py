@@ -16,6 +16,8 @@ from app.models.contract import Contract
 
 from app.models.billing_log import BillingIncreaseLog
 
+import os
+
 main = Blueprint("main", __name__)
 
 
@@ -157,7 +159,7 @@ def billing_dashboard():
     )
 
 # admin dashboard
-ADMIN_PASSWORD = "secret123"
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
 @main.route("/login", methods=["GET", "POST"])
 def login():
@@ -172,3 +174,10 @@ def login():
         return "Wrong password", 403
 
     return render_template("login.html")
+
+# logout 
+@main.route("/logout")
+def logout():
+    session.clear()
+
+    return redirect("/login")

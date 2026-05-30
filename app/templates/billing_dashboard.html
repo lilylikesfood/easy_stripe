@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!-- <!DOCTYPE html>
 <html>
 <head>
     <title>Billing Dashboard</title>
@@ -41,25 +41,40 @@
 
 <h1>Billing Dashboard</h1>
 
+<div style="background:#111827;color:white;padding:20px;margin-bottom:20px;border-radius:10px;">
+    <h2>June 1 Price Increase</h2>
+
+    <p>
+        Status:
+        {% if stats.failed == 0 %}
+            <b style="color:lightgreen;">SUCCESS</b>
+        {% else %}
+            <b style="color:red;">ISSUES DETECTED</b>
+        {% endif %}
+    </p>
+
+    <p>Total subscriptions processed: {{ stats.total }}</p>
+</div>
+
 <div style="display:flex; gap:15px; margin-bottom:20px;">
 
     <div style="background:white; padding:15px; flex:1;">
-        <h3>Total</h3>
+        <h3>Total Items Processed</h3>
         <p>{{ stats.total }}</p>
     </div>
 
     <div style="background:white; padding:15px; flex:1;">
-        <h3>Success</h3>
+        <h3>Prices Successfully Updated</h3>
         <p style="color:green;">{{ stats.success }}</p>
     </div>
 
     <div style="background:white; padding:15px; flex:1;">
-        <h3>Skipped</h3>
+        <h3>Skipped (Not Eligible)</h3>
         <p style="color:gray;">{{ stats.skipped }}</p>
     </div>
 
     <div style="background:white; padding:15px; flex:1;">
-        <h3>Failed</h3>
+        <h3>Failed Updates</h3>
         <p style="color:red;">{{ stats.failed }}</p>
     </div>
 
@@ -102,6 +117,265 @@
         {% endfor %}
     </tbody>
 </table>
+
+</body>
+</html> -->
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Billing Dashboard</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 30px;
+            background: #f5f7fa;
+        }
+
+        h1 {
+            margin-bottom: 20px;
+        }
+
+        .banner {
+            background: #111827;
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 25px;
+        }
+
+        .cards {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+
+        .card {
+            flex: 1;
+            background: white;
+            padding: 15px;
+            border-radius: 10px;
+            box-shadow: 0 1px 4px rgba(0,0,0,.08);
+        }
+
+        .card h3 {
+            margin-top: 0;
+            font-size: 16px;
+        }
+
+        .card p {
+            font-size: 28px;
+            margin: 10px 0;
+            font-weight: bold;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 1px 4px rgba(0,0,0,.08);
+        }
+
+        th {
+            background: #111827;
+            color: white;
+            padding: 12px;
+            text-align: left;
+        }
+
+        td {
+            padding: 12px;
+            border-bottom: 1px solid #eee;
+        }
+
+        .badge-success {
+            background: #16a34a;
+            color: white;
+            padding: 4px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .badge-skipped {
+            background: #6b7280;
+            color: white;
+            padding: 4px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .badge-failed {
+            background: #dc2626;
+            color: white;
+            padding: 4px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .price-change {
+            color: #16a34a;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .small-text {
+            color: #666;
+            font-size: 12px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>Annual Billing Increase Dashboard</h1>
+
+    <div style="text-align:right; margin-bottom:20px;">
+        <a href="/logout">
+            <button
+                style="
+                    padding:10px 15px;
+                    background:#dc2626;
+                    color:white;
+                    border:none;
+                    border-radius:6px;
+                    cursor:pointer;
+                ">
+                Logout
+            </button>
+        </a>
+    </div>
+
+    <div class="banner">
+        <h2>June 1 Annual Increase Status</h2>
+
+        {% if stats.failed == 0 %}
+            <p style="color:lightgreen;font-size:20px;">
+                ✓ SUCCESS - No failures detected
+            </p>
+        {% else %}
+            <p style="color:#ff8a8a;font-size:20px;">
+                ⚠ ISSUES DETECTED - Review failed items below
+            </p>
+        {% endif %}
+
+        <p>
+            Total billing records processed:
+            <strong>{{ stats.total }}</strong>
+        </p>
+    </div>
+
+    <div class="cards">
+
+        <div class="card">
+            <h3>Total Items Processed</h3>
+            <p>{{ stats.total }}</p>
+        </div>
+
+        <div class="card">
+            <h3>Successfully Updated</h3>
+            <p style="color:#16a34a;">
+                {{ stats.success }}
+            </p>
+        </div>
+
+        <div class="card">
+            <h3>Skipped</h3>
+            <p style="color:#6b7280;">
+                {{ stats.skipped }}
+            </p>
+            <div class="small-text">
+                Not eligible for annual increase
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Failed</h3>
+            <p style="color:#dc2626;">
+                {{ stats.failed }}
+            </p>
+        </div>
+
+    </div>
+
+    <table>
+
+        <thead>
+            <tr>
+                <th>Time</th>
+                <th>Status</th>
+                <th>Subscription</th>
+                <th>Product</th>
+                <th>Price Change</th>
+            </tr>
+        </thead>
+
+        <tbody>
+
+        {% for log in logs %}
+        <tr>
+
+            <td>
+                {{ log.created_at }}
+            </td>
+
+            <td>
+
+                {% if log.status == "success" %}
+                    <span class="badge-success">
+                        SUCCESS
+                    </span>
+
+                {% elif log.status == "skipped" %}
+                    <span class="badge-skipped">
+                        SKIPPED
+                    </span>
+
+                {% else %}
+                    <span class="badge-failed">
+                        FAILED
+                    </span>
+                {% endif %}
+
+            </td>
+
+            <td>
+                {{ log.subscription_id }}
+            </td>
+
+            <td>
+                {{ log.product_id }}
+            </td>
+
+            <td>
+
+                {% if log.old_amount is not none and log.new_amount is not none %}
+
+                    ${{ log.old_amount / 100 }}
+                    →
+                    ${{ log.new_amount / 100 }}
+
+                    <div class="price-change">
+                        +3% Increase Applied
+                    </div>
+
+                {% else %}
+                    -
+                {% endif %}
+
+            </td>
+
+        </tr>
+        {% endfor %}
+
+        </tbody>
+
+    </table>
 
 </body>
 </html>
