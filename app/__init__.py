@@ -4,11 +4,15 @@ from app.extensions import db, migrate
 
 from app.services.stripe_service import init_stripe
 
+import os
+
 def create_app():
 
     app = Flask(__name__)
 
     app.config.from_object(Config)
+
+    app.secret_key = os.getenv("SECRET_KEY", "dev-key")
 
     db.init_app(app)
     migrate.init_app(app, db)

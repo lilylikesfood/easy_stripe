@@ -1,4 +1,4 @@
-from flask import Blueprint, render_template
+from flask import Blueprint, render_template, request, session, redirect
 from app.services.stripe_service import create_customer
 
 from app.services.automation_service import AutomationService
@@ -135,6 +135,10 @@ def contracts():
 # billing-dashboard
 @main.route("/billing-dashboard")
 def billing_dashboard():
+
+    if not session.get("logged_in"):
+        return redirect("/login")
+
     logs = BillingIncreaseLog.query.order_by(
         BillingIncreaseLog.created_at.desc()
     ).limit(200).all()
@@ -146,4 +150,25 @@ def billing_dashboard():
         "failed": len([l for l in logs if l.status == "failed"]),
     }
 
-    return render_template("billing_dashboard.html", logs=logs, stats=stats)
+    return render_template(
+        "billing_dashboard.html",
+        logs=logs,
+        stats=stats
+    )
+
+# admin dashboard
+ADMIN_PASSWORD = "secret123"
+
+@main.route("/login", methods=["GET", "POST"])
+def login():
+
+    if request.method == "POST":
+        password = request.form.get("password")
+
+        if password == ADMIN_PASSWORD:
+            session["logged_in"] = True
+            return redirect("/billing-dashboard")
+
+        return "Wrong password", 403
+
+    return render_template("login.html")
