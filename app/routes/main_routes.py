@@ -146,10 +146,10 @@ def billing_dashboard():
     ).limit(200).all()
 
     stats = {
-        "total": len(logs),
-        "success": len([l for l in logs if l.status == "success"]),
-        "skipped": len([l for l in logs if l.status == "skipped"]),
-        "failed": len([l for l in logs if l.status == "failed"]),
+        "total": BillingIncreaseLog.query.count(),
+        "success": BillingIncreaseLog.query.filter_by(status="success").count(),
+        "skipped": BillingIncreaseLog.query.filter_by(status="skipped").count(),
+        "failed": BillingIncreaseLog.query.filter_by(status="failed").count(),
     }
 
     return render_template(

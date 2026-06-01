@@ -9,7 +9,11 @@ from datetime import datetime, timezone
 import atexit
 from threading import Lock
 
-scheduler = BackgroundScheduler()
+import pytz
+
+TORONTO_TZ= pytz.timezone("America/Toronto")
+
+scheduler = BackgroundScheduler(timezone=TORONTO_TZ)
 
 atexit.register(lambda: scheduler.shutdown())
 
@@ -35,15 +39,15 @@ def start_scheduler(app):
     scheduler.add_job(
         func=job_wrapper,
         # Run this job based on a time schedule (like a calendar rule)
-        # trigger="cron",
-        # month=6,
-        # day=1,
-        # hour=0,
-        # minute=5,
+        trigger="cron",
+        month=6,
+        day=1,
+        hour=0,
+        minute=5,
         id="annual_increase_job",
         # testing
-        trigger="interval",
-        seconds=20,
+        # trigger="interval",
+        # seconds=20,
     )
 
     print("REGISTERED JOBS:", scheduler.get_jobs())
