@@ -22,6 +22,8 @@ import uuid
 
 from app.models.schedule_repair_log import ScheduleRepairLog
 
+from app.services.pricing_service import PricingService
+
 main = Blueprint("main", __name__)
 
 
@@ -397,82 +399,91 @@ def diagnose_schedule_rollbacks():
 
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
+    billable_statuses = [
+        "active",
+        "past_due",
+        "unpaid"
+    ]
+
     results = []
     checked = 0
     with_schedule = 0
     rollback_risk = 0
 
-    subscriptions = stripe.Subscription.list(
-        status="active",
-        limit=100
-    )
+    for status in billable_statuses:
 
-    for subscription in subscriptions.auto_paging_iter():
-        checked += 1
+        subscriptions = stripe.Subscription.list(
+            status=status,
+            limit=100
+        )
 
-        schedule_id = subscription["schedule"] if "schedule" in subscription else None
+        for subscription in subscriptions.auto_paging_iter():
+            checked += 1
 
-        if not schedule_id:
-            continue
+            schedule_id = subscription["schedule"] if "schedule" in subscription else None
 
-        with_schedule += 1
+            if not schedule_id:
+                continue
 
-        schedule = stripe.SubscriptionSchedule.retrieve(schedule_id)
+            with_schedule += 1
 
-        # current increaseable product -> current price amount
-        current_amount_by_product = {}
+            schedule = stripe.SubscriptionSchedule.retrieve(schedule_id)
 
-        for sub_item in subscription["items"]["data"]:
-            current_price = sub_item["price"]
-            product = stripe.Product.retrieve(current_price["product"])
+            current_amount_by_product = {}
 
-            increaseable = (
-                product["metadata"]["increaseable"]
-                if "increaseable" in product["metadata"]
-                else None
-            )
+            for sub_item in subscription["items"]["data"]:
+                current_price = sub_item["price"]
+                product = stripe.Product.retrieve(current_price["product"])
 
-            if str(increaseable).lower() == "true":
-                current_amount_by_product[current_price["product"]] = {
-                    "price_id": current_price["id"],
-                    "unit_amount": current_price["unit_amount"],
-                    "product_name": product["name"]
-                }
+                increaseable = (
+                    product["metadata"]["increaseable"]
+                    if "increaseable" in product["metadata"]
+                    else None
+                )
 
-        risks = []
+                if str(increaseable).lower() == "true":
+                    current_amount_by_product[current_price["product"]] = {
+                        "price_id": current_price["id"],
+                        "unit_amount": current_price["unit_amount"],
+                        "product_name": product["name"]
+                    }
 
-        for phase in schedule["phases"]:
-            for item in phase["items"]:
-                phase_price = stripe.Price.retrieve(item["price"])
-                product_id = phase_price["product"]
+            risks = []
 
-                if product_id not in current_amount_by_product:
-                    continue
+            for phase in schedule["phases"]:
+                for item in phase["items"]:
+                    phase_price = stripe.Price.retrieve(item["price"])
+                    product_id = phase_price["product"]
 
-                current_info = current_amount_by_product[product_id]
+                    if product_id not in current_amount_by_product:
+                        continue
 
-                if phase_price["unit_amount"] < current_info["unit_amount"]:
-                    risks.append({
-                        "phase_start": phase["start_date"],
-                        "phase_end": phase["end_date"],
-                        "product_name": current_info["product_name"],
-                        "current_price_id": current_info["price_id"],
-                        "current_amount": current_info["unit_amount"],
-                        "phase_price_id": phase_price["id"],
-                        "phase_amount": phase_price["unit_amount"]
-                    })
+                    current_info = current_amount_by_product[product_id]
 
-        if risks:
-            rollback_risk += 1
-            results.append({
-                "subscription_id": subscription["id"],
-                "customer_id": subscription["customer"],
-                "schedule_id": schedule_id,
-                "risks": risks
-            })
+                    if phase_price["unit_amount"] < current_info["unit_amount"]:
+                        risks.append({
+                            "phase_start": phase["start_date"],
+                            "phase_end": phase["end_date"],
+                            "product_name": current_info["product_name"],
+                            "current_price_id": current_info["price_id"],
+                            "current_amount": current_info["unit_amount"],
+                            "phase_price_id": phase_price["id"],
+                            "phase_amount": phase_price["unit_amount"]
+                        })
+
+            if risks:
+                rollback_risk += 1
+                results.append({
+                    "subscription_id": subscription["id"],
+                    "customer_id": subscription["customer"],
+                    "status": subscription["status"],
+                    "schedule_id": schedule_id,
+                    "risks": risks
+                })
 
     return {
         "checked": checked,
+        "billable_statuses_checked": billable_statuses,
         "with_schedule": with_schedule,
         "rollback_risk": rollback_risk,
         "results": results
@@ -755,4 +766,567 @@ def schedule_repair_logs():
             }
             for log in logs
         ]
+    }
+
+# diagnostic route that scans all subscriptions
+@main.route("/admin/schedule-health-check")
+def schedule_health_check():
+
+    if not session.get("logged_in"):
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    checked = 0
+    with_schedule = 0
+
+    issue_counts = {
+        "no_schedule": 0,
+        "rollback_risk": 0,
+        "no_phases": 0,
+        "empty_phase_items": 0,
+        "future_phase_missing_increaseable_product": 0,
+        "wrong_number_of_increaseable_items": 0,
+        "schedule_not_active": 0,
+    }
+
+    issues = []
+
+    subscriptions = stripe.Subscription.list(
+        status="active",
+        limit=100
+    )
+
+    for subscription in subscriptions.auto_paging_iter():
+        checked += 1
+
+        subscription_id = subscription["id"]
+        customer_id = subscription["customer"]
+
+        schedule_id = subscription["schedule"] if "schedule" in subscription else None
+
+        if not schedule_id:
+            issue_counts["no_schedule"] += 1
+            issues.append({
+                "subscription_id": subscription_id,
+                "customer_id": customer_id,
+                "issue": "no_schedule",
+                "message": "Active subscription has no subscription schedule"
+            })
+            continue
+
+        with_schedule += 1
+
+        try:
+            schedule = stripe.SubscriptionSchedule.retrieve(schedule_id)
+
+            if schedule["status"] != "active":
+                issue_counts["schedule_not_active"] += 1
+                issues.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "schedule_id": schedule_id,
+                    "issue": "schedule_not_active",
+                    "status": schedule["status"]
+                })
+
+            phases = schedule["phases"] if "phases" in schedule else []
+
+            if not phases:
+                issue_counts["no_phases"] += 1
+                issues.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "schedule_id": schedule_id,
+                    "issue": "no_phases",
+                    "message": "Schedule has no phases"
+                })
+                continue
+
+            # Current subscription increaseable products
+            current_increaseable_by_product = {}
+
+            for sub_item in subscription["items"]["data"]:
+                current_price = sub_item["price"]
+                product = stripe.Product.retrieve(current_price["product"])
+
+                increaseable = (
+                    product["metadata"]["increaseable"]
+                    if "increaseable" in product["metadata"]
+                    else None
+                )
+
+                if str(increaseable).lower() == "true":
+                    current_increaseable_by_product[current_price["product"]] = {
+                        "price_id": current_price["id"],
+                        "amount": current_price["unit_amount"],
+                        "product_name": product["name"]
+                    }
+
+            if len(current_increaseable_by_product) != 1:
+                issue_counts["wrong_number_of_increaseable_items"] += 1
+                issues.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "schedule_id": schedule_id,
+                    "issue": "wrong_number_of_increaseable_items",
+                    "count": len(current_increaseable_by_product),
+                    "message": "Expected exactly one increaseable monthly fee item on current subscription"
+                })
+
+            for phase in phases:
+                phase_items = phase["items"] if "items" in phase else []
+
+                if not phase_items:
+                    issue_counts["empty_phase_items"] += 1
+                    issues.append({
+                        "subscription_id": subscription_id,
+                        "customer_id": customer_id,
+                        "schedule_id": schedule_id,
+                        "issue": "empty_phase_items",
+                        "phase_start": phase["start_date"] if "start_date" in phase else None,
+                        "phase_end": phase["end_date"] if "end_date" in phase else None
+                    })
+                    continue
+
+                phase_increaseable_count = 0
+
+                for item in phase_items:
+                    phase_price = stripe.Price.retrieve(item["price"])
+                    product_id = phase_price["product"]
+
+                    product = stripe.Product.retrieve(product_id)
+
+                    increaseable = (
+                        product["metadata"]["increaseable"]
+                        if "increaseable" in product["metadata"]
+                        else None
+                    )
+
+                    if str(increaseable).lower() == "true":
+                        phase_increaseable_count += 1
+
+                        if product_id not in current_increaseable_by_product:
+                            issue_counts["future_phase_missing_increaseable_product"] += 1
+                            issues.append({
+                                "subscription_id": subscription_id,
+                                "customer_id": customer_id,
+                                "schedule_id": schedule_id,
+                                "issue": "future_phase_missing_increaseable_product",
+                                "phase_price_id": phase_price["id"],
+                                "product_id": product_id,
+                                "message": "Future phase has increaseable product not found on current subscription"
+                            })
+                            continue
+
+                        current_info = current_increaseable_by_product[product_id]
+
+                        if phase_price["unit_amount"] < current_info["amount"]:
+                            issue_counts["rollback_risk"] += 1
+                            issues.append({
+                                "subscription_id": subscription_id,
+                                "customer_id": customer_id,
+                                "schedule_id": schedule_id,
+                                "issue": "rollback_risk",
+                                "current_price_id": current_info["price_id"],
+                                "current_amount": current_info["amount"],
+                                "phase_price_id": phase_price["id"],
+                                "phase_amount": phase_price["unit_amount"],
+                                "phase_start": phase["start_date"] if "start_date" in phase else None,
+                                "phase_end": phase["end_date"] if "end_date" in phase else None
+                            })
+
+                if phase_increaseable_count != len(current_increaseable_by_product):
+                    issue_counts["future_phase_missing_increaseable_product"] += 1
+                    issues.append({
+                        "subscription_id": subscription_id,
+                        "customer_id": customer_id,
+                        "schedule_id": schedule_id,
+                        "issue": "future_phase_missing_increaseable_product",
+                        "phase_start": phase["start_date"] if "start_date" in phase else None,
+                        "phase_end": phase["end_date"] if "end_date" in phase else None,
+                        "expected_count": len(current_increaseable_by_product),
+                        "actual_count": phase_increaseable_count,
+                        "message": "Future phase does not have the same number of increaseable items as current subscription"
+                    })
+
+        except Exception as e:
+            issues.append({
+                "subscription_id": subscription_id,
+                "customer_id": customer_id,
+                "schedule_id": schedule_id,
+                "issue": "exception",
+                "error": str(e)
+            })
+
+    return {
+        "checked": checked,
+        "with_schedule": with_schedule,
+        "issue_counts": issue_counts,
+        "issues_found": len(issues),
+        "issues": issues
+    }
+
+# Who missed an increase, Who has extra inspection fees, Who has missing inspection fees, Who has schedule problems, Who has rollback risks
+@main.route("/admin/audit-increase-coverage")
+def audit_increase_coverage():
+
+    if not session.get("logged_in"):
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    current_year = "2026"
+
+    billable_statuses = [
+        "active",
+        "past_due",
+        "unpaid"
+    ]
+
+    checked = 0
+    issues = []
+
+    issue_counts = {
+        "missing_2026_increase": 0,
+        "wrong_increaseable_count": 0,
+        "no_subscription_items": 0,
+        "price_retrieve_failed": 0,
+        "product_retrieve_failed": 0,
+    }
+
+    for status in billable_statuses:
+
+        subscriptions = stripe.Subscription.list(
+            status=status,
+            limit=100
+        )
+
+        for subscription in subscriptions.auto_paging_iter():
+            checked += 1
+
+            subscription_id = subscription["id"]
+            customer_id = subscription["customer"]
+            subscription_status = subscription["status"]
+
+            last_increase_year = (
+                subscription["metadata"]["last_increase_year"]
+                if "metadata" in subscription
+                and "last_increase_year" in subscription["metadata"]
+                else None
+            )
+
+            if last_increase_year != current_year:
+                issue_counts["missing_2026_increase"] += 1
+                issues.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "status": subscription_status,
+                    "issue": "missing_2026_increase",
+                    "last_increase_year": last_increase_year
+                })
+
+            items = subscription["items"]["data"] if "items" in subscription else []
+
+            if not items:
+                issue_counts["no_subscription_items"] += 1
+                issues.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "status": subscription_status,
+                    "issue": "no_subscription_items"
+                })
+                continue
+
+            increaseable_items = []
+
+            for item in items:
+                try:
+                    price = stripe.Price.retrieve(item["price"]["id"])
+                except Exception as e:
+                    issue_counts["price_retrieve_failed"] += 1
+                    issues.append({
+                        "subscription_id": subscription_id,
+                        "customer_id": customer_id,
+                        "status": subscription_status,
+                        "issue": "price_retrieve_failed",
+                        "error": str(e)
+                    })
+                    continue
+
+                try:
+                    product = stripe.Product.retrieve(price["product"])
+                except Exception as e:
+                    issue_counts["product_retrieve_failed"] += 1
+                    issues.append({
+                        "subscription_id": subscription_id,
+                        "customer_id": customer_id,
+                        "status": subscription_status,
+                        "issue": "product_retrieve_failed",
+                        "price_id": price["id"],
+                        "error": str(e)
+                    })
+                    continue
+
+                increaseable = (
+                    product["metadata"]["increaseable"]
+                    if "metadata" in product
+                    and "increaseable" in product["metadata"]
+                    else None
+                )
+
+                if str(increaseable).lower() == "true":
+                    increaseable_items.append({
+                        "price_id": price["id"],
+                        "product_id": product["id"],
+                        "product_name": product["name"],
+                        "unit_amount": price["unit_amount"],
+                    })
+
+            if len(increaseable_items) != 1:
+                issue_counts["wrong_increaseable_count"] += 1
+                issues.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "status": subscription_status,
+                    "issue": "wrong_increaseable_count",
+                    "count": len(increaseable_items),
+                    "increaseable_items": increaseable_items,
+                    "message": "Expected exactly one increaseable monthly fee item"
+                })
+
+    return {
+        "checked": checked,
+        "billable_statuses_checked": billable_statuses,
+        "issues_found": len(issues),
+        "issue_counts": issue_counts,
+        "issues": issues
+    }
+
+# manually increase specific customer to increase 3%
+@main.route("/admin/run-increase-one/<subscription_id>")
+def run_increase_one(subscription_id):
+
+    if not session.get("logged_in"):
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    run_id = str(uuid.uuid4())
+    started_at = datetime.now(timezone.utc)
+
+    result = PricingService.apply_annual_increase(
+        subscription_id=subscription_id,
+        run_id=run_id,
+        started_at=started_at
+    )
+
+    return {
+        "run_id": run_id,
+        "subscription_id": subscription_id,
+        "result": result
+    }
+
+# audit different status counts
+@main.route("/admin/audit-subscription-population")
+def audit_subscription_population():
+
+    if not session.get("logged_in"):
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    statuses = [
+        "active",
+        "past_due",
+        "unpaid",
+        "trialing",
+        "canceled",
+        "incomplete",
+        "incomplete_expired",
+        "paused",
+    ]
+
+    counts = {}
+    examples = {}
+
+    for status in statuses:
+        counts[status] = 0
+        examples[status] = []
+
+        subscriptions = stripe.Subscription.list(
+            status=status,
+            limit=100
+        )
+
+        for subscription in subscriptions.auto_paging_iter():
+            counts[status] += 1
+
+            if len(examples[status]) < 5:
+                examples[status].append({
+                    "subscription_id": subscription["id"],
+                    "customer_id": subscription["customer"],
+                    "status": subscription["status"],
+                })
+
+    billable_count = (
+        counts["active"]
+        + counts["past_due"]
+        + counts["unpaid"]
+    )
+
+    return {
+        "counts": counts,
+        "billable_statuses": ["active", "past_due", "unpaid"],
+        "billable_count": billable_count,
+        "examples": examples
+    }
+
+# missing increase and run increase (for status thats not active)
+@main.route("/admin/run-increase-missing-billable")
+def run_increase_missing_billable():
+
+    if not session.get("logged_in"):
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    current_year = "2026"
+    run_id = str(uuid.uuid4())
+    started_at = datetime.now(timezone.utc)
+
+    billable_statuses = [
+        "active",
+        "past_due",
+        "unpaid"
+    ]
+
+    checked = 0
+    attempted = 0
+    skipped = 0
+    failed = 0
+    results = []
+
+    for status in billable_statuses:
+
+        subscriptions = stripe.Subscription.list(
+            status=status,
+            limit=100
+        )
+
+        for subscription in subscriptions.auto_paging_iter():
+            checked += 1
+
+            last_increase_year = (
+                subscription["metadata"]["last_increase_year"]
+                if "metadata" in subscription
+                and "last_increase_year" in subscription["metadata"]
+                else None
+            )
+
+            if last_increase_year == current_year:
+                skipped += 1
+                continue
+
+            try:
+                attempted += 1
+
+                result = PricingService.apply_annual_increase(
+                    subscription_id=subscription["id"],
+                    run_id=run_id,
+                    started_at=started_at
+                )
+
+                results.append({
+                    "subscription_id": subscription["id"],
+                    "customer_id": subscription["customer"],
+                    "status": subscription["status"],
+                    "result": result
+                })
+
+            except Exception as e:
+                failed += 1
+
+                log = BillingIncreaseLog(
+                    run_id=run_id,
+                    subscription_id=subscription["id"],
+                    customer_id=subscription["customer"],
+                    status="failed",
+                    reason=str(e),
+                    started_at=started_at,
+                    finished_at=datetime.now(timezone.utc),
+                )
+
+                db.session.add(log)
+                db.session.commit()
+
+                results.append({
+                    "subscription_id": subscription["id"],
+                    "customer_id": subscription["customer"],
+                    "status": subscription["status"],
+                    "result": "failed",
+                    "error": str(e)
+                })
+
+    return {
+        "run_id": run_id,
+        "checked": checked,
+        "attempted": attempted,
+        "skipped": skipped,
+        "failed": failed,
+        "results": results
+    }
+
+# list_no_schedule_subscriptions
+@main.route("/admin/list-no-schedule-subscriptions")
+def list_no_schedule_subscriptions():
+
+    if not session.get("logged_in"):
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    billable_statuses = [
+        "active",
+        "past_due",
+        "unpaid"
+    ]
+
+    results = []
+
+    for status in billable_statuses:
+
+        subscriptions = stripe.Subscription.list(
+            status=status,
+            limit=100
+        )
+
+        for subscription in subscriptions.auto_paging_iter():
+
+            schedule_id = (
+                subscription["schedule"]
+                if "schedule" in subscription
+                else None
+            )
+
+            if schedule_id:
+                continue
+
+            last_increase_year = (
+                subscription["metadata"]["last_increase_year"]
+                if "metadata" in subscription
+                and "last_increase_year" in subscription["metadata"]
+                else None
+            )
+
+            results.append({
+                "subscription_id": subscription["id"],
+                "customer_id": subscription["customer"],
+                "status": subscription["status"],
+                "last_increase_year": last_increase_year
+            })
+
+    return {
+        "count": len(results),
+        "subscriptions": results
     }
