@@ -1330,3 +1330,371 @@ def list_no_schedule_subscriptions():
         "count": len(results),
         "subscriptions": results
     }
+
+# audit contract ending
+@main.route("/admin/audit-contract-ending")
+def audit_contract_ending():
+
+    if not session.get("logged_in"):
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    billable_statuses = [
+        "active",
+        "past_due",
+        "unpaid"
+    ]
+
+    checked = 0
+
+    issue_counts = {
+        "has_schedule_end": 0,
+        "has_cancel_at": 0,
+        "has_cancel_at_period_end": 0,
+        "no_end_mechanism": 0,
+        "schedule_retrieve_failed": 0,
+    }
+
+    issues = []
+    results = []
+
+    for status in billable_statuses:
+
+        subscriptions = stripe.Subscription.list(
+            status=status,
+            limit=100
+        )
+
+        for subscription in subscriptions.auto_paging_iter():
+            checked += 1
+
+            subscription_id = subscription["id"]
+            customer_id = subscription["customer"]
+            subscription_status = subscription["status"]
+
+            schedule_id = (
+                subscription["schedule"]
+                if "schedule" in subscription
+                else None
+            )
+
+            cancel_at = (
+                subscription["cancel_at"]
+                if "cancel_at" in subscription
+                else None
+            )
+
+            cancel_at_period_end = (
+                subscription["cancel_at_period_end"]
+                if "cancel_at_period_end" in subscription
+                else False
+            )
+
+            end_mechanisms = []
+
+            if cancel_at:
+                issue_counts["has_cancel_at"] += 1
+                end_mechanisms.append("cancel_at")
+
+            if cancel_at_period_end:
+                issue_counts["has_cancel_at_period_end"] += 1
+                end_mechanisms.append("cancel_at_period_end")
+
+            schedule_end_behavior = None
+            schedule_end_date = None
+
+            if schedule_id:
+                try:
+                    schedule = stripe.SubscriptionSchedule.retrieve(schedule_id)
+
+                    schedule_end_behavior = (
+                        schedule["end_behavior"]
+                        if "end_behavior" in schedule
+                        else None
+                    )
+
+                    phases = (
+                        schedule["phases"]
+                        if "phases" in schedule
+                        else []
+                    )
+
+                    if phases:
+                        last_phase = phases[-1]
+                        schedule_end_date = (
+                            last_phase["end_date"]
+                            if "end_date" in last_phase
+                            else None
+                        )
+
+                    if schedule_end_behavior == "cancel" and schedule_end_date:
+                        issue_counts["has_schedule_end"] += 1
+                        end_mechanisms.append("schedule_end")
+
+                except Exception as e:
+                    issue_counts["schedule_retrieve_failed"] += 1
+                    issues.append({
+                        "subscription_id": subscription_id,
+                        "customer_id": customer_id,
+                        "status": subscription_status,
+                        "schedule_id": schedule_id,
+                        "issue": "schedule_retrieve_failed",
+                        "error": str(e)
+                    })
+
+            if not end_mechanisms:
+                issue_counts["no_end_mechanism"] += 1
+                issues.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "status": subscription_status,
+                    "schedule_id": schedule_id,
+                    "cancel_at": cancel_at,
+                    "cancel_at_period_end": cancel_at_period_end,
+                    "issue": "no_end_mechanism",
+                    "message": "No schedule end, cancel_at, or cancel_at_period_end found"
+                })
+
+            results.append({
+                "subscription_id": subscription_id,
+                "customer_id": customer_id,
+                "status": subscription_status,
+                "schedule_id": schedule_id,
+                "schedule_end_behavior": schedule_end_behavior,
+                "schedule_end_date": schedule_end_date,
+                "cancel_at": cancel_at,
+                "cancel_at_period_end": cancel_at_period_end,
+                "end_mechanisms": end_mechanisms
+            })
+
+    return {
+        "checked": checked,
+        "billable_statuses_checked": billable_statuses,
+        "issue_counts": issue_counts,
+        "issues_found": len(issues),
+        "issues": issues,
+        "results": results
+    }
+
+# How much money is sitting in open invoices right now, grouped by customer and age?
+@main.route("/admin/audit-outstanding-balances")
+def audit_outstanding_balances():
+    import stripe
+    from datetime import datetime, timezone
+
+    if not session.get("logged_in"):
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    now = datetime.now(timezone.utc)
+
+    def stripe_get(obj, key, default=None):
+        if obj is None:
+            return default
+        if key in obj:
+            return obj[key]
+        return default
+
+    def cents_to_money(cents):
+        return round((cents or 0) / 100, 2)
+
+    def get_overdue_bucket(days_overdue):
+        if days_overdue <= 30:
+            return "0-30"
+        elif days_overdue <= 60:
+            return "31-60"
+        elif days_overdue <= 90:
+            return "61-90"
+        else:
+            return "90+"
+
+    totals = {
+        "total_open_invoice_amount": 0,
+        "invoice_count": 0,
+        "customers_count": 0,
+        "aging": {
+            "not_due_yet": 0,
+            "0-30": 0,
+            "31-60": 0,
+            "61-90": 0,
+            "90+": 0,
+        },
+    }
+
+    customers = {}
+
+    invoices = stripe.Invoice.list(
+        status="open",
+        limit=100,
+        expand=["data.customer", "data.subscription"]
+    )
+
+    for invoice in invoices.auto_paging_iter():
+        amount_remaining = stripe_get(invoice, "amount_remaining", 0)
+
+        if amount_remaining <= 0:
+            continue
+
+        customer = stripe_get(invoice, "customer")
+        subscription = stripe_get(invoice, "subscription")
+
+        if isinstance(customer, str):
+            customer_id = customer
+            customer_email = None
+            customer_name = None
+            customer_balance = 0
+        else:
+            customer_id = stripe_get(customer, "id")
+            customer_email = stripe_get(customer, "email")
+            customer_name = stripe_get(customer, "name")
+            customer_balance = stripe_get(customer, "balance", 0)
+
+        if isinstance(subscription, str):
+            subscription_id = subscription
+            subscription_status = None
+        else:
+            subscription_id = stripe_get(subscription, "id")
+            subscription_status = stripe_get(subscription, "status")
+
+        due_date_ts = stripe_get(invoice, "due_date")
+        finalized_at_ts = stripe_get(invoice, "finalized_at")
+        created_ts = stripe_get(invoice, "created")
+
+        invoice_date_ts = due_date_ts or finalized_at_ts or created_ts
+        invoice_date = datetime.fromtimestamp(invoice_date_ts, tz=timezone.utc)
+
+        raw_age_days = (now - invoice_date).days
+
+        if raw_age_days < 0:
+            days_overdue = 0
+            days_until_due = abs(raw_age_days)
+            bucket = "not_due_yet"
+        else:
+            days_overdue = raw_age_days
+            days_until_due = 0
+            bucket = get_overdue_bucket(days_overdue)
+
+        totals["total_open_invoice_amount"] += amount_remaining
+        totals["invoice_count"] += 1
+        totals["aging"][bucket] += amount_remaining
+
+        if customer_id not in customers:
+            customers[customer_id] = {
+                "customer_id": customer_id,
+                "name": customer_name,
+                "email": customer_email,
+                "stripe_customer_balance": cents_to_money(customer_balance),
+                "total_amount_remaining": 0,
+                "invoice_count": 0,
+                "subscription_statuses": set(),
+                "aging": {
+                    "not_due_yet": 0,
+                    "0-30": 0,
+                    "31-60": 0,
+                    "61-90": 0,
+                    "90+": 0,
+                },
+                "invoices": [],
+            }
+
+        customers[customer_id]["total_amount_remaining"] += amount_remaining
+        customers[customer_id]["invoice_count"] += 1
+        customers[customer_id]["aging"][bucket] += amount_remaining
+
+        if subscription_status:
+            customers[customer_id]["subscription_statuses"].add(subscription_status)
+
+        customers[customer_id]["invoices"].append({
+            "invoice_id": stripe_get(invoice, "id"),
+            "subscription_id": subscription_id,
+            "subscription_status": subscription_status,
+            "amount_remaining": cents_to_money(amount_remaining),
+            "aging_bucket": bucket,
+            "days_overdue": days_overdue,
+            "days_until_due": days_until_due,
+            "collection_method": stripe_get(invoice, "collection_method"),
+            "due_date": due_date_ts,
+            "finalized_at": finalized_at_ts,
+            "created": created_ts,
+            "hosted_invoice_url": stripe_get(invoice, "hosted_invoice_url"),
+        })
+
+    customer_rows = []
+
+    for customer in customers.values():
+        customer["total_amount_remaining"] = cents_to_money(
+            customer["total_amount_remaining"]
+        )
+
+        for bucket in customer["aging"]:
+            customer["aging"][bucket] = cents_to_money(customer["aging"][bucket])
+
+        customer["subscription_statuses"] = list(customer["subscription_statuses"])
+        customer_rows.append(customer)
+
+    customer_rows.sort(
+        key=lambda c: c["total_amount_remaining"],
+        reverse=True
+    )
+
+    totals["customers_count"] = len(customer_rows)
+    totals["total_open_invoice_amount"] = cents_to_money(
+        totals["total_open_invoice_amount"]
+    )
+
+    for bucket in totals["aging"]:
+        totals["aging"][bucket] = cents_to_money(totals["aging"][bucket])
+
+    return {
+        "summary": totals,
+        "customers": customer_rows,
+    }
+
+# How much money is currently outstanding?
+# @main.route("/admin/audit-outstanding-balances")
+# def audit_outstanding_balances():
+
+
+
+@main.route("/admin/test-group-open-invoices")
+def test_group_open_invoices(): 
+    customers= {}
+
+    open_invoice= stripe.Invoice.list(
+        status="open",
+        limit=100
+    )
+
+    # grouped invoices by customer
+    for invoice in open_invoice.auto_paging_iter():
+        customer_id= invoice["customer"]
+
+        if customer_id not in customers:
+            customers[customer_id] = 0
+
+        customers[customer_id] += 1
+
+    # categorization
+    one_invoice_customers = 0
+    two_invoice_customers= 0
+    three_plus_invoice_customers = 0 
+
+    for customer_id, invoice_count in customers.items():
+        if invoice_count == 1:
+            one_invoice_customers +=1
+        elif invoice_count == 2:
+            two_invoice_customers +=1
+        else:
+            three_plus_invoice_customers +=1
+
+    return {
+        "one_invoice_customers": one_invoice_customers,
+        "two_invoice_customers": two_invoice_customers,
+        "three_plus_invoice_customers": three_plus_invoice_customers
+    }
+
+
+
+        
