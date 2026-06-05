@@ -1721,6 +1721,8 @@ def audit_multiple_open_invoice_customers():
 
     customers = {}
 
+    now= datetime.now(timezone.utc)
+
     open_invoices = stripe.Invoice.list(
         status="open",
         limit=100,
@@ -1755,19 +1757,69 @@ def audit_multiple_open_invoice_customers():
                 "email": customer_email,
                 "invoice_count": 0,
                 "total_amount_remaining": 0,
-                "invoice_ids": []
+                "invoices": []
             }
         # increment invoice count
         customers[customer_id]["invoice_count"] += 1
         # add amount remaining
         customers[customer_id]["total_amount_remaining"] += amount_remaining
+
+        # convert timestamp to human-readable date
+        # stripe gives human-unreadable timestamp
+        due_date_ts= invoice["due_date"]
+
+        # debugging not guessing to see whos none
+        if due_date_ts is None:
+            print(
+                "NO DUE DATE:",
+                invoice["id"],
+                invoice["collection_method"]
+            )
+
+        # not every invoice has a due date
+        # send_invoice → has due_date
+        # charge_automatically → often due_date is None
+        if due_date_ts:
+            due_date_datetime= datetime.fromtimestamp(due_date_ts, tz=timezone.utc)
+
+            raw_days= (now - due_date_datetime).days
+
+            #positive raw_days  = overdue
+            # negative raw_days  = not due yet 
+            if raw_days > 0:
+                days_overdue = raw_days
+                days_until_due = 0
+            else: 
+                days_overdue = 0
+                # abs() : absolute value -> remove the negative sign
+                days_until_due = abs(raw_days)
+
+            due_date= due_date_datetime.date().isoformat()
+
+        else:
+            due_date = None
+            days_overdue = None
+            days_until_due = None
+
         # save invoice id
-        customers[customer_id]["invoice_ids"].append(invoice_id)
+        customers[customer_id]["invoices"].append({
+            "invoice_id": invoice_id,
+            "amount_remaining": cents_to_money(amount_remaining),
+            "collection_method": invoice["collection_method"],
+            # "due_date_ts": invoice["due_date"],
+            "due_date": due_date,
+            "days_overdue": days_overdue,
+            "days_until_due": days_until_due,
+            "hosted_invoice_url": invoice["hosted_invoice_url"]
+        })
 
     # STEP 2
     # Build results list
 
     results = []
+
+    customers_with_1_overdue_1_not_due = 0
+    customers_with_2_overdue =0
 
     # loop through customers
     for customer_id, customer_data in customers.items():
@@ -1775,6 +1827,18 @@ def audit_multiple_open_invoice_customers():
         if customer_data["invoice_count"] >= 2:
         # append to results
             results.append(customer_data)
+
+            # tell normal timing or true delinquency
+            overdue_invoice_count= 0
+            
+            for invoice in customer_data["invoices"]: 
+                if invoice["days_overdue"] is not None and invoice["days_overdue"] > 0: 
+                    overdue_invoice_count += 1
+
+            if overdue_invoice_count == 1:
+                customers_with_1_overdue_1_not_due +=1
+            elif overdue_invoice_count >=2:
+                customers_with_2_overdue +=1
 
     # STEP 3
     # sort highest balance first
@@ -1795,7 +1859,9 @@ def audit_multiple_open_invoice_customers():
     # return summary + results
     return {
         "summary": {
-            "customers_with_multiple_open_invoices": len(results)
+            "customers_with_multiple_open_invoices": len(results),
+            "customers_with_1_overdue_1_not_due": customers_with_1_overdue_1_not_due,
+            "customers_with_2_overdue": customers_with_2_overdue
         }, 
         "customers": results
     }
