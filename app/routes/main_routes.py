@@ -1669,6 +1669,11 @@ def test_group_open_invoices():
 
     # grouped invoices by customer
     for invoice in open_invoice.auto_paging_iter():
+        amount_remaining = invoice["amount_remaining"]
+
+        if amount_remaining <= 0:
+            continue
+
         customer_id= invoice["customer"]
 
         if customer_id not in customers:
@@ -1690,11 +1695,107 @@ def test_group_open_invoices():
             three_plus_invoice_customers +=1
 
     return {
-        "one_invoice_customers": one_invoice_customers,
-        "two_invoice_customers": two_invoice_customers,
-        "three_plus_invoice_customers": three_plus_invoice_customers
+        "summary": {
+            "one_invoice_customers": one_invoice_customers,
+            "two_invoice_customers": two_invoice_customers,
+            "three_plus_invoice_customers": three_plus_invoice_customers,
+            "total_customers": (
+                one_invoice_customers
+                + two_invoice_customers
+                + three_plus_invoice_customers
+            )
+        }
     }
 
+# audit-two-open-invoice-customers to see who
+@main.route("/admin/audit-multiple-open-invoice-customers")
+def audit_multiple_open_invoice_customers():
+    def cents_to_money(cents):
+        return round((cents or 0)/ 100, 2)
 
+    # login check
+    if not session.get("logged_in"):
+        return redirect("/login")
+    # stripe api key
+    stripe.api_key= current_app.config["STRIPE_SECRET_KEY"]
 
-        
+    customers = {}
+
+    open_invoices = stripe.Invoice.list(
+        status="open",
+        limit=100,
+        expand=["data.customer"]
+    )
+
+    # STEP 1
+    # Loop through all open invoices
+    for invoice in open_invoices.auto_paging_iter():
+        # get customer id
+        customer= invoice["customer"]
+
+        if isinstance(customer, str):
+            customer_id= customer
+            customer_name= None
+            customer_email= None
+        else: 
+            customer_id= customer["id"]
+            customer_name= customer["name"] if "name" in customer else None
+            customer_email= customer["email"] if "email" in customer else None
+
+        # get invoice id
+        invoice_id= invoice["id"]
+        # get amount remaining
+        amount_remaining= invoice["amount_remaining"]
+        # if customer doesn't exist
+            # create customer structure
+        if customer_id not in customers:
+            customers[customer_id] = {
+                "customer_id": customer_id,
+                "name": customer_name,
+                "email": customer_email,
+                "invoice_count": 0,
+                "total_amount_remaining": 0,
+                "invoice_ids": []
+            }
+        # increment invoice count
+        customers[customer_id]["invoice_count"] += 1
+        # add amount remaining
+        customers[customer_id]["total_amount_remaining"] += amount_remaining
+        # save invoice id
+        customers[customer_id]["invoice_ids"].append(invoice_id)
+
+    # STEP 2
+    # Build results list
+
+    results = []
+
+    # loop through customers
+    for customer_id, customer_data in customers.items():
+        # keep only customers with 2+ invoices
+        if customer_data["invoice_count"] >= 2:
+        # append to results
+            results.append(customer_data)
+
+    # STEP 3
+    # sort highest balance first
+    results.sort(
+        # def get_balance(customer):
+            # return customer["total_amount_remaining"]
+        key=lambda customer: customer["total_amount_remaining"],
+        # reverse=True: largest → smallest
+        reverse=True
+        )
+
+    # convert cents to dollars for display
+    for customer in results:
+        customer["total_amount_remaining"]= cents_to_money(
+            customer["total_amount_remaining"]
+        )
+    # STEP 4
+    # return summary + results
+    return {
+        "summary": {
+            "customers_with_multiple_open_invoices": len(results)
+        }, 
+        "customers": results
+    }
