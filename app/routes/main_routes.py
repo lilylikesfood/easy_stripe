@@ -33,8 +33,10 @@ def home():
         "message": "Stripe Billing System Running"
     }
 
-@main.route("/test-stripe")
+@main.route("/test-stripe", methods=["POST"])
 def test_stripe():
+    if request.form.get("confirm") != "APPLY":
+        return {"error": "confirmation required"}, 400
 
     customer = create_customer(
         name="529finaljen",
@@ -45,11 +47,18 @@ def test_stripe():
         "customer_id": customer.id
     }
 
-@main.route("/admin/run-increase")
+@main.route("/admin/run-increase", methods=["POST"])
 def run_increase():
 
     if not session.get("logged_in"):
         return redirect("/login")
+    
+    confirm= request.form.get("confirm")
+
+    if confirm != "APPLY":
+        return {
+            "error": "Confirmation required. Submit confirm=APPLY to run this route."
+        }, 400
     
     run_id= str(uuid.uuid4())
 
@@ -65,8 +74,10 @@ def run_increase():
         "run_id": run_id
     }
 
-@main.route("/create-test-subscription")
+@main.route("/create-test-subscription", methods=["POST"])
 def create_test_subscription():
+    if request.form.get("confirm") != "APPLY":
+        return {"error": "confirmation required"}, 400
 
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
@@ -311,11 +322,18 @@ def debug_schedule_prices(schedule_id):
     }
 
 # testing for repairing specific clients's scheduled update (to remove scheduled update)
-@main.route("/admin/repair-schedule/<subscription_id>")
+@main.route("/admin/repair-schedule/<subscription_id>", methods=["POST"])
 def repair_schedule(subscription_id):
 
     if not session.get("logged_in"):
         return redirect("/login")
+    
+    confirm= request.form.get("confirm")
+
+    if confirm != "APPLY":
+        return {
+            "error": "Confirmation required. Submit confirm=APPLY to run this route."
+        }, 400
 
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
@@ -578,11 +596,18 @@ def rollback_summary():
         "summary": list(summary.values())
     }
 # repair all schedule rollbacks
-@main.route("/admin/repair-all-schedule-rollbacks")
+@main.route("/admin/repair-all-schedule-rollbacks", methods=["POST"])
 def repair_all_schedule_rollbacks():
 
     if not session.get("logged_in"):
         return redirect("/login")
+    
+    confirm= request.form.get("confirm")
+
+    if confirm != "APPLY":
+        return {
+            "error": "Confirmation required. Submit confirm=APPLY to run this route."
+        }, 400
 
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
@@ -1104,11 +1129,18 @@ def audit_increase_coverage():
     }
 
 # manually increase specific customer to increase 3%
-@main.route("/admin/run-increase-one/<subscription_id>")
+@main.route("/admin/run-increase-one/<subscription_id>", methods=["POST"])
 def run_increase_one(subscription_id):
 
     if not session.get("logged_in"):
         return redirect("/login")
+    
+    confirm= request.form.get("confirm")
+
+    if confirm != "APPLY":
+        return {
+            "error": "Confirmation required. Submit confirm=APPLY to run this route."
+        }, 400
 
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
@@ -1183,11 +1215,18 @@ def audit_subscription_population():
     }
 
 # missing increase and run increase (for status thats not active)
-@main.route("/admin/run-increase-missing-billable")
+@main.route("/admin/run-increase-missing-billable", methods=["POST"])
 def run_increase_missing_billable():
 
     if not session.get("logged_in"):
         return redirect("/login")
+    
+    confirm= request.form.get("confirm")
+
+    if confirm != "APPLY":
+        return {
+            "error": "Confirmation required. Submit confirm=APPLY to run this route."
+        }, 400
 
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
@@ -1900,4 +1939,164 @@ def audit_multiple_open_invoice_customers():
             "customers_with_2_overdue": customers_with_2_overdue
         }, 
         "customers": results
+    }
+
+# If we ran today,who would receive a late fee and how much?
+@main.route("/admin/audit-late-fees")
+def audit_late_fees():
+    if not session.get("logged_in"):
+        return redirect("/login")
+    
+    stripe.api_key= current_app.config["STRIPE_SECRET_KEY"]
+
+    now= datetime.now(timezone.utc)
+    late_fee_month= now.strftime("%Y-%m")
+    # June 2026 → "2026-06"
+    
+    def stripe_get(obj, key, default=None):
+        if obj is None:
+            return default
+        if key in obj:
+            return obj[key]
+        return default
+    
+    def cents_to_money(cents):
+        return round((cents or 0) / 100, 2)
+    
+    def money_to_cents(amount):
+        return int(round(amount * 100))
+    
+    def calculate_late_fee_cents(amount_remaining_cents):
+        return int(round(amount_remaining_cents * 0.015))
+    
+    def late_fee_already_exists(customer_id, source_invoice_id, late_fee_month):
+        invoice_items= stripe.InvoiceItem.list(
+            customer=customer_id,
+            limit=100
+        )
+
+        for item in invoice_items.auto_paging_iter():
+            metadata= stripe_get(item, "metadata", {})
+
+            if (
+                stripe_get(metadata, "type") == "late_fee"
+                and stripe_get(metadata, "source_invoice_id") == source_invoice_id
+                and stripe_get(metadata, "late_fee_month") == late_fee_month
+            ):
+                return True
+            
+        return False
+    
+    late_fee_candidates = []
+    total_late_fee_cents = 0
+
+    invoices= stripe.Invoice.list(
+        status="open", 
+        limit=100,
+        expand=["data.customer", "data.subscription"]
+    )
+
+    for invoice in invoices.auto_paging_iter():
+        amount_remaining= stripe_get(invoice, "amount_remaining", 0)
+
+        if amount_remaining <= 0:
+            continue
+
+        customer= stripe_get(invoice, "customer")
+        subscription= stripe_get(invoice, "subscription")
+
+        if isinstance(customer, str):
+            customer_id = customer
+            customer_name= None
+            customer_email = None
+        else:
+            customer_id= stripe_get(customer, "id")
+            customer_name= stripe_get(customer, "name")
+            customer_email= stripe_get(customer, "email")
+
+        if isinstance(subscription, str):
+            subscription_id = subscription
+            next_invoice_date = None
+        elif subscription:
+            subscription_id = stripe_get(subscription, "id")
+            current_period_end_ts = stripe_get(subscription, "current_period_end")
+
+            if current_period_end_ts:
+                next_invoice_date = datetime.fromtimestamp(
+                    current_period_end_ts,
+                    tz=timezone.utc
+                ).date().isoformat()
+            else:
+                next_invoice_date = None
+        else:
+            subscription_id = None
+            next_invoice_date = None
+
+        due_date_ts= stripe_get(invoice, "due_date")
+        created_ts= stripe_get(invoice, "created")
+
+        if due_date_ts:
+            effective_due_date= datetime.fromtimestamp(due_date_ts, tz=timezone.utc)
+
+        else: 
+            created_date= datetime.fromtimestamp(created_ts, tz= timezone.utc)
+            effective_due_date= created_date + timedelta(days=20)
+
+        raw_days= (now - effective_due_date).days
+
+        if raw_days <= 0:
+            continue
+
+        days_overdue= raw_days
+
+        late_fee_cents = calculate_late_fee_cents(amount_remaining)
+
+        invoice_id= stripe_get(invoice, "id")
+
+        already_applied= late_fee_already_exists(
+            customer_id,
+            invoice_id,
+            late_fee_month
+        )
+
+        if not already_applied:
+            total_late_fee_cents += late_fee_cents
+
+        late_fee_candidates.append({
+            "customer_id": customer_id,
+            "customer_name": customer_name,
+            "customer_email": customer_email,
+            "invoice_id": invoice_id,
+            "collection_method": stripe_get(invoice, "collection_method"),
+            "amount_remaining": cents_to_money(amount_remaining),
+            "effective_due_date": effective_due_date.date().isoformat(),
+            "days_overdue": days_overdue,
+            "late_fee_month": late_fee_month,
+            "eligible_to_apply": not already_applied,
+            "skip_reason": "already applied this month" if already_applied else None,
+            "late_fee_rate": "1.5%",
+            "late_fee": cents_to_money(late_fee_cents),
+            "total_after_late_fee": cents_to_money(
+                amount_remaining + late_fee_cents
+            ),
+            "invoice_url": stripe_get(invoice, "hosted_invoice_url"),
+            "reason": "overdue under contract logic",
+            "subscription_id": subscription_id,
+            "next_invoice_date": next_invoice_date,
+        })
+
+    late_fee_candidates.sort(
+        key=lambda candidate: candidate["days_overdue"],
+        reverse=True
+    )
+
+    return {
+        "summary": {
+            "late_fee_month": late_fee_month,
+            "candidate_count": len(late_fee_candidates),
+            "eligible_count": sum(1 for c in late_fee_candidates if c["eligible_to_apply"]),
+            "skipped_count": sum(1 for c in late_fee_candidates if not c["eligible_to_apply"]),
+            "total_late_fee": f"${cents_to_money(total_late_fee_cents):.2f}"
+        },
+        "candidates": late_fee_candidates
     }
