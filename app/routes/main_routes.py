@@ -3,7 +3,7 @@ from app.services.stripe_service import create_customer
 
 from app.services.automation_service import AutomationService
 
-from datetime import date,datetime, timezone
+from datetime import date,datetime, timezone, timedelta
 from dateutil.relativedelta import relativedelta
 
 import stripe
@@ -1477,7 +1477,7 @@ def audit_contract_ending():
         "results": results
     }
 
-# How much money is sitting in open invoices right now, grouped by customer and age?
+# How much money is sitting in open invoices right now, grouped by customer and age
 @main.route("/admin/audit-outstanding-balances")
 def audit_outstanding_balances():
     import stripe
@@ -1562,10 +1562,13 @@ def audit_outstanding_balances():
         finalized_at_ts = stripe_get(invoice, "finalized_at")
         created_ts = stripe_get(invoice, "created")
 
-        invoice_date_ts = due_date_ts or finalized_at_ts or created_ts
-        invoice_date = datetime.fromtimestamp(invoice_date_ts, tz=timezone.utc)
+        if due_date_ts:
+            effective_due_date = datetime.fromtimestamp(due_date_ts, tz=timezone.utc)
+        else:
+            created_date = datetime.fromtimestamp(created_ts, tz=timezone.utc)
+            effective_due_date = created_date + timedelta(days=20)
 
-        raw_age_days = (now - invoice_date).days
+        raw_age_days = (now - effective_due_date).days
 
         if raw_age_days < 0:
             days_overdue = 0
@@ -1575,6 +1578,44 @@ def audit_outstanding_balances():
             days_overdue = raw_age_days
             days_until_due = 0
             bucket = get_overdue_bucket(days_overdue)
+
+        # debug for siddharth_jan@hotmail.com
+        if customer_email == "siddharth_jan@hotmail.com":
+            print("\n===== SIDDHARTH =====")
+
+            print("Invoice ID:", stripe_get(invoice, "id"))
+
+            print("Due Date TS:", due_date_ts)
+
+            print("Created TS:", created_ts)
+
+            print("Effective Due Date:", effective_due_date.date())
+
+            print("Days Overdue:", days_overdue)
+
+            print("Bucket:", bucket)
+
+            print("Amount:", cents_to_money(amount_remaining))
+
+            print("=====================\n")
+
+            print(
+                "Created:",
+                datetime.fromtimestamp(
+                    created_ts,
+                    tz=timezone.utc
+                ).date()
+            )
+
+            if due_date_ts:
+                print(
+                    "Stripe Due Date:",
+                    datetime.fromtimestamp(
+                        due_date_ts,
+                        tz=timezone.utc
+                    ).date()
+                )
+
 
         totals["total_open_invoice_amount"] += amount_remaining
         totals["invoice_count"] += 1
@@ -1616,6 +1657,7 @@ def audit_outstanding_balances():
             "days_until_due": days_until_due,
             "collection_method": stripe_get(invoice, "collection_method"),
             "due_date": due_date_ts,
+            "effective_due_date": effective_due_date.date().isoformat(),
             "finalized_at": finalized_at_ts,
             "created": created_ts,
             "hosted_invoice_url": stripe_get(invoice, "hosted_invoice_url"),
@@ -1651,12 +1693,6 @@ def audit_outstanding_balances():
         "summary": totals,
         "customers": customer_rows,
     }
-
-# How much money is currently outstanding?
-# @main.route("/admin/audit-outstanding-balances")
-# def audit_outstanding_balances():
-
-
 
 @main.route("/admin/test-group-open-invoices")
 def test_group_open_invoices(): 
