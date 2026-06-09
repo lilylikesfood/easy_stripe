@@ -2100,3 +2100,142 @@ def audit_late_fees():
         },
         "candidates": late_fee_candidates
     }
+
+# apply late fee for one person before apply to all
+@main.route("/admin/apply-late-fee-one/<invoice_id>", methods=["POST"])
+def apply_late_fee_one(invoice_id):
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
+    
+    confirm= request.form.get("confirm")
+
+    if confirm != "APPLY": 
+        return {
+            "error": "Confirmation required. Submit confirm=APPLY to run this route. "
+        }, 400
+    
+    # 3. setup Stripe + dates
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    now = datetime.now(timezone.utc)
+    late_fee_month = now.strftime("%Y-%m")
+
+    # 4. helper functions
+    def stripe_get(obj, key, default=None):
+        if obj is None:
+            return default
+        if key in obj:
+            return obj[key]
+        return default
+
+    def cents_to_money(cents):
+        return round((cents / 100), 2)
+
+    def calculate_late_fee_cents(amount_remaining_cents):
+        return int(round(amount_remaining_cents * 0.015))
+
+    def late_fee_already_exists(customer_id, source_invoice_id, late_fee_month):
+        invoice_items= stripe.InvoiceItem.list(
+            customer= customer_id,
+        )
+
+        for invoice_item in invoice_items.auto_paging_iter():
+            metadata= stripe_get(invoice_item, "metadata", {})
+
+            if (
+                stripe_get(metadata, "type") == "late_fee"
+                and stripe_get(metadata, "source_invoice_id") == source_invoice_id
+                and stripe_get(metadata, "late_fee_month") == late_fee_month
+            ):
+                return True
+            
+        return False
+
+    # 5. retrieve invoice
+    invoice = stripe.Invoice.retrieve(invoice_id)
+    invoice_status= stripe_get(invoice, "status")
+    amount_remaining= stripe_get(invoice, "amount_remaining", 0)
+    customer_id= stripe_get(invoice, "customer")
+    due_date_ts= stripe_get(invoice, "due_date")
+    created_ts= stripe_get(invoice, "created")
+
+    # 6. validate invoice is open
+    # if invoice status is not open:
+    #     return skipped response
+    if invoice_status != "open":
+        return {
+            "status": "skipped",
+            "reason": "Invoice is not open. ",
+            "invoice_id": invoice_id,
+            "invoice_status": invoice_status
+        }
+
+    # 7. validate amount remaining
+    if amount_remaining <= 0:
+        return {
+            "status": "skipped",
+            "reason": "Invoice has no remaining balance", 
+            "invoice_id": invoice_id
+        }
+
+    # 8. get customer id
+
+    # 9. calculate effective due date using contract logic
+    if due_date_ts:
+        effective_due_date = datetime.fromtimestamp(due_date_ts, tz=timezone.utc)
+    else:
+        effective_due_date = datetime.fromtimestamp(created_ts, tz=timezone.utc) + timedelta(days=20)
+
+    # 10. calculate days overdue
+    # days_overdue = (now - effective_due_date).days
+    # testing
+    days_overdue = 10
+
+    if days_overdue <= 0:
+        return {
+            "status": "skipped",
+            "reason": "Invoice is not overdue", 
+            "invoice_id": invoice_id,
+            "days_overdue": days_overdue
+        }
+
+    # 11. idempotency check
+    # check whether late fee already exists for:
+    # customer_id + invoice_id + late_fee_month
+    #
+    # if already exists:
+    #     return skipped response
+    if late_fee_already_exists(customer_id, invoice_id, late_fee_month):
+        return {
+            "status": "skipped",
+            "reason": "Late fee already exists.",
+            "invoice_id": invoice_id,
+            "late_fee_month": late_fee_month
+        }
+
+    # 12. calculate late fee
+    late_fee_cents = calculate_late_fee_cents(amount_remaining)
+
+    # 13. create Stripe invoice item
+    invoice_item= stripe.InvoiceItem.create(
+        customer=customer_id,
+        amount=late_fee_cents,
+        discountable=False,
+        currency="cad",
+        description=f"Late payment charge - {late_fee_month} - invoice {invoice_id}",
+        metadata={
+            "type" : "late_fee",
+            "source_invoice_id" : invoice_id,
+            "late_fee_month" : late_fee_month
+            }
+    )
+
+    # 14. return success response
+    return {
+        "status": "success",
+        "invoice_id": invoice_id,
+        "late_fee_month": late_fee_month,
+        "late_fee": cents_to_money(late_fee_cents), 
+        "invoice_item_id": invoice_item.id
+    }
+
