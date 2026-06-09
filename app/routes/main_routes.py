@@ -1941,12 +1941,7 @@ def audit_multiple_open_invoice_customers():
         "customers": results
     }
 
-# If we ran today,who would receive a late fee and how much?
-@main.route("/admin/audit-late-fees")
-def audit_late_fees():
-    if not session.get("logged_in"):
-        return redirect("/login")
-    
+def find_late_fee_candidates():
     stripe.api_key= current_app.config["STRIPE_SECRET_KEY"]
 
     now= datetime.now(timezone.utc)
@@ -1998,6 +1993,10 @@ def audit_late_fees():
 
     for invoice in invoices.auto_paging_iter():
         amount_remaining= stripe_get(invoice, "amount_remaining", 0)
+        currency= stripe_get(invoice, "currency")
+
+        if currency != "cad":
+            continue
 
         if amount_remaining <= 0:
             continue
@@ -2043,6 +2042,8 @@ def audit_late_fees():
             effective_due_date= created_date + timedelta(days=20)
 
         raw_days= (now - effective_due_date).days
+        # for testing
+        # raw_days = 10
 
         if raw_days <= 0:
             continue
@@ -2101,26 +2102,31 @@ def audit_late_fees():
         "candidates": late_fee_candidates
     }
 
-# apply late fee for one person before apply to all
-@main.route("/admin/apply-late-fee-one/<invoice_id>", methods=["POST"])
-def apply_late_fee_one(invoice_id):
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+# If we ran today,who would receive a late fee and how much?
+@main.route("/admin/audit-late-fees")
+def audit_late_fees():
+    if not session.get("logged_in"):
+        return redirect("/login")
     
-    confirm= request.form.get("confirm")
+    return find_late_fee_candidates()
+    # def get_name():
+    #     return "Lily"
+    # You could do:
+    # name = get_name()
+    # return name
+    # or simply:
+    # return get_name()
+    # Same result.
 
-    if confirm != "APPLY": 
-        return {
-            "error": "Confirmation required. Submit confirm=APPLY to run this route. "
-        }, 400
-    
-    # 3. setup Stripe + dates
+# Helper function
+# business logic
+def apply_late_fee_to_invoice(invoice_id):   
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
     now = datetime.now(timezone.utc)
     late_fee_month = now.strftime("%Y-%m")
 
-    # 4. helper functions
+    # helper functions
     def stripe_get(obj, key, default=None):
         if obj is None:
             return default
@@ -2151,7 +2157,7 @@ def apply_late_fee_one(invoice_id):
             
         return False
 
-    # 5. retrieve invoice
+    # retrieve invoice
     invoice = stripe.Invoice.retrieve(invoice_id)
     invoice_status= stripe_get(invoice, "status")
     amount_remaining= stripe_get(invoice, "amount_remaining", 0)
@@ -2159,9 +2165,7 @@ def apply_late_fee_one(invoice_id):
     due_date_ts= stripe_get(invoice, "due_date")
     created_ts= stripe_get(invoice, "created")
 
-    # 6. validate invoice is open
-    # if invoice status is not open:
-    #     return skipped response
+    # validate invoice is open
     if invoice_status != "open":
         return {
             "status": "skipped",
@@ -2170,7 +2174,7 @@ def apply_late_fee_one(invoice_id):
             "invoice_status": invoice_status
         }
 
-    # 7. validate amount remaining
+    # validate amount remaining
     if amount_remaining <= 0:
         return {
             "status": "skipped",
@@ -2178,19 +2182,16 @@ def apply_late_fee_one(invoice_id):
             "invoice_id": invoice_id
         }
 
-    # 8. get customer id
-
-    # 9. calculate effective due date using contract logic
+    # calculate effective due date using contract logic
     if due_date_ts:
         effective_due_date = datetime.fromtimestamp(due_date_ts, tz=timezone.utc)
     else:
         effective_due_date = datetime.fromtimestamp(created_ts, tz=timezone.utc) + timedelta(days=20)
 
-    # 10. calculate days overdue
-    # days_overdue = (now - effective_due_date).days
-    # testing
-    days_overdue = 10
-
+    # calculate days overdue
+    days_overdue = (now - effective_due_date).days
+    # days_overdue = 10
+    
     if days_overdue <= 0:
         return {
             "status": "skipped",
@@ -2199,12 +2200,8 @@ def apply_late_fee_one(invoice_id):
             "days_overdue": days_overdue
         }
 
-    # 11. idempotency check
-    # check whether late fee already exists for:
-    # customer_id + invoice_id + late_fee_month
-    #
-    # if already exists:
-    #     return skipped response
+    # idempotency check
+    # check whether late fee already exists for: customer_id + invoice_id + late_fee_month
     if late_fee_already_exists(customer_id, invoice_id, late_fee_month):
         return {
             "status": "skipped",
@@ -2213,10 +2210,10 @@ def apply_late_fee_one(invoice_id):
             "late_fee_month": late_fee_month
         }
 
-    # 12. calculate late fee
+    # calculate late fee
     late_fee_cents = calculate_late_fee_cents(amount_remaining)
 
-    # 13. create Stripe invoice item
+    # create Stripe invoice item
     invoice_item= stripe.InvoiceItem.create(
         customer=customer_id,
         amount=late_fee_cents,
@@ -2230,7 +2227,7 @@ def apply_late_fee_one(invoice_id):
             }
     )
 
-    # 14. return success response
+    # return success response
     return {
         "status": "success",
         "invoice_id": invoice_id,
@@ -2239,3 +2236,72 @@ def apply_late_fee_one(invoice_id):
         "invoice_item_id": invoice_item.id
     }
 
+# apply late fee for one person before apply to all
+@main.route("/admin/apply-late-fee-one/<invoice_id>", methods=["POST"])
+def apply_late_fee_one(invoice_id):
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
+    
+    confirm= request.form.get("confirm")
+
+    if confirm != "APPLY": 
+        return {
+            "error": "Confirmation required. Submit confirm=APPLY to run this route. "
+        }, 400
+    
+    result= apply_late_fee_to_invoice(invoice_id)
+
+    return result
+
+# Apply late fee to everyone
+@main.route("/admin/apply-late-fees", methods=["POST"])
+def apply_late_fees():
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
+    
+    confirm = request.form.get("confirm")
+
+    if confirm != "APPLY":
+        return {
+            "error": "Confirmation required. Submit confirm=APPLY to run this route. "
+        }, 400
+    
+    audit_result= find_late_fee_candidates()
+
+    candidates= audit_result["candidates"]
+
+    results = []
+
+    for candidate in candidates: 
+        if not candidate["eligible_to_apply"]:
+            continue
+
+        try:
+            result= apply_late_fee_to_invoice(candidate["invoice_id"])
+            results.append(result)
+
+        except Exception as e:
+            results.append({
+                "status": "failed", 
+                "invoice_id": candidate["invoice_id"],
+                "error": str(e)
+            })
+
+    already_applied_count= sum(1 for c in candidates if not c["eligible_to_apply"])
+
+    return {
+        "status": "completed", 
+        "total_candidates": len(candidates),
+        "eligible_count": sum(1 for c in candidates if c["eligible_to_apply"]),
+        "success_count": sum(1 for r in results if r["status"] == "success"),
+        "already_applied_count": already_applied_count,
+        "failed_count": sum(1 for r in results if r["status"] == "failed"),
+        "invoice_ids": [c["invoice_id"] for c in candidates],
+        "results": results
+        # equivalent long version
+        # invoice_ids = []
+        # for c in candidates:
+        #     invoice_ids.append(
+        #         c["invoice_id"]
+        #     )
+    }
