@@ -24,6 +24,8 @@ from app.models.schedule_repair_log import ScheduleRepairLog
 
 from app.services.pricing_service import PricingService
 
+from app.models.late_fee_log import LateFeeLog
+
 main = Blueprint("main", __name__)
 
 
@@ -2041,9 +2043,9 @@ def find_late_fee_candidates():
             created_date= datetime.fromtimestamp(created_ts, tz= timezone.utc)
             effective_due_date= created_date + timedelta(days=20)
 
-        raw_days= (now - effective_due_date).days
+        # raw_days= (now - effective_due_date).days
         # for testing
-        # raw_days = 10
+        raw_days = 10
 
         if raw_days <= 0:
             continue
@@ -2077,6 +2079,7 @@ def find_late_fee_candidates():
             "skip_reason": "already applied this month" if already_applied else None,
             "late_fee_rate": "1.5%",
             "late_fee": cents_to_money(late_fee_cents),
+            "late_fee_cents": late_fee_cents,
             "total_after_late_fee": cents_to_money(
                 amount_remaining + late_fee_cents
             ),
@@ -2189,8 +2192,8 @@ def apply_late_fee_to_invoice(invoice_id):
         effective_due_date = datetime.fromtimestamp(created_ts, tz=timezone.utc) + timedelta(days=20)
 
     # calculate days overdue
-    days_overdue = (now - effective_due_date).days
-    # days_overdue = 10
+    # days_overdue = (now - effective_due_date).days
+    days_overdue = 10
     
     if days_overdue <= 0:
         return {
@@ -2233,6 +2236,7 @@ def apply_late_fee_to_invoice(invoice_id):
         "invoice_id": invoice_id,
         "late_fee_month": late_fee_month,
         "late_fee": cents_to_money(late_fee_cents), 
+        "late_fee_cents": late_fee_cents,
         "invoice_item_id": invoice_item.id
     }
 
@@ -2266,6 +2270,27 @@ def apply_late_fees():
             "error": "Confirmation required. Submit confirm=APPLY to run this route. "
         }, 400
     
+    # safety check in test/live mode
+    mode= request.form.get("mode")
+
+    if mode not in ["test", "live"]:
+        return {
+            "error": "Mode required.Submit mode=test or mode=live."
+        }, 400
+    
+    is_live_key= current_app.config["STRIPE_SECRET_KEY"].startswith("sk_live_")
+
+    if mode == "live" and not is_live_key:
+        return {
+            "error": "You submitted mode=live, but Stripe key is not live."
+        }, 400
+    if mode == "test" and is_live_key:
+        return {
+            "error": "You submitted mode=test, but Stripe key is live."
+        }, 400
+    
+    run_id= str(uuid.uuid4())
+
     audit_result= find_late_fee_candidates()
 
     candidates= audit_result["candidates"]
@@ -2274,11 +2299,41 @@ def apply_late_fees():
 
     for candidate in candidates: 
         if not candidate["eligible_to_apply"]:
+            log= LateFeeLog(
+                run_id= run_id,
+                invoice_id= candidate["invoice_id"],
+                customer_id= candidate["customer_id"],
+                invoice_item_id= None,
+                late_fee_month= candidate["late_fee_month"],
+                amount_cents= candidate["late_fee_cents"],
+                status= "skipped",
+                reason= candidate.get("skip_reason"),
+                error= None,
+                created_at= datetime.now(timezone.utc)
+            )
+
+            db.session.add(log)
+
             continue
 
         try:
             result= apply_late_fee_to_invoice(candidate["invoice_id"])
             results.append(result)
+
+            log= LateFeeLog(
+                run_id= run_id,
+                invoice_id= result.get("invoice_id"),
+                customer_id= candidate["customer_id"],
+                invoice_item_id= result.get("invoice_item_id"),
+                late_fee_month= candidate["late_fee_month"],
+                amount_cents= candidate["late_fee_cents"],
+                status= result.get("status"),
+                reason= result.get("reason"),
+                error= None,
+                created_at= datetime.now(timezone.utc)
+            )
+
+            db.session.add(log)
 
         except Exception as e:
             results.append({
@@ -2287,9 +2342,31 @@ def apply_late_fees():
                 "error": str(e)
             })
 
+            # failed log
+            log= LateFeeLog(
+                run_id= run_id,
+                invoice_id= candidate["invoice_id"],
+                customer_id= candidate["customer_id"],
+                invoice_item_id= None,
+                late_fee_month= candidate["late_fee_month"],
+                amount_cents= candidate["late_fee_cents"],
+                status= "failed",
+                reason= None,
+                error= str(e),
+                created_at= datetime.now(timezone.utc)
+            )
+
+            db.session.add(log)
+
+    # commit once after the loop 
+    db.session.commit()
+
     already_applied_count= sum(1 for c in candidates if not c["eligible_to_apply"])
 
     return {
+        "run_id": run_id,
+        "mode": mode,
+        "is_live_key": is_live_key,
         "status": "completed", 
         "total_candidates": len(candidates),
         "eligible_count": sum(1 for c in candidates if c["eligible_to_apply"]),

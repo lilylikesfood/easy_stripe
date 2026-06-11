@@ -19,6 +19,13 @@ def create_app():
     app.secret_key = os.getenv("SECRET_KEY", "dev-key")
 
     db.init_app(app)
+
+    # A database model should not depend on whether a web route happens to use it.
+    from app.models.billing_log import BillingIncreaseLog
+    from app.models.billing_run_control import BillingRunControl
+    from app.models.schedule_repair_log import ScheduleRepairLog
+    from app.models.late_fee_log import LateFeeLog
+
     migrate.init_app(app, db)
 
     init_stripe(app.config["STRIPE_SECRET_KEY"])  
