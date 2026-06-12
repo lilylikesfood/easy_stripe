@@ -1531,16 +1531,6 @@ def audit_outstanding_balances():
 
     now = datetime.now(timezone.utc)
 
-    def stripe_get(obj, key, default=None):
-        if obj is None:
-            return default
-        if key in obj:
-            return obj[key]
-        return default
-
-    def cents_to_money(cents):
-        return round((cents or 0) / 100, 2)
-
     def get_overdue_bucket(days_overdue):
         if days_overdue <= 30:
             return "0-30"
@@ -1943,46 +1933,50 @@ def audit_multiple_open_invoice_customers():
         "customers": results
     }
 
+# helper functions
+def stripe_get(obj, key, default=None):
+    if obj is None:
+        return default
+    if key in obj:
+        return obj[key]
+    return default
+
+def cents_to_money(cents):
+    return round((cents or 0) / 100, 2)
+
+def late_fee_already_exists(customer_id, source_invoice_id, late_fee_month):
+    invoice_items= stripe.InvoiceItem.list(
+        customer=customer_id,
+        limit=100
+    )
+
+    for invoice_item in invoice_items.auto_paging_iter():
+        metadata= stripe_get(invoice_item, "metadata", {})
+
+        if (
+            stripe_get(metadata, "type") == "late_fee"
+            and stripe_get(metadata, "source_invoice_id") == source_invoice_id
+            and stripe_get(metadata, "late_fee_month") == late_fee_month
+        ):
+            return True
+        
+    return False
+
+# find people with open invoice
 def find_late_fee_candidates():
     stripe.api_key= current_app.config["STRIPE_SECRET_KEY"]
 
     now= datetime.now(timezone.utc)
     late_fee_month= now.strftime("%Y-%m")
     # June 2026 → "2026-06"
-    
-    def stripe_get(obj, key, default=None):
-        if obj is None:
-            return default
-        if key in obj:
-            return obj[key]
-        return default
-    
-    def cents_to_money(cents):
-        return round((cents or 0) / 100, 2)
+    # tesing
+    # late_fee_month = "2026-07"
     
     def money_to_cents(amount):
         return int(round(amount * 100))
     
     def calculate_late_fee_cents(amount_remaining_cents):
         return int(round(amount_remaining_cents * 0.015))
-    
-    def late_fee_already_exists(customer_id, source_invoice_id, late_fee_month):
-        invoice_items= stripe.InvoiceItem.list(
-            customer=customer_id,
-            limit=100
-        )
-
-        for item in invoice_items.auto_paging_iter():
-            metadata= stripe_get(item, "metadata", {})
-
-            if (
-                stripe_get(metadata, "type") == "late_fee"
-                and stripe_get(metadata, "source_invoice_id") == source_invoice_id
-                and stripe_get(metadata, "late_fee_month") == late_fee_month
-            ):
-                return True
-            
-        return False
     
     late_fee_candidates = []
     total_late_fee_cents = 0
@@ -2052,8 +2046,8 @@ def find_late_fee_candidates():
 
         days_overdue= raw_days
 
-        late_fee_cents = calculate_late_fee_cents(amount_remaining)
-
+        late_fee_cents, base_cents = calculate_compounding_late_fee_cents(invoice)                  
+        
         invoice_id= stripe_get(invoice, "id")
 
         already_applied= late_fee_already_exists(
@@ -2078,10 +2072,12 @@ def find_late_fee_candidates():
             "eligible_to_apply": not already_applied,
             "skip_reason": "already applied this month" if already_applied else None,
             "late_fee_rate": "1.5%",
+            "late_fee_base": cents_to_money(base_cents),
+            "late_fee_base_cents": base_cents,
             "late_fee": cents_to_money(late_fee_cents),
             "late_fee_cents": late_fee_cents,
             "total_after_late_fee": cents_to_money(
-                amount_remaining + late_fee_cents
+                base_cents + late_fee_cents
             ),
             "invoice_url": stripe_get(invoice, "hosted_invoice_url"),
             "reason": "overdue under contract logic",
@@ -2121,6 +2117,48 @@ def audit_late_fees():
     # return get_name()
     # Same result.
 
+# get_previous_late_fee_total_cents
+def get_previous_late_fee_total_cents(customer_id, source_invoice_id):
+    invoice_items= stripe.InvoiceItem.list(
+        customer=customer_id,
+    )
+
+    total_cents = 0
+
+    for invoice_item in invoice_items.auto_paging_iter():
+        metadata= stripe_get(invoice_item, "metadata", {})
+
+        if (
+            stripe_get(metadata, "type") == "late_fee" 
+            and stripe_get(metadata, "source_invoice_id") == source_invoice_id):
+            total_cents += stripe_get(invoice_item, "amount", 0)
+
+    return total_cents
+
+# Compounding late fee calculation:
+# New late fee = 1.5% of
+# (current overdue balance + all previous late fees
+# for the same source invoice)
+def calculate_compounding_late_fee_cents(invoice):
+    customer_id= stripe_get(invoice, "customer")
+    source_invoice_id= stripe_get(invoice, "id")
+    original_remaining_amount_cents= stripe_get(invoice, "amount_remaining")
+
+    if original_remaining_amount_cents is None:
+        raise Exception("Invoice is missing amount_remaining")
+    if customer_id is None:
+        raise Exception("Invoice is missing customer_id")
+    if source_invoice_id is None:
+        raise Exception("Invoice is missing source_invoice_id")
+
+    previous_late_fee_total_cents= get_previous_late_fee_total_cents(customer_id, source_invoice_id)
+
+    base_cents= original_remaining_amount_cents + previous_late_fee_total_cents
+
+    late_fee_cents = int(round(base_cents * 0.015))
+
+    return late_fee_cents, base_cents
+
 # Helper function
 # business logic
 def apply_late_fee_to_invoice(invoice_id):   
@@ -2128,37 +2166,11 @@ def apply_late_fee_to_invoice(invoice_id):
 
     now = datetime.now(timezone.utc)
     late_fee_month = now.strftime("%Y-%m")
+    # testing
+    # late_fee_month = "2026-07"
 
-    # helper functions
-    def stripe_get(obj, key, default=None):
-        if obj is None:
-            return default
-        if key in obj:
-            return obj[key]
-        return default
-
-    def cents_to_money(cents):
-        return round((cents / 100), 2)
-
-    def calculate_late_fee_cents(amount_remaining_cents):
-        return int(round(amount_remaining_cents * 0.015))
-
-    def late_fee_already_exists(customer_id, source_invoice_id, late_fee_month):
-        invoice_items= stripe.InvoiceItem.list(
-            customer= customer_id,
-        )
-
-        for invoice_item in invoice_items.auto_paging_iter():
-            metadata= stripe_get(invoice_item, "metadata", {})
-
-            if (
-                stripe_get(metadata, "type") == "late_fee"
-                and stripe_get(metadata, "source_invoice_id") == source_invoice_id
-                and stripe_get(metadata, "late_fee_month") == late_fee_month
-            ):
-                return True
-            
-        return False
+    # def calculate_late_fee_cents(amount_remaining_cents):
+    #     return int(round(amount_remaining_cents * 0.015))
 
     # retrieve invoice
     invoice = stripe.Invoice.retrieve(invoice_id)
@@ -2214,7 +2226,7 @@ def apply_late_fee_to_invoice(invoice_id):
         }
 
     # calculate late fee
-    late_fee_cents = calculate_late_fee_cents(amount_remaining)
+    late_fee_cents, base_cents = calculate_compounding_late_fee_cents(invoice)
 
     # create Stripe invoice item
     invoice_item= stripe.InvoiceItem.create(
@@ -2226,7 +2238,9 @@ def apply_late_fee_to_invoice(invoice_id):
         metadata={
             "type" : "late_fee",
             "source_invoice_id" : invoice_id,
-            "late_fee_month" : late_fee_month
+            "late_fee_month" : late_fee_month,
+            "compounding": "true",
+            "late_fee_base_cents": str(base_cents)
             }
     )
 
@@ -2237,6 +2251,8 @@ def apply_late_fee_to_invoice(invoice_id):
         "late_fee_month": late_fee_month,
         "late_fee": cents_to_money(late_fee_cents), 
         "late_fee_cents": late_fee_cents,
+        "late_fee_base": cents_to_money(base_cents),
+        "late_fee_base_cents": base_cents,
         "invoice_item_id": invoice_item.id
     }
 
@@ -2305,7 +2321,7 @@ def apply_late_fees():
                 customer_id= candidate["customer_id"],
                 invoice_item_id= None,
                 late_fee_month= candidate["late_fee_month"],
-                amount_cents= candidate["late_fee_cents"],
+                amount_cents= candidate["late_fee_cents"],                
                 status= "skipped",
                 reason= candidate.get("skip_reason"),
                 error= None,
@@ -2326,7 +2342,7 @@ def apply_late_fees():
                 customer_id= candidate["customer_id"],
                 invoice_item_id= result.get("invoice_item_id"),
                 late_fee_month= candidate["late_fee_month"],
-                amount_cents= candidate["late_fee_cents"],
+                amount_cents= result.get("late_fee_cents"),
                 status= result.get("status"),
                 reason= result.get("reason"),
                 error= None,
