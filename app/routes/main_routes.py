@@ -2382,3 +2382,45 @@ def apply_late_fees():
         #         c["invoice_id"]
         #     )
     }
+
+# Late fee logs
+@main.route("/admin/late-fee-logs")
+def late_fee_logs():
+    if not session.get("logged_in"):
+        return redirect("/login")
+    
+    logs= LateFeeLog.query.order_by(
+        LateFeeLog.created_at.desc()
+    ).limit(100).all()
+
+    return {
+        "count": len(logs),
+        "logs": [
+            {
+                "id": log.id,
+                "run_id": log.run_id,
+                "invoice_id": log.invoice_id,
+                "customer_id": log.customer_id,
+                "invoice_item_id": log.invoice_item_id,
+                "late_fee_month": log.late_fee_month,
+                "amount_cents": log.amount_cents,
+                "status": log.status,
+                "reason": log.reason,
+                "error": log.error,
+                "created_at": log.created_at.isoformat() if log.created_at else None,
+            }
+            for log in logs
+        ]
+    }
+
+    # above is python shorthand
+    # log_rows = []
+
+    # for log in logs:
+    #     row = {
+    #         "id": log.id,
+    #         "run_id": log.run_id,
+    #         "invoice_id": log.invoice_id,
+    #     }
+
+    #     log_rows.append(row)
