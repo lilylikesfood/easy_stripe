@@ -2440,3 +2440,124 @@ def late_fee_logs():
     #     }
 
     #     log_rows.append(row)
+
+# idempotency
+def carry_forward_already_exists(customer_id, source_invoice_id):
+    invoice_items= stripe.InvoiceItem.list(
+        customer=customer_id
+    )
+    for invoice_item in invoice_items.auto_paging_iter():
+        metadata= stripe_get(invoice_item, "metadata", {})
+
+        if (
+            stripe_get(metadata, "type") == "carry_forward_balance"
+            and stripe_get(metadata, "source_invoice_id") == source_invoice_id):
+            return True
+    return False
+
+# Carry-forward logic:
+# Move an old unpaid invoice balance onto a future invoice
+# by creating a new pending invoice item for the same customer.
+# Then mark the original invoice as uncollectible so Stripe does not
+# treat the same balance as collectible twice.
+def carry_forward_invoice_balance(invoice_id):
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    invoice = stripe.Invoice.retrieve(invoice_id)
+    
+    invoice_status= stripe_get(invoice, "status")
+    amount_remaining= stripe_get(invoice, "amount_remaining", 0)
+    customer_id= stripe_get(invoice, "customer")
+    invoice_number= stripe_get(invoice, "number")
+
+    if invoice_status != "open":
+        return {
+            "status": "skipped",
+            "reason": "Invoice is not open",
+            "invoice_id": invoice_id,
+            "invoice_status": invoice_status
+        }
+    
+    if amount_remaining <= 0:
+        return {
+            "status": "skipped", 
+            "reason": "Invoice has no remaining balance",
+            "invoice_id": invoice_id
+        }
+    
+    if not customer_id:
+        return {
+            "status": "skipped",
+            "reason": "Invoice is missing customer",
+            "invoice_id": invoice_id
+        }
+    
+    if carry_forward_already_exists(customer_id, invoice_id):
+        return {
+            "status": "skipped",
+            "reason": "Carry forward already exists",
+            "invoice_id": invoice_id
+        }
+    
+    metadata= {
+        "type": "carry_forward_balance",
+        "source_invoice_id": invoice_id,
+        "source_invoice_number": invoice_number or "",
+    }
+
+    invoice_item= stripe.InvoiceItem.create(
+        customer=customer_id, 
+        amount=amount_remaining,
+        currency="cad",
+        description=f"Previous unpaid balance - invoice {invoice_number}", 
+        metadata=metadata
+    )
+
+    stripe.Invoice.mark_uncollectible(invoice_id)
+
+    return {
+        "status": "success",
+        "invoice_id": invoice_id,
+        "invoice_number": invoice_number,
+        "customer_id": customer_id,
+        "amount_remaining_cents": amount_remaining,
+        "amount_remaining": cents_to_money(amount_remaining),
+        "invoice_item_id": invoice_item.id, 
+        "old_invoice_status": "uncollectible"
+    }
+
+@main.route("/admin/carry-forward-one/<invoice_id>", methods=["POST"])
+def test_carry_forward_one(invoice_id):
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
+
+    confirm = request.form.get("confirm")
+
+    if confirm != "APPLY":
+        return {
+            "error": "Confirmation required. Submit confirm=APPLY."
+        }, 400
+    
+    # safety check in test/live mode
+    mode= request.form.get("mode")
+
+    if mode not in ["test", "live"]:
+        return {
+            "error": "Mode required.Submit mode=test or mode=live."
+        }, 400
+    
+    is_live_key= current_app.config["STRIPE_SECRET_KEY"].startswith("sk_live_")
+
+    if mode == "live" and not is_live_key:
+        return {
+            "error": "You submitted mode=live, but Stripe key is not live."
+        }, 400
+    if mode == "test" and is_live_key:
+        return {
+            "error": "You submitted mode=test, but Stripe key is live."
+        }, 400
+
+    result = carry_forward_invoice_balance(invoice_id)
+
+    return result
+
