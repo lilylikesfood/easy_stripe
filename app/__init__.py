@@ -25,6 +25,7 @@ def create_app():
     from app.models.billing_run_control import BillingRunControl
     from app.models.schedule_repair_log import ScheduleRepairLog
     from app.models.late_fee_log import LateFeeLog
+    from app.models.carry_forward_log import CarryForwardLog
 
     migrate.init_app(app, db)
 

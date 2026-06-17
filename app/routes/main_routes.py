@@ -26,6 +26,8 @@ from app.services.pricing_service import PricingService
 
 from app.models.late_fee_log import LateFeeLog
 
+from app.models.carry_forward_log import CarryForwardLog
+
 main = Blueprint("main", __name__)
 
 
@@ -2700,11 +2702,40 @@ def apply_carry_forwards():
                 "reason": candidate["skip_reason"]
             })
 
+            log= CarryForwardLog(
+                run_id= run_id,
+                invoice_id= candidate["invoice_id"],
+                customer_id= candidate["customer_id"],
+                invoice_item_id= None,
+                amount_cents= candidate["amount_remaining_cents"],
+                status= "skipped",
+                old_invoice_status = None,
+                reason= candidate["skip_reason"],
+                error= None,
+            )
+
+            db.session.add(log)
+
             continue
 
         try:
             result= carry_forward_invoice_balance(candidate["invoice_id"])
             results.append(result)
+
+            log= CarryForwardLog(
+                run_id= run_id,
+                invoice_id= result.get("invoice_id"),
+                customer_id= result.get("customer_id"),
+                invoice_item_id= result.get("invoice_item_id"),
+                amount_cents= result.get("amount_remaining_cents"),
+                status= result.get("status"),
+                old_invoice_status = result.get("old_invoice_status"),
+                reason= None,
+                error= None
+            )
+
+            db.session.add(log)
+
 
         except Exception as e:
             results.append({
@@ -2712,6 +2743,22 @@ def apply_carry_forwards():
                 "invoice_id": candidate["invoice_id"],
                 "error": str(e)
             })
+
+            log= CarryForwardLog(
+                    run_id= run_id,
+                    invoice_id= candidate["invoice_id"],
+                    customer_id= candidate["customer_id"],
+                    invoice_item_id= None,
+                    amount_cents= candidate["amount_remaining_cents"],
+                    status= "failed",
+                    old_invoice_status = None,
+                    reason= None,
+                    error= str(e),
+                )
+            
+            db.session.add(log)
+
+    db.session.commit()
 
     return {
         "run_id": run_id,
