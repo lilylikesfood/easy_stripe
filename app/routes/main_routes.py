@@ -2527,7 +2527,7 @@ def carry_forward_invoice_balance(invoice_id):
     }
 
 @main.route("/admin/carry-forward-one/<invoice_id>", methods=["POST"])
-def test_carry_forward_one(invoice_id):
+def carry_forward_one(invoice_id):
     # if not session.get("logged_in"):
     #     return redirect("/login")
 
@@ -2561,3 +2561,93 @@ def test_carry_forward_one(invoice_id):
 
     return result
 
+# Who would be carried forward if we ran today?
+@main.route("/admin/audit-carry-forward")
+def audit_carry_forward():
+    if not session.get("logged_in"):
+        return redirect("/login")
+    
+    return find_carry_forward_candidates()
+    # def audit_carry_forward():
+    # result = find_carry_forward_candidates()
+    # return result
+    # the same thing
+
+def find_carry_forward_candidates():
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    candidates = []
+
+    now= datetime.now(timezone.utc)
+
+    invoices = stripe.Invoice.list(
+        status="open",
+        limit=100,
+        expand=["data.customer"]
+    )
+
+    for invoice in invoices.auto_paging_iter():
+        invoice_id= stripe_get(invoice, "id")
+        amount_remaining= stripe_get(invoice, "amount_remaining")
+        currency= stripe_get(invoice, "currency")
+        customer= stripe_get(invoice, "customer")
+        due_date_ts= stripe_get(invoice, "due_date")
+        created_ts= stripe_get(invoice, "created")
+
+        if currency != "cad":
+            continue
+
+        if amount_remaining <= 0:
+            continue
+
+        if due_date_ts:
+            effective_due_date = datetime.fromtimestamp(due_date_ts, tz=timezone.utc)
+        else:
+            effective_due_date = datetime.fromtimestamp(created_ts, tz=timezone.utc) + timedelta(days=20)
+
+        # raw_days = (now - effective_due_date).days
+        # testing
+        raw_days = 10
+
+        if raw_days <=0:
+            continue
+
+        days_overdue= raw_days
+
+        # if condition:
+        #     use A
+        # else:
+        #     use B
+
+        # A if condition else B
+        customer_id= stripe_get(customer, "id") if not isinstance(customer, str) else customer
+
+        eligible_to_apply= not carry_forward_already_exists(customer_id, invoice_id)
+
+        skip_reason= (
+            "carry forward already exists"
+            if not eligible_to_apply
+            else None
+        )
+
+        candidates.append({
+            "invoice_id": invoice_id,
+            "customer_id": customer_id,
+            "amount_remaining": cents_to_money(amount_remaining),
+            "amount_remaining_cents": amount_remaining,
+            "effective_due_date": effective_due_date.date().isoformat(),
+            "days_overdue": days_overdue,
+            "eligible_to_apply": eligible_to_apply,
+            "skip_reason": skip_reason
+        })
+
+        print(invoice_id, stripe_get(invoice, "number"))
+
+    return {
+        "summary": {
+            "candidate_count": len(candidates),
+            "eligible_count": sum(1 for c in candidates if c["eligible_to_apply"]),
+            "skipped_count": sum(1 for c in candidates if not c["eligible_to_apply"]),
+        },
+        "candidates": candidates
+    }
