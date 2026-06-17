@@ -2651,3 +2651,75 @@ def find_carry_forward_candidates():
         },
         "candidates": candidates
     }
+
+# bulk apply carry forward
+@main.route("/admin/apply-carry-forwards", methods=["POST"])
+def apply_carry_forwards():
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
+
+    confirm= request.form.get("confirm")
+
+    if confirm != "APPLY": 
+        return {
+            "error": "Confirmation required. Submit confirm=APPLY."
+        },400
+
+    # safety check in test/live mode
+    mode= request.form.get("mode")
+
+    if mode not in ["test", "live"]:
+        return {
+            "error": "Mode required.Submit mode=test or mode=live."
+        }, 400
+    
+    is_live_key= current_app.config["STRIPE_SECRET_KEY"].startswith("sk_live_")
+
+    if mode == "live" and not is_live_key:
+        return {
+            "error": "You submitted mode=live, but Stripe key is not live."
+        }, 400
+    if mode == "test" and is_live_key:
+        return {
+            "error": "You submitted mode=test, but Stripe key is live."
+        }, 400
+    
+    # uuid.uuid4() returns a UUID object.  not a string
+    run_id= str(uuid.uuid4())
+
+    audit_result= find_carry_forward_candidates()
+    candidates= audit_result["candidates"]
+
+    results= []
+
+    for candidate in candidates:
+        if not candidate["eligible_to_apply"]:
+            results.append({
+                "status": "skipped",
+                "invoice_id": candidate["invoice_id"],
+                "reason": candidate["skip_reason"]
+            })
+
+            continue
+
+        try:
+            result= carry_forward_invoice_balance(candidate["invoice_id"])
+            results.append(result)
+
+        except Exception as e:
+            results.append({
+                "status": "failed",
+                "invoice_id": candidate["invoice_id"],
+                "error": str(e)
+            })
+
+    return {
+        "run_id": run_id,
+        "status": "completed",
+        "total_candidates": len(candidates),
+        "results": results,
+        "eligible_count": sum(1 for c in candidates if c["eligible_to_apply"]),
+        "success_count": sum(1 for r in results if r["status"] == "success"),
+        "skipped_count": sum(1 for r in results if r["status"] == "skipped"),
+        "failed_count": sum(1 for r in results if r["status"] == "failed"),
+    }
