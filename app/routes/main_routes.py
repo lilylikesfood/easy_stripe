@@ -2770,3 +2770,32 @@ def apply_carry_forwards():
         "skipped_count": sum(1 for r in results if r["status"] == "skipped"),
         "failed_count": sum(1 for r in results if r["status"] == "failed"),
     }
+
+# admin carry forward log
+@main.route("/admin/carry-forward-logs")
+def carry_forward_logs(): 
+    # if not session.get("logged_in"):
+    #     return redirect("login")
+    
+    logs= CarryForwardLog.query.order_by(
+        CarryForwardLog.created_at.desc()
+    ).limit(100).all()
+
+    return {
+        "total_logs": CarryForwardLog.query.count(), 
+        "logs": [
+            {
+                "run_id": log.run_id,
+                "invoice_id": log.invoice_id,
+                "customer_id": log.customer_id,
+                "invoice_item_id": log.invoice_item_id,
+                "amount_cents": log.amount_cents,
+                "status": log.status,
+                "old_invoice_status" : log.old_invoice_status,
+                "reason": log.reason,
+                "error": log.error,
+                "created_at": log.created_at.isoformat() if log.created_at else None,
+            }
+            for log in logs
+        ]
+    }
