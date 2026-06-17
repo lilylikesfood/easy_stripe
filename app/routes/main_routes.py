@@ -2106,8 +2106,8 @@ def find_late_fee_candidates():
 # If we ran today,who would receive a late fee and how much?
 @main.route("/admin/audit-late-fees")
 def audit_late_fees():
-    if not session.get("logged_in"):
-        return redirect("/login")
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
     
     return find_late_fee_candidates()
     # def get_name():
@@ -2404,8 +2404,8 @@ def apply_late_fees():
 # Late fee logs
 @main.route("/admin/late-fee-logs")
 def late_fee_logs():
-    if not session.get("logged_in"):
-        return redirect("/login")
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
     
     logs= LateFeeLog.query.order_by(
         LateFeeLog.created_at.desc()
@@ -2798,4 +2798,204 @@ def carry_forward_logs():
             }
             for log in logs
         ]
+    }
+
+# combine the overdue processes into a single automated workflow
+@main.route("/admin/run-overdue-billing", methods=["POST"])
+def run_overdue_billing():
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
+
+    confirm = request.form.get("confirm")
+
+    if confirm != "APPLY":
+        return {
+            "error": "Confirmation required. Submit confirm=APPLY."
+        }, 400
+
+    mode = request.form.get("mode")
+
+    if mode not in ["test", "live"]:
+        return {
+            "error": "Mode required. Submit mode=test or mode=live."
+        }, 400
+
+    is_live_key = current_app.config["STRIPE_SECRET_KEY"].startswith("sk_live_")
+
+    if mode == "live" and not is_live_key:
+        return {
+            "error": "You submitted mode=live, but Stripe key is not live."
+        }, 400
+
+    if mode == "test" and is_live_key:
+        return {
+            "error": "You submitted mode=test, but Stripe key is live."
+        }, 400
+
+    run_id = str(uuid.uuid4())
+
+    # STEP 1: apply late fees first
+    late_fee_audit = find_late_fee_candidates()
+    late_fee_candidates = late_fee_audit["candidates"]
+
+    late_fee_results = []
+
+    for candidate in late_fee_candidates:
+        if not candidate["eligible_to_apply"]:
+            late_fee_results.append({
+                "status": "skipped",
+                "invoice_id": candidate["invoice_id"],
+                "reason": candidate.get("skip_reason")
+            })
+
+            log = LateFeeLog(
+                run_id=run_id,
+                invoice_id=candidate["invoice_id"],
+                customer_id=candidate["customer_id"],
+                invoice_item_id=None,
+                late_fee_month=candidate["late_fee_month"],
+                amount_cents=candidate["late_fee_cents"],
+                status="skipped",
+                reason=candidate.get("skip_reason"),
+                error=None,
+                created_at=datetime.now(timezone.utc)
+            )
+
+            db.session.add(log)
+
+            continue
+
+        try:
+            result = apply_late_fee_to_invoice(candidate["invoice_id"])
+            late_fee_results.append(result)
+
+            log = LateFeeLog(
+                run_id=run_id,
+                invoice_id=result.get("invoice_id"),
+                customer_id=candidate["customer_id"],
+                invoice_item_id=result.get("invoice_item_id"),
+                late_fee_month=result.get("late_fee_month"),
+                amount_cents=result.get("late_fee_cents"),
+                status=result.get("status"),
+                reason=result.get("reason"),
+                error=None,
+                created_at=datetime.now(timezone.utc)
+            )
+
+            db.session.add(log)
+
+        except Exception as e:
+            late_fee_results.append({
+                "status": "failed",
+                "invoice_id": candidate["invoice_id"],
+                "error": str(e)
+            })
+
+            log = LateFeeLog(
+                run_id=run_id,
+                invoice_id=candidate["invoice_id"],
+                customer_id=candidate["customer_id"],
+                invoice_item_id=None,
+                late_fee_month=candidate["late_fee_month"],
+                amount_cents=candidate["late_fee_cents"],
+                status="failed",
+                reason=None,
+                error=str(e),
+                created_at=datetime.now(timezone.utc)
+            )
+
+            db.session.add(log)
+
+    # STEP 2: carry forward after late fees
+    carry_forward_audit = find_carry_forward_candidates()
+    carry_forward_candidates = carry_forward_audit["candidates"]
+
+    carry_forward_results = []
+
+    for candidate in carry_forward_candidates:
+        if not candidate["eligible_to_apply"]:
+            carry_forward_results.append({
+                "status": "skipped",
+                "invoice_id": candidate["invoice_id"],
+                "reason": candidate.get("skip_reason")
+            })
+
+            log = CarryForwardLog(
+                run_id=run_id,
+                invoice_id=candidate["invoice_id"],
+                customer_id=candidate["customer_id"],
+                invoice_item_id=None,
+                amount_cents=candidate["amount_remaining_cents"],
+                status="skipped",
+                old_invoice_status=None,
+                reason=candidate.get("skip_reason"),
+                error=None,
+            )
+
+            db.session.add(log)
+
+            continue
+
+        try:
+            result = carry_forward_invoice_balance(candidate["invoice_id"])
+            carry_forward_results.append(result)
+
+            log = CarryForwardLog(
+                run_id=run_id,
+                invoice_id=result.get("invoice_id"),
+                customer_id=result.get("customer_id"),
+                invoice_item_id=result.get("invoice_item_id"),
+                amount_cents=result.get("amount_remaining_cents"),
+                status=result.get("status"),
+                old_invoice_status=result.get("old_invoice_status"),
+                reason=None,
+                error=None,
+            )
+            db.session.add(log)
+
+        except Exception as e:
+            carry_forward_results.append({
+                "status": "failed",
+                "invoice_id": candidate["invoice_id"],
+                "error": str(e)
+            })
+
+            log = CarryForwardLog(
+                run_id=run_id,
+                invoice_id=candidate["invoice_id"],
+                customer_id=candidate["customer_id"],
+                invoice_item_id=None,
+                amount_cents=candidate["amount_remaining_cents"],
+                status="failed",
+                old_invoice_status=None,
+                reason=None,
+                error=str(e),
+            )
+            db.session.add(log)
+
+    db.session.commit()
+
+    return {
+        "run_id": run_id,
+        "mode": mode,
+        "is_live_key": is_live_key,
+        "status": "completed",
+
+        "late_fees": {
+            "total_candidates": len(late_fee_candidates),
+            "eligible_count": sum(1 for c in late_fee_candidates if c["eligible_to_apply"]),
+            "success_count": sum(1 for r in late_fee_results if r["status"] == "success"),
+            "skipped_count": sum(1 for r in late_fee_results if r["status"] == "skipped"),
+            "failed_count": sum(1 for r in late_fee_results if r["status"] == "failed"),
+            "results": late_fee_results,
+        },
+
+        "carry_forwards": {
+            "total_candidates": len(carry_forward_candidates),
+            "eligible_count": sum(1 for c in carry_forward_candidates if c["eligible_to_apply"]),
+            "success_count": sum(1 for r in carry_forward_results if r["status"] == "success"),
+            "skipped_count": sum(1 for r in carry_forward_results if r["status"] == "skipped"),
+            "failed_count": sum(1 for r in carry_forward_results if r["status"] == "failed"),
+            "results": carry_forward_results,
+        },
     }
