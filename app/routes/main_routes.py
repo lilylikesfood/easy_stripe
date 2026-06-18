@@ -1627,7 +1627,7 @@ def audit_outstanding_balances():
             created_date = datetime.fromtimestamp(created_ts, tz=timezone.utc)
             effective_due_date = created_date + timedelta(days=20)
 
-        raw_age_days = (now - effective_due_date).days
+        raw_age_days = (now.date() - effective_due_date.date()).days
 
         if raw_age_days < 0:
             days_overdue = 0
@@ -2065,7 +2065,7 @@ def find_late_fee_candidates():
             created_date= datetime.fromtimestamp(created_ts, tz= timezone.utc)
             effective_due_date= created_date + timedelta(days=20)
 
-        raw_days= (now - effective_due_date).days
+        raw_days = (now.date() - effective_due_date.date()).days
         # for testing
         # raw_days = 10
 
@@ -2232,7 +2232,7 @@ def apply_late_fee_to_invoice(invoice_id):
         effective_due_date = datetime.fromtimestamp(created_ts, tz=timezone.utc) + timedelta(days=20)
 
     # calculate days overdue
-    days_overdue = (now - effective_due_date).days
+    days_overdue = (now.date() - effective_due_date.date()).days
     # days_overdue = 10
     
     if days_overdue <= 0:
@@ -2633,7 +2633,7 @@ def find_carry_forward_candidates():
         else:
             effective_due_date = datetime.fromtimestamp(created_ts, tz=timezone.utc) + timedelta(days=20)
 
-        raw_days = (now - effective_due_date).days
+        raw_days = (now.date() - effective_due_date.date()).days
         # testing
         # raw_days = 10
 
@@ -2668,8 +2668,6 @@ def find_carry_forward_candidates():
             "eligible_to_apply": eligible_to_apply,
             "skip_reason": skip_reason
         })
-
-        print(invoice_id, stripe_get(invoice, "number"))
 
     return {
         "summary": {
@@ -2801,7 +2799,7 @@ def apply_carry_forwards():
 @main.route("/admin/carry-forward-logs")
 def carry_forward_logs(): 
     if not session.get("logged_in"):
-        return redirect("login")
+        return redirect("/login")
     
     logs= CarryForwardLog.query.order_by(
         CarryForwardLog.created_at.desc()
@@ -3024,4 +3022,55 @@ def run_overdue_billing():
             "failed_count": sum(1 for r in carry_forward_results if r["status"] == "failed"),
             "results": carry_forward_results,
         },
+    }
+
+# audit due dates thats more than 20 days
+@main.route("/admin/audit-invoice-due-dates")
+def audit_invoice_due_dates(): 
+    if not session.get("logged_in"):
+        return redirect("/login")
+    
+    invoices= stripe.Invoice.list(
+        status="open",
+        limit=100
+    )
+
+    results = []
+
+    # 3. loop through invoices
+    for invoice in invoices.auto_paging_iter():
+
+        # 4. get created timestamp
+        created_ts = stripe_get(invoice, "created")
+        # 5. get due_date timestamp
+        due_ts = stripe_get(invoice, "due_date")
+        # 6. skip if no created timestamp
+        if not created_ts:
+            continue
+        # 7. skip if no due_date
+        # because no due_date means fallback rule applies later
+        if not due_ts:
+            continue
+        # 8. convert timestamps to dates
+        created_date = datetime.fromtimestamp(created_ts, tz=timezone.utc).date()
+        due_date = datetime.fromtimestamp(due_ts, tz=timezone.utc).date()
+        # 9. calculate days_between
+        days_between = (due_date - created_date).days
+        # 10. if days_between is NOT 20:
+        # append invoice info to results
+        if days_between != 20:
+            results.append({
+                "invoice_id": stripe_get(invoice, "id"),
+                "invoice_number": stripe_get(invoice, "number"),
+                "status": stripe_get(invoice, "status"),
+                "created_date": created_date.isoformat(),
+                "due_date": due_date.isoformat(),
+                "days_between": days_between,
+            })
+
+    # 11. return JSON summary
+    return {
+        "expected_due_days": 20,
+        "wrong_due_date_count": len(results),
+        "results": results
     }
