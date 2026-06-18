@@ -2065,9 +2065,9 @@ def find_late_fee_candidates():
             created_date= datetime.fromtimestamp(created_ts, tz= timezone.utc)
             effective_due_date= created_date + timedelta(days=20)
 
-        # raw_days= (now - effective_due_date).days
+        raw_days= (now - effective_due_date).days
         # for testing
-        raw_days = 10
+        # raw_days = 10
 
         if raw_days <= 0:
             continue
@@ -2132,8 +2132,8 @@ def find_late_fee_candidates():
 # If we ran today,who would receive a late fee and how much?
 @main.route("/admin/audit-late-fees")
 def audit_late_fees():
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not session.get("logged_in"):
+        return redirect("/login")
     
     return find_late_fee_candidates()
     # def get_name():
@@ -2232,8 +2232,8 @@ def apply_late_fee_to_invoice(invoice_id):
         effective_due_date = datetime.fromtimestamp(created_ts, tz=timezone.utc) + timedelta(days=20)
 
     # calculate days overdue
-    # days_overdue = (now - effective_due_date).days
-    days_overdue = 10
+    days_overdue = (now - effective_due_date).days
+    # days_overdue = 10
     
     if days_overdue <= 0:
         return {
@@ -2287,8 +2287,8 @@ def apply_late_fee_to_invoice(invoice_id):
 # apply late fee for one person before apply to all
 @main.route("/admin/apply-late-fee-one/<invoice_id>", methods=["POST"])
 def apply_late_fee_one(invoice_id):
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not session.get("logged_in"):
+        return redirect("/login")
     
     confirm= request.form.get("confirm")
 
@@ -2304,8 +2304,8 @@ def apply_late_fee_one(invoice_id):
 # Apply late fee to everyone
 @main.route("/admin/apply-late-fees", methods=["POST"])
 def apply_late_fees():
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not session.get("logged_in"):
+        return redirect("/login")
     
     confirm = request.form.get("confirm")
 
@@ -2430,8 +2430,8 @@ def apply_late_fees():
 # Late fee logs
 @main.route("/admin/late-fee-logs")
 def late_fee_logs():
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not session.get("logged_in"):
+        return redirect("/login")
     
     logs= LateFeeLog.query.order_by(
         LateFeeLog.created_at.desc()
@@ -2556,8 +2556,8 @@ def carry_forward_invoice_balance(invoice_id):
 
 @main.route("/admin/carry-forward-one/<invoice_id>", methods=["POST"])
 def carry_forward_one(invoice_id):
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not session.get("logged_in"):
+        return redirect("/login")
 
     confirm = request.form.get("confirm")
 
@@ -2633,9 +2633,9 @@ def find_carry_forward_candidates():
         else:
             effective_due_date = datetime.fromtimestamp(created_ts, tz=timezone.utc) + timedelta(days=20)
 
-        # raw_days = (now - effective_due_date).days
+        raw_days = (now - effective_due_date).days
         # testing
-        raw_days = 10
+        # raw_days = 10
 
         if raw_days <=0:
             continue
@@ -2683,8 +2683,8 @@ def find_carry_forward_candidates():
 # bulk apply carry forward
 @main.route("/admin/apply-carry-forwards", methods=["POST"])
 def apply_carry_forwards():
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not session.get("logged_in"):
+        return redirect("/login")
 
     confirm= request.form.get("confirm")
 
@@ -2800,8 +2800,8 @@ def apply_carry_forwards():
 # admin carry forward log
 @main.route("/admin/carry-forward-logs")
 def carry_forward_logs(): 
-    # if not session.get("logged_in"):
-    #     return redirect("login")
+    if not session.get("logged_in"):
+        return redirect("login")
     
     logs= CarryForwardLog.query.order_by(
         CarryForwardLog.created_at.desc()
@@ -2829,8 +2829,8 @@ def carry_forward_logs():
 # combine the overdue processes into a single automated workflow
 @main.route("/admin/run-overdue-billing", methods=["POST"])
 def run_overdue_billing():
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not session.get("logged_in"):
+        return redirect("/login")
 
     confirm = request.form.get("confirm")
 

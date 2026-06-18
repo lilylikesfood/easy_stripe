@@ -316,5 +316,83 @@
 
         </tbody>
     </table>
+
+    <!-- carry forward -->
+
+    <h1>Carry Forward Dashboard</h1>
+
+    <div class="cards">
+
+        <div class="card">
+            <h3>Total Carry Forwards</h3>
+            <p>{{ carry_forward_stats.total }}</p>
+        </div>
+
+        <div class="card">
+            <h3>Success</h3>
+            <p>{{ carry_forward_stats.success }}</p>
+        </div>
+
+        <div class="card">
+            <h3>Skipped</h3>
+            <p>{{ carry_forward_stats.skipped }}</p>
+        </div>
+
+        <div class="card">
+            <h3>Failed</h3>
+            <p>{{ carry_forward_stats.failed }}</p>
+        </div>
+    </div>
+
+    <table>
+
+    <thead>
+        <tr>
+            <th>Created At</th>
+            <th>Status</th>
+            <th>Invoice ID</th>
+            <th>Customer ID</th>
+            <th>Old Invoice Status</th>
+            <th>Amount</th>
+            <th>Reason / Error</th>
+        </tr>
+    </thead>
+
+    <tbody>
+
+        {% for log in carry_forward_logs %}
+        <tr>
+
+            <td>{{ log.created_at }}</td>
+
+            <td>{{ log.status }}</td>
+
+            <td>{{ log.invoice_id }}</td>
+
+            <td>{{ log.customer_id }}</td>
+
+            <td>{{ log.old_invoice_status }}</td>
+
+            <td>
+                ${{ "%.2f"|format(log.amount_cents / 100) }}
+            </td>
+
+            <td>
+                {% if log.error %}
+                    {{ log.error }}
+                {% elif log.reason %}
+                    {{ log.reason }}
+                {% else %}
+                    -
+                {% endif %}
+            </td>
+
+        </tr>
+        {% endfor %}
+
+    </tbody>
+
+    </table>
+
 </body>
 </html>
