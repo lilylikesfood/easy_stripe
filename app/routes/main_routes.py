@@ -173,21 +173,47 @@ def billing_dashboard():
     if not session.get("logged_in"):
         return redirect("/login")
 
-    logs = BillingIncreaseLog.query.order_by(
+    billing_increase_logs = BillingIncreaseLog.query.order_by(
         BillingIncreaseLog.created_at.desc()
     ).limit(200).all()
 
-    stats = {
+    billing_increase_stats = {
         "total": BillingIncreaseLog.query.count(),
         "success": BillingIncreaseLog.query.filter_by(status="success").count(),
         "skipped": BillingIncreaseLog.query.filter_by(status="skipped").count(),
         "failed": BillingIncreaseLog.query.filter_by(status="failed").count(),
     }
 
+    late_fee_logs= LateFeeLog.query.order_by(
+        LateFeeLog.created_at.desc()
+    ).limit(200).all()
+
+    late_fee_stats= {
+        "total": LateFeeLog.query.count(),
+        "success":LateFeeLog.query.filter_by(status="success").count(),
+        "skipped":LateFeeLog.query.filter_by(status="skipped").count(),
+        "failed":LateFeeLog.query.filter_by(status="failed").count(),
+    }
+
+    carry_forward_logs= CarryForwardLog.query.order_by(
+        CarryForwardLog.created_at.desc()
+    ).limit(200).all()
+
+    carry_forward_stats= {
+        "total": CarryForwardLog.query.count(),
+        "success":CarryForwardLog.query.filter_by(status="success").count(),
+        "skipped":CarryForwardLog.query.filter_by(status="skipped").count(),
+        "failed":CarryForwardLog.query.filter_by(status="failed").count(),
+    }
+
     return render_template(
         "billing_dashboard.html",
-        logs=logs,
-        stats=stats
+        billing_increase_logs=billing_increase_logs,
+        billing_increase_stats=billing_increase_stats,
+        late_fee_logs=late_fee_logs,
+        late_fee_stats=late_fee_stats,
+        carry_forward_logs=carry_forward_logs,
+        carry_forward_stats=carry_forward_stats,
     )
 
 # admin dashboard

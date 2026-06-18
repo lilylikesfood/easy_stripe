@@ -1,126 +1,3 @@
-<!-- <!DOCTYPE html>
-<html>
-<head>
-    <title>Billing Dashboard</title>
-    <style>
-        body {
-            font-family: Arial;
-            margin: 20px;
-            background: #f7f7f7;
-        }
-
-        h1 {
-            margin-bottom: 20px;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            background: white;
-        }
-
-        th, td {
-            padding: 12px;
-            border-bottom: 1px solid #eee;
-            text-align: left;
-            font-size: 14px;
-        }
-
-        th {
-            background: #111827;
-            color: white;
-        }
-
-        .success { color: green; font-weight: bold; }
-        .skipped { color: #999; }
-        .failed { color: red; font-weight: bold; }
-    </style>
-</head>
-
-<body>
-
-<h1>Billing Dashboard</h1>
-
-<div style="background:#111827;color:white;padding:20px;margin-bottom:20px;border-radius:10px;">
-    <h2>June 1 Price Increase</h2>
-
-    <p>
-        Status:
-        {% if stats.failed == 0 %}
-            <b style="color:lightgreen;">SUCCESS</b>
-        {% else %}
-            <b style="color:red;">ISSUES DETECTED</b>
-        {% endif %}
-    </p>
-
-    <p>Total subscriptions processed: {{ stats.total }}</p>
-</div>
-
-<div style="display:flex; gap:15px; margin-bottom:20px;">
-
-    <div style="background:white; padding:15px; flex:1;">
-        <h3>Total Items Processed</h3>
-        <p>{{ stats.total }}</p>
-    </div>
-
-    <div style="background:white; padding:15px; flex:1;">
-        <h3>Prices Successfully Updated</h3>
-        <p style="color:green;">{{ stats.success }}</p>
-    </div>
-
-    <div style="background:white; padding:15px; flex:1;">
-        <h3>Skipped (Not Eligible)</h3>
-        <p style="color:gray;">{{ stats.skipped }}</p>
-    </div>
-
-    <div style="background:white; padding:15px; flex:1;">
-        <h3>Failed Updates</h3>
-        <p style="color:red;">{{ stats.failed }}</p>
-    </div>
-
-</div>
-
-<table>
-    <thead>
-        <tr>
-            <th>Time</th>
-            <th>Run ID</th>
-            <th>Subscription</th>
-            <th>Product</th>
-            <th>Status</th>
-            <th>Old Price</th>
-            <th>New Price</th>
-        </tr>
-    </thead>
-
-    <tbody>
-        {% for log in logs %}
-        <tr>
-            <td>{{ log.created_at }}</td>
-            <td>{{ log.run_id }}</td>
-            <td>{{ log.subscription_id }}</td>
-            <td>{{ log.product_id }}</td>
-
-            <td>
-                {% if log.status == "success" %}
-                    <span class="success">SUCCESS</span>
-                {% elif log.status == "skipped" %}
-                    <span class="skipped">SKIPPED</span>
-                {% else %}
-                    <span class="failed">FAILED</span>
-                {% endif %}
-            </td>
-
-            <td>${{ log.old_amount / 100 if log.old_amount is not none else "-" }}</td>
-            <td>${{ log.new_amount / 100 if log.new_amount is not none else "-" }}</td>
-        </tr>
-        {% endfor %}
-    </tbody>
-</table>
-
-</body>
-</html> -->
-
 <!DOCTYPE html>
 <html>
 <head>
@@ -254,7 +131,7 @@
     <div class="banner">
         <h2>June 1 Annual Increase Status</h2>
 
-        {% if stats.failed == 0 %}
+        {% if billing_increase_stats.failed == 0 %}
             <p style="color:lightgreen;font-size:20px;">
                 ✓ SUCCESS - No failures detected
             </p>
@@ -266,7 +143,7 @@
 
         <p>
             Total billing records processed:
-            <strong>{{ stats.total }}</strong>
+            <strong>{{ billing_increase_stats.total }}</strong>
         </p>
     </div>
 
@@ -274,20 +151,20 @@
 
         <div class="card">
             <h3>Total Items Processed</h3>
-            <p>{{ stats.total }}</p>
+            <p>{{ billing_increase_stats.total }}</p>
         </div>
 
         <div class="card">
             <h3>Successfully Updated</h3>
             <p style="color:#16a34a;">
-                {{ stats.success }}
+                {{ billing_increase_stats.success }}
             </p>
         </div>
 
         <div class="card">
             <h3>Skipped</h3>
             <p style="color:#6b7280;">
-                {{ stats.skipped }}
+                {{ billing_increase_stats.skipped }}
             </p>
             <div class="small-text">
                 Not eligible for annual increase
@@ -297,7 +174,7 @@
         <div class="card">
             <h3>Failed</h3>
             <p style="color:#dc2626;">
-                {{ stats.failed }}
+                {{ billing_increase_stats.failed }}
             </p>
         </div>
 
@@ -317,7 +194,7 @@
 
         <tbody>
 
-        {% for log in logs %}
+        {% for log in billing_increase_logs %}
         <tr>
 
             <td>
@@ -377,5 +254,67 @@
 
     </table>
 
+    <!-- late fee -->
+    <h1>Late fee Dashboard</h1>
+
+    <div class="cards">
+
+        <div class="card">
+            <h3>Total Late fees</h3>
+            <p>{{late_fee_stats.total}}</p>
+        </div>
+
+        <div class="card">
+            <h3>Success</h3>
+            <p>{{late_fee_stats.success }}</p>
+        </div>
+
+        <div class="card">
+            <h3>Skipped</h3>
+            <p>{{late_fee_stats.skipped }}</p>
+        </div>
+
+        <div class="card">
+            <h3>Failed</h3>
+            <p>{{late_fee_stats.failed }}</p>
+        </div>
+    </div>
+
+    <table>
+
+        <thead>
+            <tr>
+                <th>Created At</th>
+                <th>Status</th>
+                <th>Invoice ID</th>
+                <th>Late Fee Month</th>
+                <th>Reason/Error</th>
+                <th>Amount</th>
+            </tr>
+        </thead>
+
+        <tbody>
+            {% for log in late_fee_logs %}
+            <tr>
+                <td>{{log.created_at}}</td>
+                <td>{{log.status}}</td>
+                <td>{{log.invoice_id}}</td>
+                <td>{{log.late_fee_month}}</td>
+                <td>
+                    {% if log.error %}
+                        {{log.error}}
+                    {% elif log.reason %}
+                        {{log.reason}}
+                    {% else %}
+                        - 
+                    {% endif %}
+                </td>
+                <td>${{"%.2f"| format(log.amount_cents / 100) }}</td>
+            </tr>
+            {% endfor %}
+
+
+        </tbody>
+    </table>
 </body>
 </html>
