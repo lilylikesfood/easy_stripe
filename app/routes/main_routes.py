@@ -28,6 +28,8 @@ from app.models.late_fee_log import LateFeeLog
 
 from app.models.carry_forward_log import CarryForwardLog
 
+from pprint import pprint
+
 main = Blueprint("main", __name__)
 
 
@@ -2202,6 +2204,7 @@ def apply_late_fee_to_invoice(invoice_id):
 
     # retrieve invoice
     invoice = stripe.Invoice.retrieve(invoice_id)
+    invoice_number= stripe_get(invoice, "number") or invoice_id
     invoice_status= stripe_get(invoice, "status")
     amount_remaining= stripe_get(invoice, "amount_remaining", 0)
     customer_id= stripe_get(invoice, "customer")
@@ -2262,10 +2265,11 @@ def apply_late_fee_to_invoice(invoice_id):
         amount=late_fee_cents,
         discountable=False,
         currency="cad",
-        description=f"Late payment charge - {late_fee_month} - invoice {invoice_id}",
+        description=f"Late payment charge (1.5%) - {late_fee_month} - invoice {invoice_number}",
         metadata={
             "type" : "late_fee",
             "source_invoice_id" : invoice_id,
+            "source_invoice_number": invoice_number,
             "late_fee_month" : late_fee_month,
             "compounding": "true",
             "late_fee_base_cents": str(base_cents)
@@ -2276,6 +2280,7 @@ def apply_late_fee_to_invoice(invoice_id):
     return {
         "status": "success",
         "invoice_id": invoice_id,
+        "invoice_number": invoice_number,
         "late_fee_month": late_fee_month,
         "late_fee": cents_to_money(late_fee_cents), 
         "late_fee_cents": late_fee_cents,
@@ -3039,6 +3044,9 @@ def audit_invoice_due_dates():
 
     # 3. loop through invoices
     for invoice in invoices.auto_paging_iter():
+        # debugging
+        # pprint(list(invoice._data.keys()))
+        # return {"debug": "printed on invoice keys"}
 
         # 4. get created timestamp
         created_ts = stripe_get(invoice, "created")
@@ -3056,6 +3064,11 @@ def audit_invoice_due_dates():
         due_date = datetime.fromtimestamp(due_ts, tz=timezone.utc).date()
         # 9. calculate days_between
         days_between = (due_date - created_date).days
+
+        parent= stripe_get(invoice, "parent", {})
+        subscription_details= stripe_get(parent, "subscription_details", {})
+        subscription_id= stripe_get(subscription_details, "subscription")
+
         # 10. if days_between is NOT 20:
         # append invoice info to results
         if days_between != 20:
@@ -3066,6 +3079,9 @@ def audit_invoice_due_dates():
                 "created_date": created_date.isoformat(),
                 "due_date": due_date.isoformat(),
                 "days_between": days_between,
+                "customer_id": stripe_get(invoice, "customer"),
+                "subscription_id": subscription_id,
+                "collection_method": stripe_get(invoice, "collection_method"),
             })
 
     # 11. return JSON summary
@@ -3074,3 +3090,25 @@ def audit_invoice_due_dates():
         "wrong_due_date_count": len(results),
         "results": results
     }
+
+# debug stripe object (not guessing)
+@main.route("/debug-invoice")
+def debug_invoice(): 
+    invocies= stripe.Invoice.list(limit=1)
+
+    invoice= invocies.data[0]
+
+    return invoice._to_dict_recursive()
+
+# create a papge for late fee implementation
+@main.route("/admin/late-fee-control")
+def late_fee_control():
+    if not session.get("logged_in"):
+        return redirect("/login")
+    
+    audit_result= find_late_fee_candidates()
+
+    return render_template(
+        "late_fee_control.html",
+        audit= audit_result
+    )
