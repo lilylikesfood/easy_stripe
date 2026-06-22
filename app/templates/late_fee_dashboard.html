@@ -10,7 +10,7 @@
 
     <h2>Late Fee Status</h2>
     {% if data.audit.summary.eligible_count > 0 and not data.today_status.ran_today %}
-        <p><strong>Action Needed:</strong> ⚠️Yes — late fees are waiting to be applied.</p>
+        <p><strong>Action Needed:</strong> ⚠️ Yes — late fees are waiting to be applied.</p>
     {% elif data.audit.summary.eligible_count == 0 and data.today_status.ran_today %}
         <p><strong>Action Needed:</strong> No — late fees already ran today.</p>
     {% elif data.audit.summary.eligible_count == 0 %}
@@ -30,6 +30,28 @@
         {% endif %}</p>
     <p>Invoices waiting for late fee: {{ data.audit.summary.eligible_count }}</p>
     <p>Total late fee if run now: {{ data.audit.summary.total_late_fee }}</p>
+
+    <hr>
+
+    <h2>Run Late fees</h2>
+    {% if data.audit.summary.eligible_count > 0  %}
+        <p>{{ data.audit.summary.eligible_count }} invoices are eligible right now. </p>
+
+        <form method="POST" action="/admin/apply-late-fees">
+            <input type="hidden" name="confirm" value="APPLY">
+            <input type="hidden" name="mode" value="live">
+            <input type="hidden" name="redirect_to_dashboard" value="true">
+
+            <button type="submit">Apply LIVE Late Fees</button>
+            <button type="submit" onclick="return confirm('Apply LIVE late fees now?');">
+                Apply LIVE Late Fees
+            </button>
+        </form>
+    {% else %}
+        <p>No late fees to apply right now.</p>
+    {% endif %}
+
+
 
     <hr>
 

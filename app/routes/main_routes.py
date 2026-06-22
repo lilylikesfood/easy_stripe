@@ -2414,6 +2414,11 @@ def apply_late_fees():
 
     already_applied_count= sum(1 for c in candidates if not c["eligible_to_apply"])
 
+    redirect_to_dashboard= request.form.get("redirect_to_dashboard")
+
+    if redirect_to_dashboard == "true":
+        return redirect("/admin/late-fee-dashboard")
+
     return {
         "run_id": run_id,
         "mode": mode,
