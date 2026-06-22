@@ -2544,6 +2544,24 @@ def carry_forward_invoice_balance(invoice_id):
             "invoice_id": invoice_id
         }
     
+    candidate = get_carry_forward_candidate_by_invoice_id(invoice_id)
+
+    if not candidate:
+        return {
+            "status": "skipped",
+            "reason": "Invoice is not currently a carry-forward candidate",
+            "invoice_id": invoice_id
+        }
+
+    if not candidate["eligible_to_apply"]:
+        return {
+            "status": "skipped",
+            "reason": candidate["skip_reason"],
+            "invoice_id": invoice_id,
+            "days_until_next_invoice": candidate.get("days_until_next_invoice"),
+            "next_invoice_date": candidate.get("next_invoice_date")
+        }
+    
     metadata= {
         "type": "carry_forward_balance",
         "source_invoice_id": invoice_id,
@@ -2573,8 +2591,8 @@ def carry_forward_invoice_balance(invoice_id):
 
 @main.route("/admin/carry-forward-one/<invoice_id>", methods=["POST"])
 def carry_forward_one(invoice_id):
-    if not session.get("logged_in"):
-        return redirect("/login")
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
 
     confirm = request.form.get("confirm")
 
@@ -2624,11 +2642,12 @@ def find_carry_forward_candidates():
     candidates = []
 
     now= datetime.now(timezone.utc)
+    today_toronto= datetime.now(TORONTO_TZ).date()
 
     invoices = stripe.Invoice.list(
         status="open",
         limit=100,
-        expand=["data.customer"]
+        expand=["data.customer", "data.subscription"]
     )
 
     for invoice in invoices.auto_paging_iter():
@@ -2636,6 +2655,8 @@ def find_carry_forward_candidates():
         amount_remaining= stripe_get(invoice, "amount_remaining")
         currency= stripe_get(invoice, "currency")
         customer= stripe_get(invoice, "customer")
+        parent = stripe_get(invoice, "parent")
+        subscription = stripe_get(invoice, "subscription")
         due_date_ts= stripe_get(invoice, "due_date")
         created_ts= stripe_get(invoice, "created")
 
@@ -2667,17 +2688,80 @@ def find_carry_forward_candidates():
         # A if condition else B
         customer_id= stripe_get(customer, "id") if not isinstance(customer, str) else customer
 
-        eligible_to_apply= not carry_forward_already_exists(customer_id, invoice_id)
+        # carry forward 1 day before the next invoice is generated
+        subscription_id = stripe_get(subscription, "id") if not isinstance(subscription, str) else subscription
 
-        skip_reason= (
-            "carry forward already exists"
-            if not eligible_to_apply
-            else None
+        parent_subscription_id = None
+
+        if parent:
+            parent_subscription_details = stripe_get(parent, "subscription_details")
+
+            if parent_subscription_details:
+                parent_subscription_id = stripe_get(parent_subscription_details, "subscription")
+
+        if not subscription and parent_subscription_id:
+            subscription = stripe.Subscription.retrieve(parent_subscription_id)
+            subscription_id = stripe_get(subscription, "id")
+
+        if not subscription:
+            for status in ["active", "past_due"]:
+                customer_subscriptions = stripe.Subscription.list(
+                    customer=customer_id,
+                    status=status,
+                    limit=1
+                )
+
+                if customer_subscriptions.data:
+                    subscription = customer_subscriptions.data[0]
+                    subscription_id = stripe_get(subscription, "id")
+                    break
+
+        next_invoice_date = None
+        days_until_next_invoice = None
+
+        if subscription and not isinstance(subscription, str):
+            current_period_end_ts = stripe_get(subscription, "current_period_end")
+            billing_cycle_anchor_ts = stripe_get(subscription, "billing_cycle_anchor")
+
+            if current_period_end_ts:
+                next_invoice_dt = datetime.fromtimestamp(current_period_end_ts, tz=timezone.utc)
+                next_invoice_date = next_invoice_dt.astimezone(TORONTO_TZ).date()
+
+            elif billing_cycle_anchor_ts:
+                next_invoice_date = get_next_monthly_billing_date_from_anchor(
+                    billing_cycle_anchor_ts,
+                    today_toronto
+                )
+
+            if next_invoice_date:
+                days_until_next_invoice = (next_invoice_date - today_toronto).days
+
+        already_exists = carry_forward_already_exists(customer_id, invoice_id)
+
+        eligible_to_apply = (
+            not already_exists
+            and days_until_next_invoice == 1
         )
+
+        if already_exists:
+            skip_reason = "carry forward already exists"
+        elif subscription is None:
+            skip_reason = "next invoice date cannot be determined automatically"
+        elif isinstance(subscription, str):
+            skip_reason = "subscription was not expanded"
+        elif days_until_next_invoice is None:
+            skip_reason = "next invoice date unavailable"
+        elif days_until_next_invoice != 1:
+            skip_reason = f"next invoice is not tomorrow; days_until_next_invoice={days_until_next_invoice}"
+        else:
+            skip_reason = None
 
         candidates.append({
             "invoice_id": invoice_id,
             "customer_id": customer_id,
+            "subscription_id": subscription_id,
+            "next_invoice_date": next_invoice_date.isoformat() if next_invoice_date else None,
+            "days_until_next_invoice": days_until_next_invoice,
             "amount_remaining": cents_to_money(amount_remaining),
             "amount_remaining_cents": amount_remaining,
             "effective_due_date": effective_due_date.date().isoformat(),
@@ -2691,8 +2775,119 @@ def find_carry_forward_candidates():
             "candidate_count": len(candidates),
             "eligible_count": sum(1 for c in candidates if c["eligible_to_apply"]),
             "skipped_count": sum(1 for c in candidates if not c["eligible_to_apply"]),
+            "next_invoice_tomorrow_count": sum(1 for c in candidates if c["days_until_next_invoice"] == 1),
+            "with_next_invoice_date_count": sum(1 for c in candidates if c["next_invoice_date"] is not None),
+            "missing_next_invoice_date_count": sum(1 for c in candidates if c["next_invoice_date"] is None),
         },
         "candidates": candidates
+    }
+
+def get_carry_forward_candidate_by_invoice_id(invoice_id):
+    audit_result = find_carry_forward_candidates()
+
+    for candidate in audit_result["candidates"]:
+        if candidate["invoice_id"] == invoice_id:
+            return candidate
+
+    return None
+
+# debug-subscription
+@main.route("/admin/debug-subscription/<subscription_id>")
+def debug_subscription(subscription_id):
+    if not session.get("logged_in"):
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    sub = stripe.Subscription.retrieve(subscription_id)
+
+    return {
+        "id": stripe_get(sub, "id"),
+        "status": stripe_get(sub, "status"),
+        "current_period_start": stripe_get(sub, "current_period_start"),
+        "current_period_end": stripe_get(sub, "current_period_end"),
+        "billing_cycle_anchor": stripe_get(sub, "billing_cycle_anchor"),
+        "cancel_at_period_end": stripe_get(sub, "cancel_at_period_end"),
+        "collection_method": stripe_get(sub, "collection_method"),
+        "items_count": len(stripe_get(stripe_get(sub, "items"), "data", []))
+    }
+
+def get_next_monthly_billing_date_from_anchor(anchor_ts, today_date):
+    anchor_dt = datetime.fromtimestamp(anchor_ts, tz=timezone.utc).astimezone(TORONTO_TZ)
+
+    year = today_date.year
+    month = today_date.month
+
+    candidate = anchor_dt.replace(year=year, month=month).date()
+
+    if candidate <= today_date:
+        if month == 12:
+            candidate = anchor_dt.replace(year=year + 1, month=1).date()
+        else:
+            candidate = anchor_dt.replace(year=year, month=month + 1).date()
+
+    return candidate
+
+# debug invoice
+@main.route("/admin/debug-carry-forward-invoice/<invoice_id>")
+def debug_carry_forward_invoice(invoice_id):
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    invoice = stripe.Invoice.retrieve(invoice_id)
+    parent = stripe_get(invoice, "parent")
+    subscription_details = stripe_get(invoice, "subscription_details")
+    
+
+    return {
+        "id": stripe_get(invoice, "id"),
+        "created": stripe_get(invoice, "created"),
+        "due_date": stripe_get(invoice, "due_date"),
+        "subscription": stripe_get(invoice, "subscription"),
+        "parent_type": type(parent).__name__ if parent else None,
+        "parent_str": str(parent) if parent else None,
+        "subscription_details_type": type(subscription_details).__name__ if subscription_details else None,
+        "subscription_details_str": str(subscription_details) if subscription_details else None,
+        "period_start": stripe_get(invoice, "period_start"),
+        "period_end": stripe_get(invoice, "period_end"),
+        "status": stripe_get(invoice, "status"),
+        "collection_method": stripe_get(invoice, "collection_method")
+    }
+
+# debug customer
+@main.route("/admin/debug-customer/<customer_id>")
+def debug_customer(customer_id):
+
+    if not session.get("logged_in"):
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    customer = stripe.Customer.retrieve(customer_id)
+
+    subscriptions = stripe.Subscription.list(
+        customer=customer_id,
+        status="all",
+        limit=100
+    )
+
+    return {
+        "customer_id": stripe_get(customer, "id"),
+        "customer_name": stripe_get(customer, "name"),
+        "customer_email": stripe_get(customer, "email"),
+
+        "subscription_count": len(subscriptions.data),
+
+        "subscriptions": [
+            {
+                "id": stripe_get(sub, "id"),
+                "status": stripe_get(sub, "status"),
+                "billing_cycle_anchor": stripe_get(sub, "billing_cycle_anchor"),
+                "current_period_start": stripe_get(sub, "current_period_start"),
+                "current_period_end": stripe_get(sub, "current_period_end"),
+                "cancel_at_period_end": stripe_get(sub, "cancel_at_period_end"),
+            }
+            for sub in subscriptions.data
+        ]
     }
 
 # bulk apply carry forward
@@ -2844,8 +3039,8 @@ def carry_forward_logs():
 # combine the overdue processes into a single automated workflow
 @main.route("/admin/run-overdue-billing", methods=["POST"])
 def run_overdue_billing():
-    if not session.get("logged_in"):
-        return redirect("/login")
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
 
     confirm = request.form.get("confirm")
 
