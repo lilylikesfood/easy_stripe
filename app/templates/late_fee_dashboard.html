@@ -42,10 +42,7 @@
             <input type="hidden" name="mode" value="live">
             <input type="hidden" name="redirect_to_dashboard" value="true">
 
-            <button type="submit">Apply LIVE Late Fees</button>
-            <button type="submit" onclick="return confirm('Apply LIVE late fees now?');">
-                Apply LIVE Late Fees
-            </button>
+            <button type="submit" onclick="return confirm('Apply LIVE late fees now?');">Apply LIVE Late Fees</button>
         </form>
     {% else %}
         <p>No late fees to apply right now.</p>
@@ -61,6 +58,34 @@
     <p>Failed: {{ data.today_status.failed_count }}</p>
     <p>Skipped: {{ data.today_status.skipped_count }}</p>
     <p>Total applied: {{ data.today_status.total_amount }}</p>
+
+    <h3>Recent Log Details</h3>
+    <table border="1">
+        <thead>
+            <tr>
+                <th>Time</th>
+                <th>Status</th>
+                <th>Invoice</th>
+                <th>Invoice Item</th>
+                <th>Amount</th>
+                <th>Reason / Error</th>
+            </tr>
+        </thead>
+
+        <tbody>
+            {% for log in data.recent_logs %}
+            <tr>
+                <td>{{ log.created_at }}</td>
+                <td>{{ log.status }}</td>
+                <td>{{ log.invoice_number }}</td>
+                <td>{{ log.invoice_item_id or "-" }}</td>
+                <td>{{ log.amount }}</td>
+                <td>{{ log.reason_or_error or "-" }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+
+    </table>
 
 
     

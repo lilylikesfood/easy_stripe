@@ -2081,6 +2081,7 @@ def find_late_fee_candidates():
         late_fee_cents, base_cents = calculate_compounding_late_fee_cents(invoice)                  
         
         invoice_id= stripe_get(invoice, "id")
+        invoice_number = stripe_get(invoice, "number")
 
         already_applied= late_fee_already_exists(
             customer_id,
@@ -2096,6 +2097,7 @@ def find_late_fee_candidates():
             "customer_name": customer_name,
             "customer_email": customer_email,
             "invoice_id": invoice_id,
+            "invoice_number": invoice_number,
             "collection_method": stripe_get(invoice, "collection_method"),
             "amount_remaining": cents_to_money(amount_remaining),
             "effective_due_date": effective_due_date.date().isoformat(),
@@ -2353,6 +2355,7 @@ def apply_late_fees():
             log= LateFeeLog(
                 run_id= run_id,
                 invoice_id= candidate["invoice_id"],
+                invoice_number=candidate.get("invoice_number"),
                 customer_id= candidate["customer_id"],
                 invoice_item_id= None,
                 late_fee_month= candidate["late_fee_month"],
@@ -2374,6 +2377,7 @@ def apply_late_fees():
             log= LateFeeLog(
                 run_id= run_id,
                 invoice_id= result.get("invoice_id"),
+                invoice_number=result.get("invoice_number"),
                 customer_id= candidate["customer_id"],
                 invoice_item_id= result.get("invoice_item_id"),
                 late_fee_month= candidate["late_fee_month"],
@@ -2397,6 +2401,7 @@ def apply_late_fees():
             log= LateFeeLog(
                 run_id= run_id,
                 invoice_id= candidate["invoice_id"],
+                invoice_number=candidate.get("invoice_number"),
                 customer_id= candidate["customer_id"],
                 invoice_item_id= None,
                 late_fee_month= candidate["late_fee_month"],
@@ -3167,6 +3172,26 @@ def get_late_fee_dashboard_data():
         else:
             ran_today = False
 
+    recent_logs= []
+
+    for log in run_logs:
+        created_at= log.created_at
+
+        if created_at.tzinfo is None:
+            created_at= created_at.replace(tzinfo=timezone.utc)
+
+        created_at_toronto= created_at.astimezone(TORONTO_TZ)
+
+        recent_logs.append({
+            "created_at": created_at_toronto.strftime("%Y-%m-%d %I:%M %p"),
+            "status": log.status,
+            "invoice_id": log.invoice_id,
+            "invoice_number": log.invoice_number or log.invoice_id,
+            "invoice_item_id": log.invoice_item_id,
+            "amount": f"${cents_to_money(log.amount_cents):.2f}",
+            "reason_or_error": log.reason or log.error or "-"
+        })
+
     return {
         "audit": audit_result,        
         "today_status": {
@@ -3176,7 +3201,8 @@ def get_late_fee_dashboard_data():
             "failed_count": failed_count,
             "skipped_count": skipped_count,
             "total_amount": f"${cents_to_money(total_amount_cents):.2f}",
-        }
+        },
+        "recent_logs": recent_logs,
     }
 
 @main.route("/admin/late-fee-dashboard")

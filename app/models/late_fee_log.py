@@ -7,6 +7,7 @@ class LateFeeLog(db.Model):
     run_id= db.Column(db.String(100), nullable=False)
 
     invoice_id= db.Column(db.String(100), nullable=False)
+    invoice_number = db.Column(db.String(100), nullable=True)
     customer_id= db.Column(db.String(100), nullable=True)
     invoice_item_id= db.Column(db.String(100), nullable=True)
 
