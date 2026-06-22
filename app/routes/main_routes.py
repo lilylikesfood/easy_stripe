@@ -30,6 +30,8 @@ from app.models.carry_forward_log import CarryForwardLog
 
 from pprint import pprint
 
+from app.scheduler.scheduler import TORONTO_TZ
+
 main = Blueprint("main", __name__)
 
 
@@ -3111,4 +3113,75 @@ def late_fee_control():
     return render_template(
         "late_fee_control.html",
         audit= audit_result
+    )
+
+# get_late_fee_dashboard_data
+def get_late_fee_dashboard_data():
+    audit_result = find_late_fee_candidates()
+
+    run_logs = []
+
+    latest_log= LateFeeLog.query.order_by(
+        LateFeeLog.created_at.desc()
+    ).first()
+
+    if latest_log:
+        run_id= latest_log.run_id
+    
+        run_logs= LateFeeLog.query.filter_by(
+            run_id=run_id
+        ).all()
+
+    total_amount_cents= 0
+
+    for log in run_logs: 
+        if log.status == "success":
+            total_amount_cents += log.amount_cents or 0
+
+    last_run_time = None
+    last_run_time_toronto = None
+    ran_today = False
+    
+    # 5. calculate:
+    success_count= sum(1 for r in run_logs if r.status == "success")
+    failed_count= sum(1 for r in run_logs if r.status == "failed")
+    skipped_count= sum(1 for r in run_logs if r.status == "skipped")
+    
+    if latest_log:
+        last_run_time = latest_log.created_at
+
+        if last_run_time.tzinfo is None:
+            last_run_time = last_run_time.replace(tzinfo=timezone.utc)
+
+        last_run_time_toronto = last_run_time.astimezone(TORONTO_TZ)
+
+        now_toronto = datetime.now(TORONTO_TZ).date()
+
+        if last_run_time_toronto.date() == now_toronto:
+            ran_today = True
+        else:
+            ran_today = False
+
+    return {
+        "audit": audit_result,        
+        "today_status": {
+            "ran_today": ran_today,
+            "last_run_time": last_run_time_toronto.strftime("%Y-%m-%d %I:%M %p") if last_run_time_toronto else None,
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "skipped_count": skipped_count,
+            "total_amount": f"${cents_to_money(total_amount_cents):.2f}",
+        }
+    }
+
+@main.route("/admin/late-fee-dashboard")
+def late_fee_dashboard():
+    if not session.get("logged_in"):
+        return redirect("/login")
+    
+    data= get_late_fee_dashboard_data()
+
+    return render_template(
+        "late_fee_dashboard.html",
+        data=data
     )

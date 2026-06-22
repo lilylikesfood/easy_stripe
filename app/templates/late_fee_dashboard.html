@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Late Fee Dashboard</title>
+</head>
+<body>
+    <h1>Late Fee Dashboard</h1>
+
+    <h2>Late Fee Status</h2>
+    {% if data.audit.summary.eligible_count > 0 and not data.today_status.ran_today %}
+        <p><strong>Action Needed:</strong> ⚠️Yes — late fees are waiting to be applied.</p>
+    {% elif data.audit.summary.eligible_count == 0 and data.today_status.ran_today %}
+        <p><strong>Action Needed:</strong> No — late fees already ran today.</p>
+    {% elif data.audit.summary.eligible_count == 0 %}
+        <p><strong>Action Needed:</strong> No — no eligible late fees right now.</p>
+    {% else %}
+        <p><strong>Action Needed:</strong> Review needed.</p>
+    {% endif %}
+
+    <hr>
+
+    <h2>Current Audit</h2>
+    <p>Late fees run today: 
+        {% if data.today_status.ran_today %}
+            Yes
+        {% else %}
+            No
+        {% endif %}</p>
+    <p>Invoices waiting for late fee: {{ data.audit.summary.eligible_count }}</p>
+    <p>Total late fee if run now: {{ data.audit.summary.total_late_fee }}</p>
+
+    <hr>
+
+    <h2>Last Run Summary</h2>
+    <p>Last run: {{ data.today_status.last_run_time }}</p>
+    <p>Late fees applied: {{ data.today_status.success_count }}</p>
+    <p>Failed: {{ data.today_status.failed_count }}</p>
+    <p>Skipped: {{ data.today_status.skipped_count }}</p>
+    <p>Total applied: {{ data.today_status.total_amount }}</p>
+
+
+    
+
+</body>
+</html>
