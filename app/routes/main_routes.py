@@ -2519,25 +2519,13 @@ def late_fee_logs():
         LateFeeLog.created_at.desc()
     ).limit(100).all()
 
-    return {
-        "count": len(logs),
-        "logs": [
-            {
-                "id": log.id,
-                "run_id": log.run_id,
-                "invoice_id": log.invoice_id,
-                "customer_id": log.customer_id,
-                "invoice_item_id": log.invoice_item_id,
-                "late_fee_month": log.late_fee_month,
-                "amount_cents": log.amount_cents,
-                "status": log.status,
-                "reason": log.reason,
-                "error": log.error,
-                "created_at": log.created_at.isoformat() if log.created_at else None,
-            }
-            for log in logs
-        ]
-    }
+    return render_template(
+        "late_fee_logs.html",
+        logs=logs,
+        total_logs=LateFeeLog.query.count(),
+        TORONTO_TZ=TORONTO_TZ,
+        timezone=timezone,
+    )
 
     # above is python shorthand
     # log_rows = []
@@ -3082,24 +3070,13 @@ def carry_forward_logs():
         CarryForwardLog.created_at.desc()
     ).limit(100).all()
 
-    return {
-        "total_logs": CarryForwardLog.query.count(), 
-        "logs": [
-            {
-                "run_id": log.run_id,
-                "invoice_id": log.invoice_id,
-                "customer_id": log.customer_id,
-                "invoice_item_id": log.invoice_item_id,
-                "amount_cents": log.amount_cents,
-                "status": log.status,
-                "old_invoice_status" : log.old_invoice_status,
-                "reason": log.reason,
-                "error": log.error,
-                "created_at": log.created_at.isoformat() if log.created_at else None,
-            }
-            for log in logs
-        ]
-    }
+    return render_template(
+        "carry_forward_logs.html", 
+        logs=logs,
+        total_logs=CarryForwardLog.query.count(),
+        TORONTO_TZ=TORONTO_TZ,
+        timezone=timezone,
+    )
 
 # billing increase log
 @main.route("/admin/billing-increase-logs")
@@ -3111,25 +3088,13 @@ def billing_increase_logs():
         BillingIncreaseLog.created_at.desc()
     ).limit(100).all()
 
-    return{
-        "total_logs": BillingIncreaseLog.query.count(),
-        "logs": [
-            {
-                "run_id": log.run_id,
-                "subscription_id": log.subscription_id,
-                "product_id": log.product_id,
-                "customer_id": log.customer_id,
-                "old_amount" : log.old_amount,
-                "new_amount" :log.new_amount,
-                "increase_percentage": log.increase_percentage,
-                "status": log.status,
-                "reason": log.reason,
-                "error_code": log.error_code,
-                "created_at": log.created_at.isoformat() if log.created_at else None,
-            }
-            for log in logs
-        ]
-    }
+    return render_template(
+        "billing_increase_logs.html",
+        logs=logs, 
+        total_logs=BillingIncreaseLog.query.count(),
+        TORONTO_TZ=TORONTO_TZ,
+        timezone=timezone, 
+    )
 
 # combine the overdue processes into a single automated workflow
 @main.route("/admin/run-overdue-billing", methods=["POST"])

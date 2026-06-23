@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Late Fee Logs</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 30px;
+            background: #f5f7fa;
+        }
+
+        h1 {
+            margin-bottom: 20px;
+        }
+
+        .badge-success {
+            background: #16a34a;
+            color: white;
+            padding: 4px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .badge-skipped {
+            background: #6b7280;
+            color: white;
+            padding: 4px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .badge-failed {
+            background: #dc2626;
+            color: white;
+            padding: 4px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <h1>Late Fee Logs</h1>
+
+    <p>Total logs: {{ total_logs }}</p>
+    <p>
+        <a href="/billing-dashboard">Back to Billing Dashboard</a>
+    </p>
+
+    <table border="1" cellpadding="8">
+        <thead>
+            <tr>
+                <th>Created At</th>
+                <th>Status</th>
+                <th>Invoice Number</th>
+                <th>Customer</th>
+                <th>Late Fee Month</th>
+                <th>Invoice ID</th>
+                <th>Amount</th>
+                <th>Reason</th>
+                <th>Error</th>
+            </tr>
+        </thead>
+
+        <tbody>
+            {% for log in logs %}
+            <tr>
+                <td>{{ log.created_at.replace(tzinfo=timezone.utc).astimezone(TORONTO_TZ).strftime("%Y-%m-%d %I:%M %p") if log.created_at else "-" }}</td>
+                <td>
+                    {% if log.status == "success" %}
+                        <span class="badge-success">
+                            SUCCESS
+                        </span>
+
+                    {% elif log.status == "skipped" %}
+                        <span class="badge-skipped">
+                            SKIPPED
+                        </span>
+
+                    {% else %}
+                        <span class="badge-failed">
+                            FAILED
+                        </span>
+                    {% endif %}
+                </td>
+                <td>{{ log.invoice_number }}</td>
+                <td>{{ log.customer_id or "-" }}</td>
+                <td>{{ log.late_fee_month or "-" }}</td>
+                <td>{{ log.invoice_id or "-" }}</td>
+                <td>${{ "%.2f"|format((log.amount_cents or 0) / 100) }}</td>
+                <td>{{ log.reason or "-" }}</td>
+                <td>{{ log.error or "-" }}</td>
+
+            </tr>
+            {% endfor %}
+        </tbody>
+
+    </table>
+</body>
+</html>
