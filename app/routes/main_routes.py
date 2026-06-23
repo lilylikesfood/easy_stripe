@@ -179,7 +179,7 @@ def billing_dashboard():
 
     billing_increase_logs = BillingIncreaseLog.query.order_by(
         BillingIncreaseLog.created_at.desc()
-    ).limit(200).all()
+    ).limit(20).all()
 
     billing_increase_stats = {
         "total": BillingIncreaseLog.query.count(),
@@ -190,7 +190,7 @@ def billing_dashboard():
 
     late_fee_logs= LateFeeLog.query.order_by(
         LateFeeLog.created_at.desc()
-    ).limit(200).all()
+    ).limit(20).all()
 
     late_fee_stats= {
         "total": LateFeeLog.query.count(),
@@ -201,7 +201,7 @@ def billing_dashboard():
 
     carry_forward_logs= CarryForwardLog.query.order_by(
         CarryForwardLog.created_at.desc()
-    ).limit(200).all()
+    ).limit(20).all()
 
     carry_forward_stats= {
         "total": CarryForwardLog.query.count(),
@@ -218,6 +218,8 @@ def billing_dashboard():
         late_fee_stats=late_fee_stats,
         carry_forward_logs=carry_forward_logs,
         carry_forward_stats=carry_forward_stats,
+        TORONTO_TZ=TORONTO_TZ,
+        timezone=timezone,
     )
 
 # admin dashboard
@@ -2193,6 +2195,22 @@ def calculate_compounding_late_fee_cents(invoice):
 
     return late_fee_cents, base_cents
 
+def format_invoice_period(start_ts, end_ts):
+    if not start_ts or not end_ts:
+        return "invoice period unavailable"
+    
+    start= datetime.fromtimestamp(start_ts, tz=timezone.utc)
+    end= datetime.fromtimestamp(end_ts, tz=timezone.utc)
+
+    if start.year == end.year:
+        start_text= f"{start.strftime('%b')} {start.day}"
+        end_text= f"{end.strftime('%b')} {end.day}, {end.year}"
+    else: 
+        start_text= f"{start.strftime('%b')} {start.day}, {start.year}"
+        end_text= f"{end.strftime('%b')} {end.day}, {end.year}"
+
+    return f"{start_text} - {end_text}"
+
 # Helper function
 # business logic
 def apply_late_fee_to_invoice(invoice_id):   
@@ -2214,6 +2232,11 @@ def apply_late_fee_to_invoice(invoice_id):
     customer_id= stripe_get(invoice, "customer")
     due_date_ts= stripe_get(invoice, "due_date")
     created_ts= stripe_get(invoice, "created")
+
+    period_start_ts=stripe_get(invoice, "period_start")
+    period_end_ts= stripe_get(invoice, "period_end")
+
+    invoice_period= format_invoice_period(period_start_ts, period_end_ts)
 
     # validate invoice is open
     if invoice_status != "open":
@@ -2263,13 +2286,16 @@ def apply_late_fee_to_invoice(invoice_id):
     # calculate late fee
     late_fee_cents, base_cents = calculate_compounding_late_fee_cents(invoice)
 
+    # debug print
+    print("INVOICE PERIOD:", invoice_period)
+
     # create Stripe invoice item
     invoice_item= stripe.InvoiceItem.create(
         customer=customer_id,
         amount=late_fee_cents,
         discountable=False,
         currency="cad",
-        description=f"Late payment charge (1.5%) - {late_fee_month} - invoice {invoice_number}",
+        description=f"Late payment charge (1.5%) - invoice {invoice_number} - {invoice_period}",
         metadata={
             "type" : "late_fee",
             "source_invoice_id" : invoice_id,
@@ -2283,8 +2309,10 @@ def apply_late_fee_to_invoice(invoice_id):
     # return success response
     return {
         "status": "success",
+        "customer_id": customer_id,
         "invoice_id": invoice_id,
         "invoice_number": invoice_number,
+        "invoice_period": invoice_period,
         "late_fee_month": late_fee_month,
         "late_fee": cents_to_money(late_fee_cents), 
         "late_fee_cents": late_fee_cents,
@@ -2296,8 +2324,8 @@ def apply_late_fee_to_invoice(invoice_id):
 # apply late fee for one person before apply to all
 @main.route("/admin/apply-late-fee-one/<invoice_id>", methods=["POST"])
 def apply_late_fee_one(invoice_id):
-    if not session.get("logged_in"):
-        return redirect("/login")
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
     
     confirm= request.form.get("confirm")
 
@@ -2306,7 +2334,44 @@ def apply_late_fee_one(invoice_id):
             "error": "Confirmation required. Submit confirm=APPLY to run this route. "
         }, 400
     
+    mode = request.form.get("mode")
+
+    if mode not in ["test", "live"]:
+        return {
+            "error": "Mode required. Submit mode=test or mode=live."
+        }, 400
+
+    is_live_key = current_app.config["STRIPE_SECRET_KEY"].startswith("sk_live_")
+
+    if mode == "live" and not is_live_key:
+        return {
+            "error": "You submitted mode=live, but Stripe key is not live."
+        }, 400
+
+    if mode == "test" and is_live_key:
+        return {
+            "error": "You submitted mode=test, but Stripe key is live."
+        }, 400
+    
     result= apply_late_fee_to_invoice(invoice_id)
+    run_id= str(uuid.uuid4())
+
+    log= LateFeeLog(
+        run_id= run_id,
+        invoice_id=result.get("invoice_id"),
+        invoice_number=result.get("invoice_number"),
+        customer_id=result.get("customer_id"),
+        invoice_item_id=result.get("invoice_item_id"),
+        late_fee_month=result.get("late_fee_month"),
+        amount_cents=result.get("late_fee_cents"),
+        status=result.get("status"),
+        reason=result.get("reason"),
+        error=result.get("error"),
+        created_at=datetime.now(timezone.utc)
+    )
+
+    db.session.add(log)
+    db.session.commit()
 
     return result
 
@@ -3030,6 +3095,36 @@ def carry_forward_logs():
                 "old_invoice_status" : log.old_invoice_status,
                 "reason": log.reason,
                 "error": log.error,
+                "created_at": log.created_at.isoformat() if log.created_at else None,
+            }
+            for log in logs
+        ]
+    }
+
+# billing increase log
+@main.route("/admin/billing-increase-logs")
+def billing_increase_logs():
+    if not session.get("logged_in"):
+        return redirect("/login")
+    
+    logs= BillingIncreaseLog.query.order_by(
+        BillingIncreaseLog.created_at.desc()
+    ).limit(100).all()
+
+    return{
+        "total_logs": BillingIncreaseLog.query.count(),
+        "logs": [
+            {
+                "run_id": log.run_id,
+                "subscription_id": log.subscription_id,
+                "product_id": log.product_id,
+                "customer_id": log.customer_id,
+                "old_amount" : log.old_amount,
+                "new_amount" :log.new_amount,
+                "increase_percentage": log.increase_percentage,
+                "status": log.status,
+                "reason": log.reason,
+                "error_code": log.error_code,
                 "created_at": log.created_at.isoformat() if log.created_at else None,
             }
             for log in logs

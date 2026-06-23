@@ -198,7 +198,7 @@
         <tr>
 
             <td>
-                {{ log.created_at }}
+                {{ log.created_at.replace(tzinfo=timezone.utc).astimezone(TORONTO_TZ).strftime("%Y-%m-%d %I:%M %p") if log.created_at else "-" }}
             </td>
 
             <td>
@@ -254,6 +254,10 @@
 
     </table>
 
+    <p>
+        <a href="/admin/billing-increase-logs">View annual increase logs</a>
+    </p>
+
     <!-- late fee -->
     <h1>Late fee Dashboard</h1>
 
@@ -265,18 +269,18 @@
         </div>
 
         <div class="card">
-            <h3>Success</h3>
-            <p>{{late_fee_stats.success }}</p>
+            <h3>Late Fees Applied</h3>
+            <p style="color:#16a34a;">{{late_fee_stats.success }}</p>
         </div>
 
         <div class="card">
             <h3>Skipped</h3>
-            <p>{{late_fee_stats.skipped }}</p>
+            <p style="color:#6b7280;">{{late_fee_stats.skipped }}</p>
         </div>
 
         <div class="card">
             <h3>Failed</h3>
-            <p>{{late_fee_stats.failed }}</p>
+            <p style="color:#dc2626;">{{late_fee_stats.failed }}</p>
         </div>
     </div>
 
@@ -296,8 +300,24 @@
         <tbody>
             {% for log in late_fee_logs %}
             <tr>
-                <td>{{log.created_at}}</td>
-                <td>{{log.status}}</td>
+                <td>{{ log.created_at.replace(tzinfo=timezone.utc).astimezone(TORONTO_TZ).strftime("%Y-%m-%d %I:%M %p") if log.created_at else "-" }}</td>
+                <td>
+                    {% if log.status == "success" %}
+                    <span class="badge-success">
+                        SUCCESS
+                    </span>
+
+                    {% elif log.status == "skipped" %}
+                        <span class="badge-skipped">
+                            SKIPPED
+                        </span>
+
+                    {% else %}
+                        <span class="badge-failed">
+                            FAILED
+                        </span>
+                    {% endif %}
+                </td>
                 <td>{{log.invoice_id}}</td>
                 <td>{{log.late_fee_month}}</td>
                 <td>
@@ -317,6 +337,10 @@
         </tbody>
     </table>
 
+    <p>
+        <a href="/admin/late-fee-logs">View all late fee logs</a>
+    </p>
+
     <!-- carry forward -->
 
     <h1>Carry Forward Dashboard</h1>
@@ -329,18 +353,18 @@
         </div>
 
         <div class="card">
-            <h3>Success</h3>
-            <p>{{ carry_forward_stats.success }}</p>
+            <h3>Balances Carried Forward</h3>
+            <p style="color:#16a34a;">{{ carry_forward_stats.success }}</p>
         </div>
 
         <div class="card">
             <h3>Skipped</h3>
-            <p>{{ carry_forward_stats.skipped }}</p>
+            <p style="color:#6b7280;">{{ carry_forward_stats.skipped }}</p>
         </div>
 
         <div class="card">
             <h3>Failed</h3>
-            <p>{{ carry_forward_stats.failed }}</p>
+            <p style="color:#dc2626;">{{ carry_forward_stats.failed }}</p>
         </div>
     </div>
 
@@ -363,18 +387,34 @@
         {% for log in carry_forward_logs %}
         <tr>
 
-            <td>{{ log.created_at }}</td>
+            <td>{{ log.created_at.replace(tzinfo=timezone.utc).astimezone(TORONTO_TZ).strftime("%Y-%m-%d %I:%M %p") if log.created_at else "-" }}</td>
 
-            <td>{{ log.status }}</td>
+            <td>
+                    {% if log.status == "success" %}
+                    <span class="badge-success">
+                        SUCCESS
+                    </span>
+
+                    {% elif log.status == "skipped" %}
+                        <span class="badge-skipped">
+                            SKIPPED
+                        </span>
+
+                    {% else %}
+                        <span class="badge-failed">
+                            FAILED
+                        </span>
+                    {% endif %}
+                </td>
 
             <td>{{ log.invoice_id }}</td>
 
             <td>{{ log.customer_id }}</td>
 
-            <td>{{ log.old_invoice_status }}</td>
+            <td>{{ log.old_invoice_status or "-" }}</td>
 
             <td>
-                ${{ "%.2f"|format(log.amount_cents / 100) }}
+                ${{ "%.2f"|format((log.amount_cents or 0) / 100) }}
             </td>
 
             <td>
@@ -393,6 +433,10 @@
     </tbody>
 
     </table>
+
+    <p>
+        <a href="/admin/carry-forward-logs">View all carry forward logs</a>
+    </p>
 
 </body>
 </html>
