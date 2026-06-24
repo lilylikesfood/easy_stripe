@@ -2000,8 +2000,10 @@ def late_fee_already_exists(customer_id, source_invoice_id, late_fee_month):
 def find_late_fee_candidates():
     stripe.api_key= current_app.config["STRIPE_SECRET_KEY"]
 
-    now= datetime.now(timezone.utc)
-    late_fee_month= now.strftime("%Y-%m")
+    now_utc = datetime.now(timezone.utc)
+    now_toronto = datetime.now(TORONTO_TZ)
+
+    late_fee_month= now_toronto.strftime("%Y-%m")
     # June 2026 → "2026-06"
     # tesing
     # late_fee_month = "2026-07"
@@ -2065,13 +2067,14 @@ def find_late_fee_candidates():
         created_ts= stripe_get(invoice, "created")
 
         if due_date_ts:
-            effective_due_date= datetime.fromtimestamp(due_date_ts, tz=timezone.utc)
+            effective_due_date = datetime.fromtimestamp(due_date_ts, tz=timezone.utc).astimezone(TORONTO_TZ)
 
-        else: 
-            created_date= datetime.fromtimestamp(created_ts, tz= timezone.utc)
-            effective_due_date= created_date + timedelta(days=20)
+        else:
+            created_date = datetime.fromtimestamp(created_ts, tz=timezone.utc).astimezone(TORONTO_TZ)
 
-        raw_days = (now.date() - effective_due_date.date()).days
+            effective_due_date = created_date + timedelta(days=20)
+
+        raw_days = (now_toronto.date() - effective_due_date.date()).days
         # for testing
         # raw_days = 10
 
@@ -2216,8 +2219,10 @@ def format_invoice_period(start_ts, end_ts):
 def apply_late_fee_to_invoice(invoice_id):   
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
-    now = datetime.now(timezone.utc)
-    late_fee_month = now.strftime("%Y-%m")
+    now_utc = datetime.now(timezone.utc)
+    now_toronto = datetime.now(TORONTO_TZ)
+
+    late_fee_month = now_toronto.strftime("%Y-%m")
     # testing
     # late_fee_month = "2026-07"
 
@@ -2257,12 +2262,12 @@ def apply_late_fee_to_invoice(invoice_id):
 
     # calculate effective due date using contract logic
     if due_date_ts:
-        effective_due_date = datetime.fromtimestamp(due_date_ts, tz=timezone.utc)
+        effective_due_date = datetime.fromtimestamp(due_date_ts, tz=timezone.utc).astimezone(TORONTO_TZ)
     else:
-        effective_due_date = datetime.fromtimestamp(created_ts, tz=timezone.utc) + timedelta(days=20)
+        effective_due_date = datetime.fromtimestamp(created_ts, tz=timezone.utc).astimezone(TORONTO_TZ) + timedelta(days=20)
 
     # calculate days overdue
-    days_overdue = (now.date() - effective_due_date.date()).days
+    days_overdue = (now_toronto.date() - effective_due_date.date()).days
     # days_overdue = 10
     
     if days_overdue <= 0:
@@ -2675,6 +2680,23 @@ def carry_forward_one(invoice_id):
 
     result = carry_forward_invoice_balance(invoice_id)
 
+    run_id = str(uuid.uuid4())
+
+    log = CarryForwardLog(
+        run_id=run_id,
+        invoice_id=result.get("invoice_id"),
+        customer_id=result.get("customer_id"),
+        invoice_item_id=result.get("invoice_item_id"),
+        amount_cents=result.get("amount_remaining_cents"),
+        status=result.get("status"),
+        old_invoice_status=result.get("old_invoice_status"),
+        reason=result.get("reason"),
+        error=result.get("error"),
+    )
+
+    db.session.add(log)
+    db.session.commit()
+
     return result
 
 # Who would be carried forward if we ran today?
@@ -2720,11 +2742,11 @@ def find_carry_forward_candidates():
             continue
 
         if due_date_ts:
-            effective_due_date = datetime.fromtimestamp(due_date_ts, tz=timezone.utc)
+            effective_due_date = datetime.fromtimestamp(due_date_ts, tz=timezone.utc).astimezone(TORONTO_TZ)
         else:
-            effective_due_date = datetime.fromtimestamp(created_ts, tz=timezone.utc) + timedelta(days=20)
+            effective_due_date = datetime.fromtimestamp(created_ts, tz=timezone.utc).astimezone(TORONTO_TZ) + timedelta(days=20)
 
-        raw_days = (now.date() - effective_due_date.date()).days
+        raw_days = (today_toronto - effective_due_date.date()).days
         # testing
         # raw_days = 10
 
@@ -2991,19 +3013,19 @@ def apply_carry_forwards():
                 "reason": candidate["skip_reason"]
             })
 
-            log= CarryForwardLog(
-                run_id= run_id,
-                invoice_id= candidate["invoice_id"],
-                customer_id= candidate["customer_id"],
-                invoice_item_id= None,
-                amount_cents= candidate["amount_remaining_cents"],
-                status= "skipped",
-                old_invoice_status = None,
-                reason= candidate["skip_reason"],
-                error= None,
-            )
+            # log= CarryForwardLog(
+            #     run_id= run_id,
+            #     invoice_id= candidate["invoice_id"],
+            #     customer_id= candidate["customer_id"],
+            #     invoice_item_id= None,
+            #     amount_cents= candidate["amount_remaining_cents"],
+            #     status= "skipped",
+            #     old_invoice_status = None,
+            #     reason= candidate["skip_reason"],
+            #     error= None,
+            # )
 
-            db.session.add(log)
+            # db.session.add(log)
 
             continue
 
@@ -3216,19 +3238,19 @@ def run_overdue_billing():
                 "reason": candidate.get("skip_reason")
             })
 
-            log = CarryForwardLog(
-                run_id=run_id,
-                invoice_id=candidate["invoice_id"],
-                customer_id=candidate["customer_id"],
-                invoice_item_id=None,
-                amount_cents=candidate["amount_remaining_cents"],
-                status="skipped",
-                old_invoice_status=None,
-                reason=candidate.get("skip_reason"),
-                error=None,
-            )
+            # log = CarryForwardLog(
+            #     run_id=run_id,
+            #     invoice_id=candidate["invoice_id"],
+            #     customer_id=candidate["customer_id"],
+            #     invoice_item_id=None,
+            #     amount_cents=candidate["amount_remaining_cents"],
+            #     status="skipped",
+            #     old_invoice_status=None,
+            #     reason=candidate.get("skip_reason"),
+            #     error=None,
+            # )
 
-            db.session.add(log)
+            # db.session.add(log)
 
             continue
 
