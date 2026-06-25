@@ -2561,8 +2561,12 @@ def carry_forward_already_exists(customer_id, source_invoice_id):
 # Carry-forward logic:
 # Move an old unpaid invoice balance onto a future invoice
 # by creating a new pending invoice item for the same customer.
-# Then mark the original invoice as uncollectible so Stripe does not
-# treat the same balance as collectible twice.
+
+# We void Invoice #1 instead of marking uncollectible because:
+# - uncollectible doesn't block payment in Stripe (customer can still pay)
+# - void fully disables the payment link preventing double collection
+# Tradeoff: void is permanent and may send customer a notification
+# Future improvement: webhook guard approach would be more scalable
 def carry_forward_invoice_balance(invoice_id):
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
@@ -2634,7 +2638,7 @@ def carry_forward_invoice_balance(invoice_id):
         metadata=metadata
     )
 
-    stripe.Invoice.mark_uncollectible(invoice_id)
+    stripe.Invoice.void_invoice(invoice_id)
 
     return {
         "status": "success",
@@ -2644,7 +2648,7 @@ def carry_forward_invoice_balance(invoice_id):
         "amount_remaining_cents": amount_remaining,
         "amount_remaining": cents_to_money(amount_remaining),
         "invoice_item_id": invoice_item.id, 
-        "old_invoice_status": "uncollectible"
+        "old_invoice_status": "void"
     }
 
 @main.route("/admin/carry-forward-one/<invoice_id>", methods=["POST"])

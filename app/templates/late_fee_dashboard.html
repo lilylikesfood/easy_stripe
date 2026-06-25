@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Late Fee Dashboard</title>
+
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
 </head>
 <body>
     <h1>Late Fee Dashboard</h1>
@@ -76,7 +78,23 @@
             {% for log in data.recent_logs %}
             <tr>
                 <td>{{ log.created_at }}</td>
-                <td>{{ log.status }}</td>
+                <td>
+                    {% if log.status == "success" %}
+                        <span class="badge-success">
+                            SUCCESS
+                        </span>
+
+                    {% elif log.status == "skipped" %}
+                        <span class="badge-skipped">
+                            SKIPPED
+                        </span>
+
+                    {% else %}
+                        <span class="badge-failed">
+                            FAILED
+                        </span>
+                    {% endif %}
+                </td>
                 <td>{{ log.invoice_number }}</td>
                 <td>{{ log.invoice_item_id or "-" }}</td>
                 <td>{{ log.amount }}</td>
