@@ -15,7 +15,12 @@ TORONTO_TZ= pytz.timezone("America/Toronto")
 
 scheduler = BackgroundScheduler(timezone=TORONTO_TZ)
 
-atexit.register(lambda: scheduler.shutdown())
+def shutdown_scheduler():
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+
+atexit.register(shutdown_scheduler)
+# notice sth important, () calls the function immediately, so no ()
 
 job_lock= Lock()
 

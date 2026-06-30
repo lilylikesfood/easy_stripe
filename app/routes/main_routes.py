@@ -3497,3 +3497,55 @@ def late_fee_dashboard():
         "late_fee_dashboard.html",
         data=data
     )
+
+# audit inspection fee
+@main.route("/admin/audit-inspection-fees")
+def audit_inspection_fees(): 
+
+    subscriptions= stripe.Subscription.list(
+        status="active",
+        limit=100,
+    )
+
+    for subscription in subscriptions.auto_paging_iter(): 
+        items= stripe_get(subscription, "items", {})
+        subscription_items= stripe_get(items, "data",[])
+
+        for item in subscription_items:
+            price= stripe_get(item, "price", {})
+            product= stripe_get(price, "product")
+
+            print("----------------------------------")
+            print("Subscription: ", stripe_get(subscription, "id"))
+            print("Item:", stripe_get(item, "id"))
+            print("product: ", product)
+
+    return {"status": "ok"}
+
+# product audit
+@main.route("/admin/audit-products")
+def audit_products(): 
+
+    products= stripe.Product.list(
+        active=True,
+        limit=100,
+    )
+
+    results= []
+
+    for product in products.auto_paging_iter():
+        product_id= stripe_get(product, "id")
+        name= stripe_get(product, "name", "")
+        metadata= stripe_get(product, "metadata", {})
+
+        if "inspect" in name.lower() or "inspection" in name.lower():
+            results.append({
+                "product_id": product_id,
+                "name": name, 
+                "metadata": metadata,
+            })
+
+    return {
+        "count": len(results),
+        "results": results,
+    }

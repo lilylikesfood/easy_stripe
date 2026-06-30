@@ -1,14 +1,28 @@
+print("1 before flask")
 from flask import Flask
+print("2 after flask")
+
 from config import Config
+print("3 after config")
+
 from app.extensions import db, migrate
+print("4 after extensions")
+
 
 from app.services.stripe_service import init_stripe
+print("5 after stripe_service")
+
 
 import os
+print("6 after os")
+
 
 from dotenv import load_dotenv
+print("7 after dotenv import")
+
 
 load_dotenv()
+print("8 after load_dotenv")
 
 def create_app():
 
@@ -32,11 +46,11 @@ def create_app():
     init_stripe(app.config["STRIPE_SECRET_KEY"])  
 
     # imports AFTER app exists
-    from app.scheduler.scheduler import start_scheduler
+    # from app.scheduler.scheduler import start_scheduler
     from app.routes.main_routes import main
 
     app.register_blueprint(main)
 
-    start_scheduler(app)
+    # start_scheduler(app)
 
     return app
