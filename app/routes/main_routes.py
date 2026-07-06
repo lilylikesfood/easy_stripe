@@ -32,6 +32,12 @@ from pprint import pprint
 
 from app.scheduler.scheduler import TORONTO_TZ
 
+import calendar
+
+from flask import Response
+import csv
+import io
+
 main = Blueprint("main", __name__)
 
 
@@ -1996,6 +2002,47 @@ def late_fee_already_exists(customer_id, source_invoice_id, late_fee_month):
         
     return False
 
+def stripe_timestamp_to_utc_datetime(ts):
+    if not ts: 
+        return None
+    
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+def create_carry_forward_log_from_result(run_id, result):
+    log = CarryForwardLog(
+        run_id=run_id,
+
+        invoice_id=result.get("invoice_id"),
+        customer_id=result.get("customer_id"),
+        invoice_item_id=result.get("invoice_item_id"),
+
+        amount_cents=result.get("amount_remaining_cents"),
+        carried_forward_amount_cents=result.get("carried_forward_amount_cents"),
+
+        status=result.get("status"),
+
+        # Legacy field kept for backward compatibility
+        old_invoice_status=result.get("old_invoice_status_after"),
+        old_invoice_status_before=result.get("old_invoice_status_before"),
+        old_invoice_status_after=result.get("old_invoice_status_after"),
+
+        source_invoice_number=result.get("source_invoice_number"),
+        source_invoice_created=stripe_timestamp_to_utc_datetime(result.get("source_invoice_created_ts")),
+        source_invoice_due_date=stripe_timestamp_to_utc_datetime(result.get("source_invoice_due_date_ts")),
+        source_invoice_total_cents=result.get("source_invoice_total_cents"),
+        source_invoice_amount_remaining_cents=result.get("source_invoice_amount_remaining_cents"),
+
+        new_invoice_id=result.get("new_invoice_id"),
+        new_invoice_number=result.get("new_invoice_number"),
+
+        carry_forward_description=result.get("carry_forward_description"),
+
+        reason=result.get("reason"),
+        error=result.get("error"),
+    )
+
+    return log
+
 # find people with open invoice
 def find_late_fee_candidates():
     stripe.api_key= current_app.config["STRIPE_SECRET_KEY"]
@@ -2570,12 +2617,19 @@ def carry_forward_already_exists(customer_id, source_invoice_id):
 def carry_forward_invoice_balance(invoice_id):
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
-    invoice = stripe.Invoice.retrieve(invoice_id)
+    invoice_before = stripe.Invoice.retrieve(invoice_id)
     
-    invoice_status= stripe_get(invoice, "status")
-    amount_remaining= stripe_get(invoice, "amount_remaining", 0)
-    customer_id= stripe_get(invoice, "customer")
-    invoice_number= stripe_get(invoice, "number")
+    invoice_status= stripe_get(invoice_before, "status")
+    amount_remaining= stripe_get(invoice_before, "amount_remaining", 0)
+    customer_id= stripe_get(invoice_before, "customer")
+    invoice_number= stripe_get(invoice_before, "number")
+    old_invoice_status_before = stripe_get(invoice_before, "status")
+    source_invoice_created_ts = stripe_get(invoice_before, "created")
+    source_invoice_due_date_ts = stripe_get(invoice_before, "due_date")
+    source_invoice_total_cents = stripe_get(invoice_before, "total")
+    source_invoice_amount_remaining_cents = stripe_get(invoice_before, "amount_remaining", 0)
+
+    carry_forward_description = f"Previous unpaid balance - invoice {invoice_number}"
 
     if invoice_status != "open":
         return {
@@ -2634,21 +2688,34 @@ def carry_forward_invoice_balance(invoice_id):
         customer=customer_id, 
         amount=amount_remaining,
         currency="cad",
-        description=f"Previous unpaid balance - invoice {invoice_number}", 
+        description=carry_forward_description, 
         metadata=metadata
     )
 
     stripe.Invoice.void_invoice(invoice_id)
 
+    invoice_after= stripe.Invoice.retrieve(invoice_id)
+    old_invoice_status_after = stripe_get(invoice_after, "status")
+
     return {
         "status": "success",
         "invoice_id": invoice_id,
+        "source_invoice_number": invoice_number,
+        "new_invoice_id": None,
+        "new_invoice_number": None,
         "invoice_number": invoice_number,
         "customer_id": customer_id,
         "amount_remaining_cents": amount_remaining,
         "amount_remaining": cents_to_money(amount_remaining),
         "invoice_item_id": invoice_item.id, 
-        "old_invoice_status": "void"
+        "old_invoice_status_before": old_invoice_status_before,
+        "old_invoice_status_after": old_invoice_status_after,
+        "source_invoice_created_ts": source_invoice_created_ts,
+        "source_invoice_due_date_ts": source_invoice_due_date_ts,
+        "source_invoice_total_cents": source_invoice_total_cents,
+        "source_invoice_amount_remaining_cents": source_invoice_amount_remaining_cents,
+        "carried_forward_amount_cents": amount_remaining,
+        "carry_forward_description": carry_forward_description,
     }
 
 @main.route("/admin/carry-forward-one/<invoice_id>", methods=["POST"])
@@ -2686,17 +2753,7 @@ def carry_forward_one(invoice_id):
 
     run_id = str(uuid.uuid4())
 
-    log = CarryForwardLog(
-        run_id=run_id,
-        invoice_id=result.get("invoice_id"),
-        customer_id=result.get("customer_id"),
-        invoice_item_id=result.get("invoice_item_id"),
-        amount_cents=result.get("amount_remaining_cents"),
-        status=result.get("status"),
-        old_invoice_status=result.get("old_invoice_status"),
-        reason=result.get("reason"),
-        error=result.get("error"),
-    )
+    log = create_carry_forward_log_from_result(run_id, result)
 
     db.session.add(log)
     db.session.commit()
@@ -2894,16 +2951,27 @@ def debug_subscription(subscription_id):
 def get_next_monthly_billing_date_from_anchor(anchor_ts, today_date):
     anchor_dt = datetime.fromtimestamp(anchor_ts, tz=timezone.utc).astimezone(TORONTO_TZ)
 
+    def safe_date_for_month(year, month):
+        last_day= calendar.monthrange(year, month)[1]
+        day= min(anchor_dt.day, last_day)
+        
+        return date(year, month, day)
+
     year = today_date.year
     month = today_date.month
 
-    candidate = anchor_dt.replace(year=year, month=month).date()
+    print("Anchor datetime:", anchor_dt)
+    print("Anchor day:", anchor_dt.day)
+    print("Target year:", year)
+    print("Target month:", month)
+
+    candidate = safe_date_for_month(year, month)
 
     if candidate <= today_date:
         if month == 12:
-            candidate = anchor_dt.replace(year=year + 1, month=1).date()
+            candidate = safe_date_for_month(year + 1, 1)
         else:
-            candidate = anchor_dt.replace(year=year, month=month + 1).date()
+            candidate = safe_date_for_month(year, month + 1)
 
     return candidate
 
@@ -3037,17 +3105,7 @@ def apply_carry_forwards():
             result= carry_forward_invoice_balance(candidate["invoice_id"])
             results.append(result)
 
-            log= CarryForwardLog(
-                run_id= run_id,
-                invoice_id= result.get("invoice_id"),
-                customer_id= result.get("customer_id"),
-                invoice_item_id= result.get("invoice_item_id"),
-                amount_cents= result.get("amount_remaining_cents"),
-                status= result.get("status"),
-                old_invoice_status = result.get("old_invoice_status"),
-                reason= None,
-                error= None
-            )
+            log= create_carry_forward_log_from_result(run_id, result)
 
             db.session.add(log)
 
@@ -3102,6 +3160,163 @@ def carry_forward_logs():
         total_logs=CarryForwardLog.query.count(),
         TORONTO_TZ=TORONTO_TZ,
         timezone=timezone,
+    )
+
+# time format helper
+def format_toronto(dt):
+    if not dt:
+        return None
+    
+    return dt.astimezone(TORONTO_TZ).strftime("%Y-%m-%d %I:%M:%S %p %Z")
+
+# generate CSV report
+@main.route("/admin/accounting-carry-forward-report.csv")
+def accounting_carry_forward_report_csv():
+    data= get_accounting_carry_forward_report_data()
+
+    output= io.StringIO()
+    writer= csv.writer(output)
+
+    # headers
+    writer.writerow([
+        "Carry Forward Date",
+        "Run ID",
+        "Customer ID",
+        "Source Invoice ID",
+        "Source Invoice Number",
+        "Source Invoice Total",
+        "Source Invoice Amount Remaining",
+        "Carried Forward Amount",
+        "Difference Check",
+        "Status Before",
+        "Status After",
+        "Invoice Item ID",
+        "Description",
+        "Legacy",
+    ])
+
+    # rows
+    for row in data["rows"]:
+        writer.writerow([
+            row["carry_forward_date"],
+            row["run_id"],
+            row["customer_id"],
+            row["source_invoice_id"],
+            row["source_invoice_number"],
+            f"{row['source_invoice_total']:.2f}",
+            f"{row['source_invoice_amount_remaining']:.2f}",
+            f"{row['carried_forward_amount']:.2f}",
+            f"{row['difference_check']:.2f}",
+            row["status_before"],
+            row["status_after"],
+            row["invoice_item_id"],
+            row["description"],
+            "Legacy" if row["is_legacy"] else "Current",
+        ])
+
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": "attachment; filename=carry_forward_report.csv"
+        }
+    )
+
+# accounting helper
+def get_accounting_carry_forward_report_data():
+    logs= (
+        CarryForwardLog.query
+        .filter_by(status="success")
+        .order_by(CarryForwardLog.created_at.desc())
+        .all()
+    )
+
+    total_carry_forward = 0
+    affected_customers= set()
+    rows= []
+    largest_amount = 0
+    smallest_amount = None
+
+    for log in logs: 
+        affected_customers.add(log.customer_id)
+
+        created_at= log.created_at
+
+        amount_cents = log.carried_forward_amount_cents or log.amount_cents or 0
+        total_carry_forward += amount_cents
+
+        if amount_cents > largest_amount:
+            largest_amount = amount_cents
+
+        if smallest_amount is None or amount_cents < smallest_amount:
+            smallest_amount = amount_cents
+
+        source_invoice_number = log.source_invoice_number or log.invoice_id
+        status_before = log.old_invoice_status_before or "unknown"
+        status_after = log.old_invoice_status_after or log.old_invoice_status
+        is_legacy = log.carried_forward_amount_cents is None
+
+        difference_check_cents= (log.source_invoice_amount_remaining_cents or 0) - amount_cents
+
+        rows.append({
+            "carry_forward_date": format_toronto(created_at) if created_at else None,
+            "run_id": log.run_id,
+            "customer_id": log.customer_id,
+            "source_invoice_id": log.invoice_id,
+            "source_invoice_number": source_invoice_number,
+            "source_invoice_created": format_toronto(log.source_invoice_created) if log.source_invoice_created else None,
+            "source_invoice_due_date": format_toronto(log.source_invoice_due_date) if log.source_invoice_due_date else None,
+            "source_invoice_total_cents": log.source_invoice_total_cents,
+            "source_invoice_total": cents_to_money(log.source_invoice_total_cents or 0),
+            "source_invoice_amount_remaining_cents": log.source_invoice_amount_remaining_cents,
+            "source_invoice_amount_remaining": cents_to_money(log.source_invoice_amount_remaining_cents or 0),
+            "carried_forward_amount_cents": amount_cents,
+            "carried_forward_amount": cents_to_money(amount_cents),
+            "status_before": status_before,
+            "status_after": status_after,
+            "difference_check_cents": difference_check_cents,
+            "difference_check": cents_to_money(difference_check_cents),
+            "invoice_item_id": log.invoice_item_id,
+            "new_invoice_id": log.new_invoice_id,
+            "new_invoice_number": log.new_invoice_number,
+            "description": log.carry_forward_description,
+            "is_legacy": is_legacy,
+        })
+
+    invoice_count= len(logs)
+    customer_count= len(affected_customers)
+    generated_at= datetime.now(TORONTO_TZ)
+
+    return {
+        "summary": {
+            "report_type": "Carry Forward Reconciliation Report",
+            "generated_at": generated_at.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "status_filter": "success",
+            "total_carried_forward_cents": total_carry_forward,
+            "total_carried_forward": cents_to_money(total_carry_forward),
+            "invoice_count": invoice_count,
+            "customer_count": customer_count,
+            "row_count": len(rows),
+            "largest_carry_forward": cents_to_money(largest_amount),
+            "smallest_carry_forward": cents_to_money(smallest_amount or 0),
+            "average_carry_forward": cents_to_money(total_carry_forward // invoice_count) if invoice_count else 0,
+        },
+        "rows": rows
+    }
+
+# accounting-carry-forward-report
+@main.route("/admin/accounting-carry-forward-report")
+def accounting_carry_forward_report():
+    return get_accounting_carry_forward_report_data()
+
+# html accounting carry forward report page
+@main.route("/admin/accounting-carry-forward-report-page")
+def accounting_carry_forward_report_page():
+    data= get_accounting_carry_forward_report_data()
+
+    return render_template(
+        "accounting_carry_forward_report.html",
+        data=data
     )
 
 # billing increase log
@@ -3262,17 +3477,8 @@ def run_overdue_billing():
             result = carry_forward_invoice_balance(candidate["invoice_id"])
             carry_forward_results.append(result)
 
-            log = CarryForwardLog(
-                run_id=run_id,
-                invoice_id=result.get("invoice_id"),
-                customer_id=result.get("customer_id"),
-                invoice_item_id=result.get("invoice_item_id"),
-                amount_cents=result.get("amount_remaining_cents"),
-                status=result.get("status"),
-                old_invoice_status=result.get("old_invoice_status"),
-                reason=None,
-                error=None,
-            )
+            log = create_carry_forward_log_from_result(run_id, result)
+
             db.session.add(log)
 
         except Exception as e:

@@ -18,3 +18,24 @@ class CarryForwardLog(db.Model):
     error= db.Column(db.Text, nullable=True)
 
     created_at= db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    # source invoice snapshot
+    source_invoice_number = db.Column(db.String(100), nullable=True)
+    source_invoice_created = db.Column(db.DateTime, nullable=True)
+    source_invoice_due_date = db.Column(db.DateTime, nullable=True)
+    source_invoice_total_cents = db.Column(db.Integer, nullable=True)
+    source_invoice_amount_remaining_cents = db.Column(db.Integer, nullable=True)
+
+    # status proof
+    old_invoice_status_before = db.Column(db.String(50), nullable=True)
+    old_invoice_status_after = db.Column(db.String(50), nullable=True)
+
+    # clearer carry-forward amount
+    carried_forward_amount_cents = db.Column(db.Integer, nullable=True)
+
+    # destination / new invoice tracking
+    new_invoice_id = db.Column(db.String(100), nullable=True)
+    new_invoice_number = db.Column(db.String(100), nullable=True)
+
+    # description shown in Stripe
+    carry_forward_description = db.Column(db.String(255), nullable=True)

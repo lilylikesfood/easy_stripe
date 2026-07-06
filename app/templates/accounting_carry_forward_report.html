@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Accounting Carry Forward Report</title>
+
+    <style>
+    body {
+        font-family: Arial, sans-serif;
+        margin: 24px;
+    }
+
+    table {
+        border-collapse: collapse;
+        width: 100%;
+        font-size: 14px;
+    }
+
+    th, td {
+        border: 1px solid #ccc;
+        padding: 8px;
+        text-align: left;
+        vertical-align: top;
+    }
+
+    th {
+        background-color: #f2f2f2;
+    }
+
+    .amount {
+        text-align: right;
+        white-space: nowrap;
+    }
+
+    .summary-box {
+        border: 1px solid #ddd;
+        padding: 16px;
+        margin-bottom: 20px;
+        background: #fafafa;
+    }
+
+    td{
+        word-break: break-word;
+    }
+</style>
+</head>
+<body>
+    <h1>{{data.summary.report_type}}</h1>
+    <p>Generated At: {{data.summary.generated_at}}</p>
+
+    <a href="/admin/accounting-carry-forward-report.csv">Export CSV</a>
+    
+    <hr>
+
+    <h2>SUMMARY</h2>
+
+    <div class="summary-box">
+        <p>Total Carried Forward: ${{ "%.2f"|format(data.summary.total_carried_forward) }}</p>
+        <p>Invoices: {{ data.summary.invoice_count }}</p>
+        <p>Customers: {{ data.summary.customer_count }}</p>
+        <p>Rows: {{ data.summary.row_count }}</p>
+        <p>Largest Carry Forward: ${{ "%.2f"|format(data.summary.largest_carry_forward) }}</p>
+        <p>Smallest Carry Forward: ${{ "%.2f"|format(data.summary.smallest_carry_forward) }}</p>
+        <p>Average Carry Forward: ${{ "%.2f"|format(data.summary.average_carry_forward) }}</p>
+    </div>
+    
+    <hr>
+
+    <h2>DETAILS</h2>
+    <table>
+        <thead>
+            <tr>
+                <!-- Identification -->
+                <th>Carry Forward Date</th>
+                <th>Run ID</th>
+                <th>Customer ID</th>
+                <th>Source Invoice ID</th>
+                <th>Source Invoice Number</th>
+
+                <!-- Financial -->
+                <th>Invoice Total</th>
+                <th>Amount Remaining</th>
+                <th>Carried Forward</th>
+                <th>Difference Check</th>
+
+                <!-- Evidence -->
+                <th>Status Before</th>
+                <th>Status After</th>
+                <th>Invoice Item ID</th>
+                <th>Description</th>
+                <th>Legacy</th>
+
+                <!-- Extra Metadata -->
+                <th>Invoice Created</th>
+                <th>Due Date</th>
+            </tr>
+        </thead>
+
+        <tbody>
+            {% for row in data.rows %}
+            <tr>
+                <td>{{ row.carry_forward_date }}</td>
+                <td>{{ row.run_id }}</td>
+                <td>
+                    <!-- target="_blank": Open this link in a new browser tab instead of replacing the current page -->
+                    <a href="https://dashboard.stripe.com/customers/{{row.customer_id}}" target="_blank">{{row.customer_id}}</a>
+                </td>
+                <td>{{ row.source_invoice_id }}</td>
+                <td>
+                    <a href="https://dashboard.stripe.com/invoices/{{row.source_invoice_id}}" target="_blank">{{row.source_invoice_number}}</a>
+                </td>
+
+                <td class="amount">${{ "%.2f"|format(row.source_invoice_total) }}</td>
+                <td class="amount">${{ "%.2f"|format(row.source_invoice_amount_remaining) }}</td>
+                <td class="amount">${{ "%.2f"|format(row.carried_forward_amount) }}</td>
+                <td class="amount">
+                    {% if row.difference_check != 0 %}
+                    <strong style="color: red;">${{ "%.2f"|format(row.difference_check) }}</strong>
+                    {% else%}
+                        ${{ "%.2f"|format(row.difference_check) }}
+                    {% endif %}
+                </td>
+
+                <td>{{ row.status_before }}</td>
+                <td>{{ row.status_after }}</td>
+                <td>
+                    <a href="https://dashboard.stripe.com/customers/{{row.customer_id}}" target="_blank">{{row.invoice_item_id}}</a>
+                </td>
+                <td>{{ row.description }}</td>
+                <td>
+                    {% if row.is_legacy %}
+                        Legacy
+                    {% else %}
+                        Current
+                    {% endif %}
+                </td>
+
+                <td>{{ row.source_invoice_created }}</td>
+                <td>
+                    {% if row.source_invoice_due_date %}
+                        {{ row.source_invoice_due_date }}
+                    {% else %}
+                        N/A
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+        
+        
+    </table>
+
+</body>
+</html>
