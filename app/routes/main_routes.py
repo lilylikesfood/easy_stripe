@@ -1984,23 +1984,78 @@ def stripe_get(obj, key, default=None):
 def cents_to_money(cents):
     return round((cents or 0) / 100, 2)
 
-def late_fee_already_exists(customer_id, source_invoice_id, late_fee_month):
+# check invoice item metadata
+@main.route("/admin/debug-invoice-item/<invoice_item_id>")
+def debug_invoice_item(invoice_item_id):
+    stripe.api_key= current_app.config["STRIPE_SECRET_KEY"]
+
+    invoice_item= stripe.InvoiceItem.retrieve(invoice_item_id)
+
+    return invoice_item._to_dict_recursive()
+
+# get latest invoice item for invoice
+LATE_FEE_INTERVAL_DAYS = 30
+
+def get_latest_late_fee_for_invoice(customer_id, source_invoice_id):
     invoice_items= stripe.InvoiceItem.list(
-        customer=customer_id,
+        customer= customer_id,
         limit=100
     )
 
+    latest_item = None
+
     for invoice_item in invoice_items.auto_paging_iter():
-        metadata= stripe_get(invoice_item, "metadata", {})
+        metadata = stripe_get(invoice_item, "metadata", {})
 
         if (
             stripe_get(metadata, "type") == "late_fee"
             and stripe_get(metadata, "source_invoice_id") == source_invoice_id
-            and stripe_get(metadata, "late_fee_month") == late_fee_month
         ):
-            return True
+            invoice_item_date = stripe_get(invoice_item, "date", 0)
+            latest_item_date = stripe_get(latest_item, "date", 0)
+
+            if latest_item is None or invoice_item_date > latest_item_date:
+                latest_item = invoice_item
+
+    return latest_item
+
+def has_recent_late_fee(customer_id, source_invoice_id):
+    latest_late_fee = get_latest_late_fee_for_invoice(customer_id, source_invoice_id)
+
+    if not latest_late_fee:
+        return False
+    
+    now_toronto = datetime.now(TORONTO_TZ)
+
+    latest_fee_ts = stripe_get(latest_late_fee, "date")
+
+    if not latest_fee_ts:
+        return False
+
+    latest_fee_date = datetime.fromtimestamp(latest_fee_ts, tz=timezone.utc).astimezone(TORONTO_TZ)
+
+    days_since_last_fee = (now_toronto.date() - latest_fee_date.date()).days
+
+    return days_since_last_fee < LATE_FEE_INTERVAL_DAYS
+    # return true or false
+
+# def late_fee_already_exists(customer_id, source_invoice_id, late_fee_month):
+#     invoice_items= stripe.InvoiceItem.list(
+#         customer=customer_id,
+#         limit=100
+#     )
+
+#     for invoice_item in invoice_items.auto_paging_iter():
+#         metadata= stripe_get(invoice_item, "metadata", {})
+
+#         if (
+#             stripe_get(metadata, "type") == "late_fee"
+#             and stripe_get(metadata, "source_invoice_id") == source_invoice_id
+#             and stripe_get(metadata, "late_fee_month") == late_fee_month
+#         ):
+#             return True
         
-    return False
+#     return False
 
 def stripe_timestamp_to_utc_datetime(ts):
     if not ts: 
@@ -2135,10 +2190,9 @@ def find_late_fee_candidates():
         invoice_id= stripe_get(invoice, "id")
         invoice_number = stripe_get(invoice, "number")
 
-        already_applied= late_fee_already_exists(
+        already_applied= has_recent_late_fee(
             customer_id,
             invoice_id,
-            late_fee_month
         )
 
         if not already_applied:
@@ -2156,7 +2210,7 @@ def find_late_fee_candidates():
             "days_overdue": days_overdue,
             "late_fee_month": late_fee_month,
             "eligible_to_apply": not already_applied,
-            "skip_reason": "already applied this month" if already_applied else None,
+            "skip_reason": "late fee already applied within last 30 days" if already_applied else None,
             "late_fee_rate": "1.5%",
             "late_fee_base": cents_to_money(base_cents),
             "late_fee_base_cents": base_cents,
@@ -2296,6 +2350,9 @@ def apply_late_fee_to_invoice(invoice_id):
             "status": "skipped",
             "reason": "Invoice is not open. ",
             "invoice_id": invoice_id,
+            "invoice_number": invoice_number,
+            "customer_id": customer_id,
+            "late_fee_month": late_fee_month,
             "invoice_status": invoice_status
         }
 
@@ -2304,7 +2361,10 @@ def apply_late_fee_to_invoice(invoice_id):
         return {
             "status": "skipped",
             "reason": "Invoice has no remaining balance", 
-            "invoice_id": invoice_id
+            "invoice_id": invoice_id,
+            "invoice_number": invoice_number,
+            "customer_id": customer_id,
+            "late_fee_month": late_fee_month,
         }
 
     # calculate effective due date using contract logic
@@ -2322,17 +2382,22 @@ def apply_late_fee_to_invoice(invoice_id):
             "status": "skipped",
             "reason": "Invoice is not overdue", 
             "invoice_id": invoice_id,
+            "invoice_number": invoice_number,
+            "customer_id": customer_id,
+            "late_fee_month": late_fee_month,
             "days_overdue": days_overdue
         }
 
     # idempotency check
-    # check whether late fee already exists for: customer_id + invoice_id + late_fee_month
-    if late_fee_already_exists(customer_id, invoice_id, late_fee_month):
+    # check whether a late fee was applied to this invoice within the last 30 days
+    if has_recent_late_fee(customer_id, invoice_id):
         return {
             "status": "skipped",
-            "reason": "Late fee already exists.",
+            "reason": "Late fee already applied within last 30 days.",
             "invoice_id": invoice_id,
-            "late_fee_month": late_fee_month
+            "invoice_number": invoice_number,
+            "customer_id": customer_id,
+            "late_fee_month": late_fee_month,
         }
 
     # calculate late fee
@@ -2469,6 +2534,12 @@ def apply_late_fees():
 
     for candidate in candidates: 
         if not candidate["eligible_to_apply"]:
+            results.append({
+                "status": "skipped",
+                "invoice_id": candidate["invoice_id"],
+                "reason": candidate.get("skip_reason")
+            })
+
             log= LateFeeLog(
                 run_id= run_id,
                 invoice_id= candidate["invoice_id"],
@@ -2495,7 +2566,7 @@ def apply_late_fees():
                 run_id= run_id,
                 invoice_id= result.get("invoice_id"),
                 invoice_number=result.get("invoice_number"),
-                customer_id= candidate["customer_id"],
+                customer_id= result.get("customer_id"),
                 invoice_item_id= result.get("invoice_item_id"),
                 late_fee_month= candidate["late_fee_month"],
                 amount_cents= result.get("late_fee_cents"),
@@ -2534,7 +2605,7 @@ def apply_late_fees():
     # commit once after the loop 
     db.session.commit()
 
-    already_applied_count= sum(1 for c in candidates if not c["eligible_to_apply"])
+    skipped_count= sum(1 for c in candidates if not c["eligible_to_apply"])
 
     redirect_to_dashboard= request.form.get("redirect_to_dashboard")
 
@@ -2549,7 +2620,7 @@ def apply_late_fees():
         "total_candidates": len(candidates),
         "eligible_count": sum(1 for c in candidates if c["eligible_to_apply"]),
         "success_count": sum(1 for r in results if r["status"] == "success"),
-        "already_applied_count": already_applied_count,
+        "skipped_count": skipped_count,
         "failed_count": sum(1 for r in results if r["status"] == "failed"),
         "invoice_ids": [c["invoice_id"] for c in candidates],
         "results": results
@@ -3593,9 +3664,9 @@ def audit_invoice_due_dates():
 # debug stripe object (not guessing)
 @main.route("/debug-invoice")
 def debug_invoice(): 
-    invocies= stripe.Invoice.list(limit=1)
+    invoices= stripe.Invoice.list(limit=1)
 
-    invoice= invocies.data[0]
+    invoice= invoices.data[0]
 
     return invoice._to_dict_recursive()
 
