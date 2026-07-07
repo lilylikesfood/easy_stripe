@@ -4227,6 +4227,131 @@ def preview_inspection_weird_categories():
         "examples": examples,
     }
 
+# CSV report of weird cases
+@main.route("/admin/export-inspection-weird-cases") 
+def export_inspection_weird_cases():
+    subscriptions = stripe.Subscription.list(
+        status="active",
+        limit=100,
+        expand=["data.customer"]
+    )
+
+    rows = []
+
+    for subscription in subscriptions.auto_paging_iter():
+        subscription_id = stripe_get(subscription, "id")
+        start_dt = stripe_timestamp_to_utc_datetime(stripe_get(subscription, "start_date"))
+        cancel_dt = stripe_timestamp_to_utc_datetime(stripe_get(subscription, "cancel_at"))
+
+        customer = stripe_get(subscription, "customer")
+
+        customer_id = stripe_get(customer, "id")
+        customer_name = stripe_get(customer, "name")
+        customer_email = stripe_get(customer, "email")
+
+        if not start_dt:
+            row = {
+                "Customer Name": customer_name,
+                "Customer Email": customer_email,
+                "Category": "missing_start_date",
+                "Customer ID": customer_id,
+                "Subscription ID": subscription_id,
+                "Start Date": None,
+                "Current Cancel Date": cancel_dt.date().isoformat() if cancel_dt else None,
+                "Expected Inspection End Date": None,
+                "Expected Contract End Date": None,
+                "Days Difference": None,
+                "Recommended Action": "Subscription is missing start date. Review manually.",
+                "Boss Decision": "",
+                "Notes": "",
+            }
+
+            rows.append(row)
+            continue
+
+        expected_inspection_end_dt = start_dt + relativedelta(years=3)
+        expected_contract_end_dt = start_dt + relativedelta(years=50)
+
+        category = None
+        recommended_action = None
+        days_difference = None
+
+        if not cancel_dt:
+            category = "missing_cancel_at"
+            recommended_action = "No cancel date is currently set. Review only. "
+
+        else:
+            days_difference = (cancel_dt.date() - expected_inspection_end_dt.date()).days
+            years_from_start = cancel_dt.year -start_dt.year
+
+            # 0 days off, 1 day early, 1 day late all considered close enough because dates in Stripe are sometimes weird
+            if abs(days_difference) <= 1:
+            # abs(5) = 5, abs(-5) = 5
+            # it removes the sign
+                continue
+                # This subscription is normal. Skip it. Don't put it in the report
+
+            elif years_from_start == 20:
+                category = "twenty_year_cancel"
+                recommended_action = "Subscription appears set to cancel after 20 years. Confirm business rule."
+
+            # more than 1 day EARLY
+            elif days_difference < -1:
+                category = "early_cancel"
+                recommended_action = "Subscription may end too early. Needs review."
+
+            # more than 1 day LATE
+            elif days_difference > 1: 
+                category = "late_cancel"
+                recommended_action = "Inspection fee may continue too long. Needs review."
+
+        row = {
+            "Customer Name": customer_name,
+            "Customer Email": customer_email,
+            "Category": category,
+            "Customer ID": customer_id,
+            "Subscription ID": subscription_id,
+            "Start Date": start_dt.date().isoformat() if start_dt else None,
+            "Current Cancel Date": cancel_dt.date().isoformat() if cancel_dt else None,
+            "Expected Inspection End Date": expected_inspection_end_dt.date().isoformat() if expected_inspection_end_dt else None,
+            "Expected Contract End Date": expected_contract_end_dt.date().isoformat() if expected_contract_end_dt else None,
+            "Days Difference": days_difference,
+            "Recommended Action": recommended_action,
+            "Boss Decision": "",
+            "Notes": "",
+        }
+
+        rows.append(row)
+
+    output = io.StringIO()
+
+    fieldnames = [
+        "Customer Name",
+        "Customer Email",
+        "Category",
+        "Customer ID",
+        "Subscription ID",
+        "Start Date",
+        "Current Cancel Date",
+        "Expected Inspection End Date",
+        "Expected Contract End Date",
+        "Days Difference",
+        "Recommended Action",
+        "Boss Decision",
+        "Notes",
+    ]
+
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": "attachment; filename=inspection_weird_cases.csv"
+        },
+    )    
 
 # product audit
 @main.route("/admin/audit-products")
