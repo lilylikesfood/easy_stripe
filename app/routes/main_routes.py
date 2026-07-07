@@ -2692,6 +2692,7 @@ def carry_forward_invoice_balance(invoice_id):
     
     invoice_status= stripe_get(invoice_before, "status")
     amount_remaining= stripe_get(invoice_before, "amount_remaining", 0)
+    currency= stripe_get(invoice_before, "currency")
     customer_id= stripe_get(invoice_before, "customer")
     invoice_number= stripe_get(invoice_before, "number")
     old_invoice_status_before = stripe_get(invoice_before, "status")
@@ -2715,6 +2716,14 @@ def carry_forward_invoice_balance(invoice_id):
             "status": "skipped", 
             "reason": "Invoice has no remaining balance",
             "invoice_id": invoice_id
+        }
+    
+    if currency != "cad":
+        return {
+            "status": "skipped",
+            "reason": "Invoice currency is not CAD",
+            "invoice_id": invoice_id,
+            "currency": currency
         }
     
     if not customer_id:
@@ -2755,18 +2764,53 @@ def carry_forward_invoice_balance(invoice_id):
         "source_invoice_number": invoice_number or "",
     }
 
-    invoice_item= stripe.InvoiceItem.create(
-        customer=customer_id, 
-        amount=amount_remaining,
-        currency="cad",
-        description=carry_forward_description, 
-        metadata=metadata
-    )
-
     stripe.Invoice.void_invoice(invoice_id)
 
     invoice_after= stripe.Invoice.retrieve(invoice_id)
     old_invoice_status_after = stripe_get(invoice_after, "status")
+
+    if old_invoice_status_after != "void":
+        return {
+            "status": "failed",
+            "reason": "Invoice was not voided, so carry-forward item was not created",
+            "invoice_id": invoice_id,
+            "source_invoice_number": invoice_number,
+            "customer_id": customer_id,
+            "amount_remaining_cents": amount_remaining,
+            "old_invoice_status_before": old_invoice_status_before,
+            "old_invoice_status_after": old_invoice_status_after,
+        }
+    
+    try:
+        invoice_item= stripe.InvoiceItem.create(
+            customer=customer_id, 
+            amount=amount_remaining,
+            currency="cad",
+            description=carry_forward_description, 
+            metadata=metadata
+        )
+
+    except Exception as e:
+        return {
+            "status": "failed",
+            "reason": "Invoice was voided, but carry-forward invoice item creation failed. Manual review required.",
+            "error": str(e),
+            "invoice_id": invoice_id,
+            "source_invoice_number": invoice_number,
+            "customer_id": customer_id,
+            "amount_remaining_cents": amount_remaining,
+            "old_invoice_status_before": old_invoice_status_before,
+            "old_invoice_status_after": old_invoice_status_after,
+            "invoice_item_id": None,
+            "manual_action_required": True,
+            "source_invoice_created_ts": source_invoice_created_ts,
+            "source_invoice_due_date_ts": source_invoice_due_date_ts,
+            "source_invoice_total_cents": source_invoice_total_cents,
+            "source_invoice_amount_remaining_cents": source_invoice_amount_remaining_cents,
+            "carried_forward_amount_cents": 0,
+            "carry_forward_description": carry_forward_description,
+        }
+
 
     return {
         "status": "success",
@@ -2950,6 +2994,12 @@ def find_carry_forward_candidates():
             and days_until_next_invoice == 1
         )
 
+        # for special case: invoice is going to be generated the same day but later time to generate invoice
+        # eligible_to_apply = (
+        #     not already_exists
+        #     and days_until_next_invoice in [0, 1]
+        # )
+
         if already_exists:
             skip_reason = "carry forward already exists"
         elif subscription is None:
@@ -2960,6 +3010,9 @@ def find_carry_forward_candidates():
             skip_reason = "next invoice date unavailable"
         elif days_until_next_invoice != 1:
             skip_reason = f"next invoice is not tomorrow; days_until_next_invoice={days_until_next_invoice}"
+        # for special case: invoice is going to be generated the same day but later time to generate invoice
+        # elif days_until_next_invoice not in [0, 1]:
+        #     skip_reason = f"next invoice is not today or tomorrow; days_until_next_invoice={days_until_next_invoice}"
         else:
             skip_reason = None
 
@@ -3038,7 +3091,7 @@ def get_next_monthly_billing_date_from_anchor(anchor_ts, today_date):
 
     candidate = safe_date_for_month(year, month)
 
-    if candidate <= today_date:
+    if candidate < today_date:
         if month == 12:
             candidate = safe_date_for_month(year + 1, 1)
         else:
@@ -3513,6 +3566,8 @@ def run_overdue_billing():
             )
 
             db.session.add(log)
+
+    db.session.commit()
 
     # STEP 2: carry forward after late fees
     carry_forward_audit = find_carry_forward_candidates()
