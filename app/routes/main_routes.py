@@ -3830,6 +3830,35 @@ def late_fee_dashboard():
         data=data
     )
 
+# -----------------------------------------inspection fee ------------------------------------------
+
+# helper
+def stripe_metadata_to_dict(metadata):
+    if not metadata:
+        return {}
+
+    result = {}
+
+    raw_data = getattr(metadata, "_data", None)
+
+    if raw_data:
+        for key, value in raw_data.items():
+            result[key] = value
+
+    return result
+
+def date_to_str(dt):
+    if not dt:
+        return None
+    
+    return dt.date().isoformat()
+
+def days_between(date1, date2):
+    if not date1 or not date2:
+        return None
+    
+    return abs((date1.date() - date2.date()).days)
+
 # audit inspection fee
 @main.route("/admin/audit-inspection-fees")
 def audit_inspection_fees(): 
@@ -3839,20 +3868,365 @@ def audit_inspection_fees():
         limit=100,
     )
 
-    for subscription in subscriptions.auto_paging_iter(): 
-        items= stripe_get(subscription, "items", {})
-        subscription_items= stripe_get(items, "data",[])
+#     for subscription in subscriptions.auto_paging_iter(): 
+#         items= stripe_get(subscription, "items", {})
+#         subscription_items= stripe_get(items, "data",[])
+
+#         for item in subscription_items:
+#             price= stripe_get(item, "price", {})
+#             product= stripe_get(price, "product")
+
+#             print("----------------------------------")
+#             print("Subscription: ", stripe_get(subscription, "id"))
+#             print("Item:", stripe_get(item, "id"))
+#             print("product: ", product)
+
+#     return {"status": "ok"}
+    results = []
+
+    for subscription in subscriptions.auto_paging_iter():
+        subscription_id = stripe_get(subscription, "id")
+        customer_id = stripe_get(subscription, "customer")
+        metadata = stripe_metadata_to_dict(
+            stripe_get(subscription, "metadata", {}) or {}
+        )
+
+        start_date = stripe_timestamp_to_utc_datetime(
+            stripe_get(subscription, "start_date")
+        )
+
+        cancel_at = stripe_get(subscription, "cancel_at")
+        cancel_at_period_end = stripe_get(subscription, "cancel_at_period_end")
+
+        cancel_at_date = stripe_timestamp_to_utc_datetime(cancel_at)
+
+        items = stripe_get(subscription, "items", {})
+        subscription_items = stripe_get(items, "data", [])
+
+        service_items = []
+        inspection_items = []
+        unknown_items = []
 
         for item in subscription_items:
-            price= stripe_get(item, "price", {})
-            product= stripe_get(price, "product")
+            item_id = stripe_get(item, "id")
+            item_metadata = stripe_metadata_to_dict(
+                stripe_get(item, "metadata", {}) or {}
+            )
 
-            print("----------------------------------")
-            print("Subscription: ", stripe_get(subscription, "id"))
-            print("Item:", stripe_get(item, "id"))
-            print("product: ", product)
+            price = stripe_get(item, "price", {})
+            price_id = stripe_get(price, "id")
+            unit_amount = stripe_get(price, "unit_amount")
+            currency = stripe_get(price, "currency")
 
-    return {"status": "ok"}
+            product_id = stripe_get(price, "product")
+
+            product = stripe.Product.retrieve(product_id) if product_id else {}
+            product_name = stripe_get(product, "name", "")
+
+            item_info = {
+                "subscription_item_id": item_id,
+                "price_id": price_id,
+                "product_id": product_id,
+                "product_name": product_name,
+                "unit_amount": unit_amount,
+                "currency": currency,
+                "metadata": item_metadata,
+            }
+
+            product_name_lower = product_name.lower()
+            item_type = item_metadata.get("item_type")
+
+            if item_type == "inspection_fee" or "inspect" in product_name_lower:
+                inspection_items.append(item_info)
+
+            elif item_type == "main_service_fee" or "geothermal" in product_name_lower:
+                service_items.append(item_info)
+
+            else:
+                unknown_items.append(item_info)
+
+        warnings = []
+
+        if cancel_at:
+            warnings.append(
+                "Subscription has cancel_at set. This may stop the whole 50-year contract."
+            )
+
+        if cancel_at_period_end:
+            warnings.append(
+                "Subscription has cancel_at_period_end=True. This may stop the whole subscription."
+            )
+
+        if len(service_items) == 0:
+            warnings.append("No main service item found.")
+
+        if len(inspection_items) == 0:
+            warnings.append("No inspection fee item found.")
+
+        if len(inspection_items) > 1:
+            warnings.append("More than one inspection fee item found.")
+
+        if not stripe_get(metadata, "contract_start_date"):
+            warnings.append("Missing metadata: contract_start_date")
+
+        if not stripe_get(metadata, "contract_end_date"):
+            warnings.append("Missing metadata: contract_end_date")
+
+        if not stripe_get(metadata, "inspection_fee_end_date"):
+            warnings.append("Missing metadata: inspection_fee_end_date")
+
+        results.append({
+            "subscription_id": subscription_id,
+            "customer_id": customer_id,
+            "start_date": start_date.date().isoformat() if start_date else None,
+            "cancel_at": cancel_at,
+            "cancel_at_date": cancel_at_date.date().isoformat() if cancel_at_date else None,
+            "cancel_at_period_end": cancel_at_period_end,
+            "metadata": metadata,
+            "service_items": service_items,
+            "inspection_items": inspection_items,
+            "unknown_items": unknown_items,
+            "warnings": warnings,
+        })
+
+    return {
+        "count": len(results),
+        "results": results,
+    }
+
+# Show me exactly what I'm about to do before I actually touch customer subscriptions
+@main.route("/admin/preview-inspection-metadata")
+def preview_inspection_metadata():
+    subscriptions = stripe.Subscription.list(
+        status="active",
+        limit=100,
+    )
+
+    results = []
+
+    for subscription in subscriptions.auto_paging_iter():
+        subscription_id = stripe_get(subscription, "id")
+        customer_id = stripe_get(subscription, "customer")
+
+        start_dt = stripe_timestamp_to_utc_datetime(
+            stripe_get(subscription, "start_date")
+        )
+
+        if not start_dt:
+            results.append({
+                "subscription_id": subscription_id,
+                "customer_id": customer_id,
+                "action": "skipped",
+                "reason": "Missing subscription start_date",
+            })
+            continue
+
+        inspection_end_dt = start_dt + relativedelta(years=3)
+        contract_end_dt = start_dt + relativedelta(years=50)
+
+        preview_metadata = {
+            "contract_start_date": date_to_str(start_dt),
+            "contract_end_date": date_to_str(contract_end_dt),
+            "contract_term_years": "50",
+            "inspection_fee_start_date": date_to_str(start_dt),
+            "inspection_fee_end_date": date_to_str(inspection_end_dt),
+            "inspection_fee_years": "3",
+            "inspection_fee_status": "active",
+            "billing_rule_version": "1",
+        }
+
+        results.append({
+            "subscription_id": subscription_id,
+            "customer_id": customer_id,
+            "current_cancel_at": stripe_get(subscription, "cancel_at"),
+            "current_cancel_at_date": date_to_str(
+                stripe_timestamp_to_utc_datetime(
+                    stripe_get(subscription, "cancel_at")
+                )
+            ),
+            "would_add_metadata": preview_metadata,
+            "action": "preview_only_no_changes",
+        })
+
+    return {
+        "count": len(results),
+        "results": results,
+    }
+
+# summary of preview for weird results
+@main.route("/admin/preview-inspection-metadata-summary")
+def preview_inspection_metadata_summary():
+    subscriptions = stripe.Subscription.list(
+        status="active",
+        limit=100,
+    )
+
+    total_checked = 0
+    normal_count = 0
+    weird_results = []
+
+    for subscription in subscriptions.auto_paging_iter():
+        total_checked += 1
+
+        subscription_id = stripe_get(subscription, "id")
+        customer_id = stripe_get(subscription, "customer")
+
+        start_dt = stripe_timestamp_to_utc_datetime(
+            stripe_get(subscription, "start_date")
+        )
+
+        cancel_at = stripe_get(subscription, "cancel_at")
+        cancel_dt = stripe_timestamp_to_utc_datetime(cancel_at)
+
+        if not start_dt:
+            weird_results.append({
+                "subscription_id": subscription_id,
+                "customer_id": customer_id,
+                "reason": "missing_start_date",
+            })
+            continue
+
+        expected_inspection_end_dt = start_dt + relativedelta(years=3)
+        expected_contract_end_dt = start_dt + relativedelta(years=50)
+
+        weird_reasons = []
+
+        if not cancel_dt:
+            weird_reasons.append("cancel_at_is_missing")
+
+        else:
+            difference_days = days_between(cancel_dt, expected_inspection_end_dt)
+
+            if difference_days > 1:
+                weird_reasons.append(
+                    f"cancel_at_does_not_match_3_year_inspection_end_date_by_{difference_days}_days"
+                )
+
+        if expected_contract_end_dt.year - start_dt.year != 50:
+            weird_reasons.append("contract_end_date_not_50_years_after_start")
+
+        if weird_reasons:
+            weird_results.append({
+                "subscription_id": subscription_id,
+                "customer_id": customer_id,
+                "start_date": date_to_str(start_dt),
+                "current_cancel_at_date": date_to_str(cancel_dt),
+                "expected_inspection_fee_end_date": date_to_str(expected_inspection_end_dt),
+                "expected_contract_end_date": date_to_str(expected_contract_end_dt),
+                "weird_reasons": weird_reasons,
+            })
+        else:
+            normal_count += 1
+
+    return {
+        "total_checked": total_checked,
+        "normal_count": normal_count,
+        "weird_count": len(weird_results),
+        "weird_results": weird_results,
+    }
+
+# categorize weird cases
+@main.route("/admin/preview-inspection-weird-categories")
+def preview_inspection_weird_categories():
+    subscriptions = stripe.Subscription.list(
+        status="active",
+        limit=100,
+    )
+
+    summary = {
+        "total_checked": 0,
+        "normal_count": 0,
+        "missing_cancel_at_count": 0,
+        "early_cancel_count": 0,
+        "late_cancel_count": 0,
+        "twenty_year_cancel_count": 0,
+    }
+
+    examples = {
+        "missing_cancel_at": [],
+        "early_cancel": [],
+        "late_cancel": [],
+        "twenty_year_cancel": [],
+    }
+
+    for subscription in subscriptions.auto_paging_iter():
+        summary["total_checked"] += 1
+
+        subscription_id = stripe_get(subscription, "id")
+        customer_id = stripe_get(subscription, "customer")
+
+        start_dt = stripe_timestamp_to_utc_datetime(
+            stripe_get(subscription, "start_date")
+        )
+
+        cancel_dt = stripe_timestamp_to_utc_datetime(
+            stripe_get(subscription, "cancel_at")
+        )
+
+        if not start_dt:
+            continue
+
+        expected_inspection_end_dt = start_dt + relativedelta(years=3)
+        expected_contract_end_dt = start_dt + relativedelta(years=50)
+
+        base_info = {
+            "subscription_id": subscription_id,
+            "customer_id": customer_id,
+            "start_date": date_to_str(start_dt),
+            "current_cancel_at_date": date_to_str(cancel_dt),
+            "expected_inspection_fee_end_date": date_to_str(expected_inspection_end_dt),
+            "expected_contract_end_date": date_to_str(expected_contract_end_dt),
+        }
+
+        if not cancel_dt:
+            summary["missing_cancel_at_count"] += 1
+
+            if len(examples["missing_cancel_at"]) < 10:
+                examples["missing_cancel_at"].append(base_info)
+
+            continue
+
+        difference_days = (cancel_dt.date() - expected_inspection_end_dt.date()).days
+
+        if abs(difference_days) <= 1:
+            summary["normal_count"] += 1
+            continue
+
+        years_from_start = cancel_dt.year - start_dt.year
+
+        if years_from_start == 20:
+            summary["twenty_year_cancel_count"] += 1
+
+            if len(examples["twenty_year_cancel"]) < 10:
+                examples["twenty_year_cancel"].append({
+                    **base_info,
+                    "difference_days": difference_days,
+                    "years_from_start": years_from_start,
+                })
+
+        elif difference_days < -1:
+            summary["early_cancel_count"] += 1
+
+            if len(examples["early_cancel"]) < 10:
+                examples["early_cancel"].append({
+                    **base_info,
+                    "difference_days": difference_days,
+                })
+
+        elif difference_days > 1:
+            summary["late_cancel_count"] += 1
+
+            if len(examples["late_cancel"]) < 10:
+                examples["late_cancel"].append({
+                    **base_info,
+                    "difference_days": difference_days,
+                })
+
+    return {
+        "summary": summary,
+        "examples": examples,
+    }
+
 
 # product audit
 @main.route("/admin/audit-products")
