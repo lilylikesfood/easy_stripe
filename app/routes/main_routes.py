@@ -4353,6 +4353,70 @@ def export_inspection_weird_cases():
         },
     )    
 
+# preview-inspection-metadata-apply
+@main.route("/admin/preview-inspection-metadata-apply")
+def preview_inspection_metadata_apply():
+    subscriptions = stripe.Subscription.list(
+        status="active",
+        limit=100,
+        expand=["data.customer"]
+    )
+
+    results = []
+
+    for subscription in subscriptions.auto_paging_iter():
+        subscription_id = stripe_get(subscription, "id")
+        customer= stripe_get(subscription, "customer")
+        customer_id = stripe_get(customer, "id")
+        current_metadata = stripe_metadata_to_dict(stripe_get(subscription, "metadata", {}) or {})
+
+        start_dt = stripe_timestamp_to_utc_datetime(stripe_get(subscription, "start_date"))
+        cancel_dt = stripe_timestamp_to_utc_datetime(stripe_get(subscription, "cancel_at"))
+
+        if not start_dt:
+            results.append({
+                "Category": "missing_start_date",
+                "Customer ID": customer_id,
+                "Subscription ID": subscription_id,
+                "Start Date": None,
+                "Current Cancel Date": cancel_dt.date().isoformat() if cancel_dt else None,
+                "Expected Inspection End Date": None,
+                "Expected Contract End Date": None,
+                "Days Difference": None,
+                "Recommended Action": "Subscription is missing start date. Review manually.",
+                "Boss Decision": "",
+                "Notes": "",
+            })
+
+            continue
+
+        expected_inspection_end_dt = start_dt + relativedelta(years=3)
+        expected_contract_end_dt = start_dt + relativedelta(years=50)
+
+        would_add_metadata = {
+            "contract_start_date": start_dt.date().isoformat(),
+            "contract_end_date": expected_contract_end_dt.date().isoformat(),
+            "contract_term_years": "50",
+            "inspection_fee_start_date": start_dt.date().isoformat(),
+            "inspection_fee_end_date": expected_inspection_end_dt.date().isoformat(),
+            "inspection_fee_years": "3",
+            "inspection_fee_status": "active",
+            "billing_rule_version": "1",
+        }
+
+        results.append({
+            "subscription_id": subscription_id,
+            "customer_id": customer_id,
+            "current_metadata": current_metadata,
+            "would_add_metadata": would_add_metadata,
+            "action": "preview_only_no_changes",
+        })
+
+    return {
+        "count": len(results),
+        "results": results[:10],
+    }
+
 # product audit
 @main.route("/admin/audit-products")
 def audit_products(): 
