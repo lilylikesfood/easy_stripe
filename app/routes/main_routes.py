@@ -3859,6 +3859,29 @@ def days_between(date1, date2):
     
     return abs((date1.date() - date2.date()).days)
 
+def get_effective_cancel_datetime(subscription):
+    cancel_at = stripe_get(subscription, "cancel_at")
+
+    if cancel_at:
+        return stripe_timestamp_to_utc_datetime(cancel_at), "subscription.cancel_at"
+
+    schedule = stripe_get(subscription, "schedule")
+
+    if schedule:
+        if isinstance(schedule, str):
+            schedule = stripe.SubscriptionSchedule.retrieve(schedule)
+
+        if stripe_get(schedule, "end_behavior") == "cancel":
+            phases = stripe_get(schedule, "phases", [])
+            last_phase = phases[-1] if phases else None
+
+            if last_phase and stripe_get(last_phase, "end_date"):
+                return stripe_timestamp_to_utc_datetime(
+                    stripe_get(last_phase, "end_date")
+                ), "subscription_schedule.last_phase.end_date"
+
+    return None, "missing"
+
 # audit inspection fee
 @main.route("/admin/audit-inspection-fees")
 def audit_inspection_fees(): 
@@ -4000,6 +4023,7 @@ def preview_inspection_metadata():
     subscriptions = stripe.Subscription.list(
         status="active",
         limit=100,
+        expand=["data.customer"]
     )
 
     results = []
@@ -4008,27 +4032,29 @@ def preview_inspection_metadata():
         subscription_id = stripe_get(subscription, "id")
         customer_id = stripe_get(subscription, "customer")
 
-        start_dt = stripe_timestamp_to_utc_datetime(
-            stripe_get(subscription, "start_date")
+        customer = stripe_get(subscription, "customer")
+
+        contract_start_dt = stripe_timestamp_to_utc_datetime(
+            stripe_get(customer, "created")
         )
 
-        if not start_dt:
+        if not contract_start_dt:
             results.append({
                 "subscription_id": subscription_id,
                 "customer_id": customer_id,
                 "action": "skipped",
-                "reason": "Missing subscription start_date",
+                "reason": "Missing customer.created date",
             })
             continue
 
-        inspection_end_dt = start_dt + relativedelta(years=3)
-        contract_end_dt = start_dt + relativedelta(years=50)
+        inspection_end_dt = contract_start_dt + relativedelta(years=3)
+        contract_end_dt = contract_start_dt + relativedelta(years=50)
 
         preview_metadata = {
-            "contract_start_date": date_to_str(start_dt),
+            "contract_start_date": date_to_str(contract_start_dt),
             "contract_end_date": date_to_str(contract_end_dt),
             "contract_term_years": "50",
-            "inspection_fee_start_date": date_to_str(start_dt),
+            "inspection_fee_start_date": date_to_str(contract_start_dt),
             "inspection_fee_end_date": date_to_str(inspection_end_dt),
             "inspection_fee_years": "3",
             "inspection_fee_status": "active",
@@ -4059,6 +4085,7 @@ def preview_inspection_metadata_summary():
     subscriptions = stripe.Subscription.list(
         status="active",
         limit=100,
+        expand=["data.customer", "data.schedule"]
     )
 
     total_checked = 0
@@ -4071,23 +4098,24 @@ def preview_inspection_metadata_summary():
         subscription_id = stripe_get(subscription, "id")
         customer_id = stripe_get(subscription, "customer")
 
-        start_dt = stripe_timestamp_to_utc_datetime(
-            stripe_get(subscription, "start_date")
+        customer = stripe_get(subscription, "customer")
+
+        contract_start_dt = stripe_timestamp_to_utc_datetime(
+            stripe_get(customer, "created")
         )
 
-        cancel_at = stripe_get(subscription, "cancel_at")
-        cancel_dt = stripe_timestamp_to_utc_datetime(cancel_at)
+        cancel_dt, cancel_source = get_effective_cancel_datetime(subscription)
 
-        if not start_dt:
+        if not contract_start_dt:
             weird_results.append({
                 "subscription_id": subscription_id,
                 "customer_id": customer_id,
-                "reason": "missing_start_date",
+                "reason": "missing_customer_created_date",
             })
             continue
 
-        expected_inspection_end_dt = start_dt + relativedelta(years=3)
-        expected_contract_end_dt = start_dt + relativedelta(years=50)
+        expected_inspection_end_dt = contract_start_dt + relativedelta(years=3)
+        expected_contract_end_dt = contract_start_dt + relativedelta(years=50)
 
         weird_reasons = []
 
@@ -4102,14 +4130,14 @@ def preview_inspection_metadata_summary():
                     f"cancel_at_does_not_match_3_year_inspection_end_date_by_{difference_days}_days"
                 )
 
-        if expected_contract_end_dt.year - start_dt.year != 50:
+        if expected_contract_end_dt.year - contract_start_dt.year != 50:
             weird_reasons.append("contract_end_date_not_50_years_after_start")
 
         if weird_reasons:
             weird_results.append({
                 "subscription_id": subscription_id,
                 "customer_id": customer_id,
-                "start_date": date_to_str(start_dt),
+                "start_date": date_to_str(contract_start_dt),
                 "current_cancel_at_date": date_to_str(cancel_dt),
                 "expected_inspection_fee_end_date": date_to_str(expected_inspection_end_dt),
                 "expected_contract_end_date": date_to_str(expected_contract_end_dt),
@@ -4131,6 +4159,7 @@ def preview_inspection_weird_categories():
     subscriptions = stripe.Subscription.list(
         status="active",
         limit=100,
+        expand=["data.customer", "data.schedule"]
     )
 
     summary = {
@@ -4155,24 +4184,24 @@ def preview_inspection_weird_categories():
         subscription_id = stripe_get(subscription, "id")
         customer_id = stripe_get(subscription, "customer")
 
-        start_dt = stripe_timestamp_to_utc_datetime(
-            stripe_get(subscription, "start_date")
+        customer = stripe_get(subscription, "customer")
+
+        contract_start_dt = stripe_timestamp_to_utc_datetime(
+            stripe_get(customer, "created")
         )
 
-        cancel_dt = stripe_timestamp_to_utc_datetime(
-            stripe_get(subscription, "cancel_at")
-        )
+        cancel_dt, cancel_source = get_effective_cancel_datetime(subscription)
 
-        if not start_dt:
+        if not contract_start_dt:
             continue
 
-        expected_inspection_end_dt = start_dt + relativedelta(years=3)
-        expected_contract_end_dt = start_dt + relativedelta(years=50)
+        expected_inspection_end_dt = contract_start_dt + relativedelta(years=3)
+        expected_contract_end_dt = contract_start_dt + relativedelta(years=50)
 
         base_info = {
             "subscription_id": subscription_id,
             "customer_id": customer_id,
-            "start_date": date_to_str(start_dt),
+            "start_date": date_to_str(contract_start_dt),
             "current_cancel_at_date": date_to_str(cancel_dt),
             "expected_inspection_fee_end_date": date_to_str(expected_inspection_end_dt),
             "expected_contract_end_date": date_to_str(expected_contract_end_dt),
@@ -4192,7 +4221,7 @@ def preview_inspection_weird_categories():
             summary["normal_count"] += 1
             continue
 
-        years_from_start = cancel_dt.year - start_dt.year
+        years_from_start = cancel_dt.year - contract_start_dt.year
 
         if years_from_start == 20:
             summary["twenty_year_cancel_count"] += 1
@@ -4233,35 +4262,41 @@ def export_inspection_weird_cases():
     subscriptions = stripe.Subscription.list(
         status="active",
         limit=100,
-        expand=["data.customer"]
+        expand=["data.customer", "data.schedule"]
     )
 
     rows = []
 
     for subscription in subscriptions.auto_paging_iter():
         subscription_id = stripe_get(subscription, "id")
-        start_dt = stripe_timestamp_to_utc_datetime(stripe_get(subscription, "start_date"))
-        cancel_dt = stripe_timestamp_to_utc_datetime(stripe_get(subscription, "cancel_at"))
+        
+        subscription_start_dt = stripe_timestamp_to_utc_datetime(stripe_get(subscription, "start_date"))
 
         customer = stripe_get(subscription, "customer")
+
+        # Business rule: contract start date is based on Stripe Customer.created ("Customer Since")
+        contract_start_dt = stripe_timestamp_to_utc_datetime(stripe_get(customer, "created"))
+        contract_cancel_dt, cancel_source = get_effective_cancel_datetime(subscription)
 
         customer_id = stripe_get(customer, "id")
         customer_name = stripe_get(customer, "name")
         customer_email = stripe_get(customer, "email")
 
-        if not start_dt:
+        if not contract_start_dt:
             row = {
                 "Customer Name": customer_name,
                 "Customer Email": customer_email,
-                "Category": "missing_start_date",
+                "Category": "missing_customer_created_date",
                 "Customer ID": customer_id,
                 "Subscription ID": subscription_id,
-                "Start Date": None,
-                "Current Cancel Date": cancel_dt.date().isoformat() if cancel_dt else None,
+                "Customer Since": None,
+                "Subscription Start Date": subscription_start_dt.date().isoformat() if subscription_start_dt else None,
+                "Current Cancel Date": contract_cancel_dt.date().isoformat() if contract_cancel_dt else None,
+                "Cancel Source": cancel_source,
                 "Expected Inspection End Date": None,
                 "Expected Contract End Date": None,
                 "Days Difference": None,
-                "Recommended Action": "Subscription is missing start date. Review manually.",
+                "Recommended Action": "Customer created date is missing. Review manually.",
                 "Boss Decision": "",
                 "Notes": "",
             }
@@ -4269,20 +4304,20 @@ def export_inspection_weird_cases():
             rows.append(row)
             continue
 
-        expected_inspection_end_dt = start_dt + relativedelta(years=3)
-        expected_contract_end_dt = start_dt + relativedelta(years=50)
+        expected_inspection_end_dt = contract_start_dt + relativedelta(years=3)
+        expected_contract_end_dt = contract_start_dt + relativedelta(years=50)
 
         category = None
         recommended_action = None
         days_difference = None
 
-        if not cancel_dt:
+        if not contract_cancel_dt:
             category = "missing_cancel_at"
             recommended_action = "No cancel date is currently set. Review only. "
 
         else:
-            days_difference = (cancel_dt.date() - expected_inspection_end_dt.date()).days
-            years_from_start = cancel_dt.year -start_dt.year
+            days_difference = (contract_cancel_dt.date() - expected_inspection_end_dt.date()).days
+            years_from_start = contract_cancel_dt.year - contract_start_dt.year
 
             # 0 days off, 1 day early, 1 day late all considered close enough because dates in Stripe are sometimes weird
             if abs(days_difference) <= 1:
@@ -4311,8 +4346,10 @@ def export_inspection_weird_cases():
             "Category": category,
             "Customer ID": customer_id,
             "Subscription ID": subscription_id,
-            "Start Date": start_dt.date().isoformat() if start_dt else None,
-            "Current Cancel Date": cancel_dt.date().isoformat() if cancel_dt else None,
+            "Customer Since": contract_start_dt.date().isoformat() if contract_start_dt else None,
+            "Subscription Start Date": subscription_start_dt.date().isoformat() if subscription_start_dt else None,
+            "Current Cancel Date": contract_cancel_dt.date().isoformat() if contract_cancel_dt else None,
+            "Cancel Source": cancel_source,
             "Expected Inspection End Date": expected_inspection_end_dt.date().isoformat() if expected_inspection_end_dt else None,
             "Expected Contract End Date": expected_contract_end_dt.date().isoformat() if expected_contract_end_dt else None,
             "Days Difference": days_difference,
@@ -4331,8 +4368,10 @@ def export_inspection_weird_cases():
         "Category",
         "Customer ID",
         "Subscription ID",
-        "Start Date",
+        "Customer Since",
+        "Subscription Start Date",
         "Current Cancel Date",
+        "Cancel Source",
         "Expected Inspection End Date",
         "Expected Contract End Date",
         "Days Difference",
@@ -4351,7 +4390,40 @@ def export_inspection_weird_cases():
         headers={
             "Content-Disposition": "attachment; filename=inspection_weird_cases.csv"
         },
-    )    
+    )
+
+# debug-subscription-lifecycle
+@main.route("/admin/debug-subscription-lifecycle/<subscription_id>")
+def debug_subscription_lifecycle(subscription_id):
+    subscription = stripe.Subscription.retrieve(
+        subscription_id,
+        expand=["customer", "schedule"]
+    )
+
+    schedule = stripe_get(subscription, "schedule")
+
+    return {
+        "subscription_id": stripe_get(subscription, "id"),
+        "customer_id": stripe_get(stripe_get(subscription, "customer"), "id"),
+        "customer_created": stripe_get(stripe_get(subscription, "customer"), "created"),
+        "subscription_start_date": stripe_get(subscription, "start_date"),
+        "subscription_cancel_at": stripe_get(subscription, "cancel_at"),
+        "subscription_cancel_at_period_end": stripe_get(subscription, "cancel_at_period_end"),
+        "subscription_status": stripe_get(subscription, "status"),
+        "subscription_schedule": stripe_get(schedule, "id") if schedule else None,
+        "schedule_status": stripe_get(schedule, "status") if schedule else None,
+        "schedule_end_behavior": stripe_get(schedule, "end_behavior") if schedule else None,
+        "schedule_phases": [
+            {
+                "start_date": stripe_timestamp_to_utc_datetime(stripe_get(phase, "start_date")).date().isoformat()
+                if stripe_get(phase, "start_date") else None,
+
+                "end_date": stripe_timestamp_to_utc_datetime(stripe_get(phase, "end_date")).date().isoformat()
+                if stripe_get(phase, "end_date") else None,
+            }
+            for phase in stripe_get(schedule, "phases", [])
+        ] if schedule else [],
+    }
 
 # preview-inspection-metadata-apply
 @main.route("/admin/preview-inspection-metadata-apply")
@@ -4359,23 +4431,36 @@ def preview_inspection_metadata_apply():
     subscriptions = stripe.Subscription.list(
         status="active",
         limit=100,
-        expand=["data.customer"]
+        expand=["data.customer", "data.schedule"]
     )
+
+    target_subscription_id = request.args.get("subscription_id")
 
     results = []
 
     for subscription in subscriptions.auto_paging_iter():
         subscription_id = stripe_get(subscription, "id")
+
+        if target_subscription_id and subscription_id != target_subscription_id:
+            continue
+
         customer= stripe_get(subscription, "customer")
         customer_id = stripe_get(customer, "id")
         current_metadata = stripe_metadata_to_dict(stripe_get(subscription, "metadata", {}) or {})
 
-        start_dt = stripe_timestamp_to_utc_datetime(stripe_get(subscription, "start_date"))
-        cancel_dt = stripe_timestamp_to_utc_datetime(stripe_get(subscription, "cancel_at"))
+        contract_start_dt = stripe_timestamp_to_utc_datetime(
+            stripe_get(customer, "created")
+        )
 
-        if not start_dt:
+        subscription_start_dt = stripe_timestamp_to_utc_datetime(
+            stripe_get(subscription, "start_date")
+        )
+
+        cancel_dt, cancel_source = get_effective_cancel_datetime(subscription)
+
+        if not contract_start_dt:
             results.append({
-                "Category": "missing_start_date",
+                "Category": "missing_customer_created_date",
                 "Customer ID": customer_id,
                 "Subscription ID": subscription_id,
                 "Start Date": None,
@@ -4383,21 +4468,21 @@ def preview_inspection_metadata_apply():
                 "Expected Inspection End Date": None,
                 "Expected Contract End Date": None,
                 "Days Difference": None,
-                "Recommended Action": "Subscription is missing start date. Review manually.",
+                "Recommended Action": "Customer created date is missing. Review manually.",
                 "Boss Decision": "",
                 "Notes": "",
             })
 
             continue
 
-        expected_inspection_end_dt = start_dt + relativedelta(years=3)
-        expected_contract_end_dt = start_dt + relativedelta(years=50)
+        expected_inspection_end_dt = contract_start_dt + relativedelta(years=3)
+        expected_contract_end_dt = contract_start_dt + relativedelta(years=50)
 
         would_add_metadata = {
-            "contract_start_date": start_dt.date().isoformat(),
+            "contract_start_date": contract_start_dt.date().isoformat(),
             "contract_end_date": expected_contract_end_dt.date().isoformat(),
             "contract_term_years": "50",
-            "inspection_fee_start_date": start_dt.date().isoformat(),
+            "inspection_fee_start_date": contract_start_dt.date().isoformat(),
             "inspection_fee_end_date": expected_inspection_end_dt.date().isoformat(),
             "inspection_fee_years": "3",
             "inspection_fee_status": "active",
@@ -4407,6 +4492,10 @@ def preview_inspection_metadata_apply():
         results.append({
             "subscription_id": subscription_id,
             "customer_id": customer_id,
+            "customer_since": contract_start_dt.date().isoformat(),
+            "subscription_start_date": subscription_start_dt.date().isoformat() if subscription_start_dt else None,
+            "current_cancel_date": cancel_dt.date().isoformat() if cancel_dt else None,
+            "cancel_source": cancel_source,
             "current_metadata": current_metadata,
             "would_add_metadata": would_add_metadata,
             "action": "preview_only_no_changes",
@@ -4414,7 +4503,199 @@ def preview_inspection_metadata_apply():
 
     return {
         "count": len(results),
-        "results": results[:10],
+        "results": results[:30],
+    }
+
+# apply metadata for inspection fee
+@main.route("/admin/apply-inspection-metadata", methods=["POST"])
+def apply_inspection_metadata():
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
+
+    confirm = request.form.get("confirm")
+
+    if confirm != "APPLY":
+        return {
+            "error": "Confirmation required. Submit confirm=APPLY."
+        }, 400
+
+    mode = request.form.get("mode")
+
+    if mode not in ["test", "live"]:
+        return {
+            "error": "Mode required. Submit mode=test or mode=live."
+        }, 400
+
+    is_live_key = current_app.config["STRIPE_SECRET_KEY"].startswith("sk_live_")
+
+    if mode == "live" and not is_live_key:
+        return {
+            "error": "You submitted mode=live, but Stripe key is not live."
+        }, 400
+
+    if mode == "test" and is_live_key:
+        return {
+            "error": "You submitted mode=test, but Stripe key is live."
+        }, 400
+    
+    # Specify subscription ID from terminal
+    target_subscription_id = request.form.get("subscription_id")
+    
+    subscriptions= stripe.Subscription.list(
+        status="active", 
+        limit=100,
+        expand=["data.customer"],
+    )
+
+    results = []
+
+    # for saving to the CSV file
+    log_rows = []
+
+    updated_count = 0
+    failed_count = 0
+
+    # to generate CSV report 
+    # Create a folder called logs. If it already exists, don’t crash.
+    os.makedirs("logs", exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    log_filename = f"inspection_metadata_apply_log_{timestamp}.csv"
+    # Put these path pieces together correctly -> logs\abc.csv   (it avoids manually choosing / or \)
+    log_path= os.path.join("logs", log_filename)
+
+    for subscription in subscriptions.auto_paging_iter():
+        subscription_id = stripe_get(subscription, "id")
+
+        # # apply for one person only before bulk apply
+        # TEST_SUBSCRIPTION_ID = "sub_1TThLQE2kujhweZxBGs9Qoij"
+
+        # # Ignore this subscription and continue with the rest of the subscriptions
+        # if subscription_id != TEST_SUBSCRIPTION_ID:
+        #     continue
+        #     # continue: Skip everything below me in THIS iteration, then start the next iteration.
+
+        if target_subscription_id and subscription_id != target_subscription_id:
+            continue
+
+        customer = stripe_get(subscription, "customer")
+        customer_id = stripe_get(customer, "id")
+
+        contract_start_dt = stripe_timestamp_to_utc_datetime(
+            stripe_get(customer, "created")
+        )
+
+        if not contract_start_dt:
+            raise ValueError(
+                f"Subscription {subscription_id} is missing created date. Stop and investigate before applying metadata."
+            )
+
+        current_metadata = stripe_metadata_to_dict(stripe_get(subscription, "metadata", {}) or {})
+
+        expected_inspection_end_dt = contract_start_dt + relativedelta(years=3)
+        expected_contract_end_dt = contract_start_dt + relativedelta(years=50)
+
+        new_metadata = {
+            # The ** means: Take every key/value pair from this dictionary and put it into the new dictionary
+            **current_metadata,
+            "contract_start_date": contract_start_dt.date().isoformat(),
+            "contract_end_date": expected_contract_end_dt.date().isoformat(),
+            "contract_term_years": "50",
+            "inspection_fee_start_date": contract_start_dt.date().isoformat(),
+            "inspection_fee_end_date": expected_inspection_end_dt.date().isoformat(),
+            "inspection_fee_years": "3",
+            "inspection_fee_status": "active",
+            "billing_rule_version": "1",
+        }
+
+        try: 
+            stripe.Subscription.modify(
+                subscription_id,
+                metadata=new_metadata,
+            )
+
+            updated_count += 1
+
+            results.append({
+                "subscription_id" : subscription_id,
+                "customer_id": customer_id,
+                "action": "metadata_updated",
+                "metadata": new_metadata,
+            })
+
+            log_rows.append({
+                "subscription_id": subscription_id,
+                "customer_id": customer_id,
+                "action": "metadata_updated",
+                "reason": "",
+                "error": "",
+                "contract_start_date": contract_start_dt.date().isoformat(),
+                "contract_end_date": expected_contract_end_dt.date().isoformat(),
+                "contract_term_years": new_metadata["contract_term_years"],
+                "inspection_fee_start_date": new_metadata["inspection_fee_start_date"],
+                "inspection_fee_end_date": new_metadata["inspection_fee_end_date"],
+                "inspection_fee_years": new_metadata["inspection_fee_years"],
+                "inspection_fee_status": new_metadata["inspection_fee_status"],
+                "billing_rule_version": new_metadata["billing_rule_version"],            
+            })
+        
+        except Exception as e: 
+            failed_count += 1
+
+            results.append({
+                "subscription_id": subscription_id,
+                "customer_id": customer_id,
+                "action": "failed",
+                "error": str(e),
+            })
+
+            log_rows.append({
+                "subscription_id": subscription_id,
+                "customer_id": customer_id,
+                "action": "failed",
+                "error": str(e),
+                "reason": "",
+                "contract_start_date": contract_start_dt.date().isoformat(),
+                "contract_end_date": expected_contract_end_dt.date().isoformat(),
+                "contract_term_years": new_metadata["contract_term_years"],
+                "inspection_fee_start_date": new_metadata["inspection_fee_start_date"],
+                "inspection_fee_end_date": new_metadata["inspection_fee_end_date"],
+                "inspection_fee_years": new_metadata["inspection_fee_years"],
+                "inspection_fee_status": new_metadata["inspection_fee_status"],
+                "billing_rule_version": new_metadata["billing_rule_version"],   
+            })
+
+            # I'm done with this failed subscription. Go to the next subscription
+            continue
+
+    fieldnames = [
+        "subscription_id",
+        "customer_id",
+        "action",
+        "reason",
+        "error",
+        "contract_start_date",
+        "contract_end_date",
+        "contract_term_years",
+        "inspection_fee_start_date",
+        "inspection_fee_end_date",
+        "inspection_fee_years",
+        "inspection_fee_status",
+        "billing_rule_version",
+    ]
+
+    # Open this CSV file for writing. Let me write into it. When I’m done, close it automatically. "w" means write mode.
+    with open(log_path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(log_rows)
+
+    return {
+        "status": "ok",
+        "updated_count": updated_count,
+        "failed_count": failed_count,
+        "results": results,
+        "log_file": log_path
     }
 
 # product audit
