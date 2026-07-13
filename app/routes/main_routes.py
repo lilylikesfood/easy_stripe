@@ -3230,15 +3230,21 @@ def debug_subscription(subscription_id):
 
     sub = stripe.Subscription.retrieve(subscription_id)
 
+    items= stripe_get(sub, "items", {})
+    subscription_items = stripe_get(items, "data", [])
+
     return {
-        "id": stripe_get(sub, "id"),
+        "subscription_id": stripe_get(sub, "id"),
         "status": stripe_get(sub, "status"),
         "current_period_start": stripe_get(sub, "current_period_start"),
         "current_period_end": stripe_get(sub, "current_period_end"),
         "billing_cycle_anchor": stripe_get(sub, "billing_cycle_anchor"),
-        "cancel_at_period_end": stripe_get(sub, "cancel_at_period_end"),
+        "schedule": stripe_get(sub, "schedule"),
+        "cancel_at": stripe_get(sub, "cancel_at"),
+        "cancel_at_period_end": stripe_get(sub, "cancel_at_period_end", False),
         "collection_method": stripe_get(sub, "collection_method"),
-        "items_count": len(stripe_get(stripe_get(sub, "items"), "data", []))
+        "items_count": len(subscription_items),
+        "metadata": stripe_metadata_to_dict(stripe_get(sub, "metadata", {}) or {}),
     }
 
 def get_next_monthly_billing_date_from_anchor(anchor_ts, today_date):
@@ -7425,26 +7431,14 @@ def apply_subscription_item_metadata():
             failed_count += 1
 
             result["apply_status"] = "update_failed"
-            result["apply_error"] = str(
-                update_error
-            )
+            result["apply_error"] = str(update_error)
 
             errors.append({
-                "subscription_id": result[
-                    "subscription_id"
-                ],
-                "subscription_item_id": (
-                    subscription_item_id
-                ),
-                "customer_id": result[
-                    "customer_id"
-                ],
-                "product_id": result[
-                    "product_id"
-                ],
-                "error_type": (
-                    "subscription_item_metadata_update_failed"
-                ),
+                "subscription_id": result["subscription_id"],
+                "subscription_item_id": subscription_item_id,
+                "customer_id": result["customer_id"],
+                "product_id": result["product_id"],
+                "error_type": "subscription_item_metadata_update_failed",
                 "error": str(update_error),
             })
 
@@ -7458,25 +7452,972 @@ def apply_subscription_item_metadata():
     return {
         "status": "apply_complete",
         "mode": mode,
-        "checked_subscription_count": collection[
-            "checked_subscription_count"
-        ],
-        "checked_item_count": collection[
-            "checked_item_count"
-        ],
+        "checked_subscription_count": collection["checked_subscription_count"],
+        "checked_item_count": collection["checked_item_count"],
         "updated_count": updated_count,
-        "already_complete_count": (
-            already_complete_count
-        ),
-        "unknown_product_count": (
-            unknown_product_count
-        ),
-        "conflicting_metadata_count": (
-            conflicting_metadata_count
-        ),
+        "already_complete_count": already_complete_count,
+        "unknown_product_count": unknown_product_count,
+        "conflicting_metadata_count": conflicting_metadata_count,
         "failed_count": failed_count,
         "error_count": len(errors),
         "errors": errors[:50],
         "log_file": csv_path,
         "sample_results": results[:30],
+    }
+
+# debug_subscription_item
+@main.route("/admin/debug-subscription-item/<subscription_item_id>", methods=["GET"])
+def debug_subscription_item(subscription_item_id):
+    """
+    Retrieve one Stripe subscription item and display its metadata.
+
+    Read-only route.
+    """
+
+    try:
+        item = stripe.SubscriptionItem.retrieve(subscription_item_id)
+
+        price = stripe_get(item, "price", {}) or {}
+
+        return {
+            "subscription_item_id": stripe_get(item, "id"),
+            "subscription_id": stripe_get(item, "subscription"),
+            "metadata": stripe_metadata_to_dict(stripe_get(item, "metadata", {})),
+            "price_id": stripe_get(price, "id"),
+            "product_id": stripe_get(price, "product"),
+            "quantity": stripe_get(item, "quantity"),
+        }
+
+    except Exception as error:
+        return {
+            "error": str(error),
+            "subscription_item_id": subscription_item_id,
+        }, 500
+
+# Preview migration from fixed subscription endings to open-ended ("Forever") subscriptions
+@main.route("/admin/preview-contract-end-migration", methods=["GET"])
+def preview_contract_end_migration():
+    """
+    READ-ONLY preview.
+
+    Reviews all active, past_due, and unpaid subscriptions
+    and determines what must happen to make each subscription
+    open-ended.
+
+    This route does NOT:
+    - release any schedules
+    - clear cancel_at
+    - change cancel_at_period_end
+    - modify subscriptions
+    - modify metadata
+    """
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    # Optional:
+    # Allows us to test one subscription before scanning all 536.
+    #
+    # Example:
+    # /admin/preview-contract-end-migration?subscription_id=sub_123
+    target_subscription_id = request.args.get("subscription_id")
+
+    results = []
+    errors = []
+
+    summary = {
+        "checked_subscription_count": 0,
+        "already_forever_count": 0,
+        "would_clear_cancel_at_count": 0,
+        "would_release_schedule_count": 0,
+        "manual_review_count": 0,
+        "error_count": 0,
+    }
+
+    # Reuse the statuses already defined for inspection-fee work:
+    # active, past_due, and unpaid.
+    for requested_status in INSPECTION_BILLABLE_STATUSES:
+        subscriptions = stripe.Subscription.list(
+            status=requested_status,
+            limit=100,
+        )
+
+        for subscription in subscriptions.auto_paging_iter():
+            subscription_id = stripe_get(subscription, "id")
+
+            # If we supplied one subscription ID in the URL,
+            # skip every other subscription.
+            if target_subscription_id and subscription_id != target_subscription_id:
+                continue
+
+            summary["checked_subscription_count"] += 1
+
+            # Stripe can return customer in two forms:
+            #
+            # Form 1: only the Customer ID
+            # "cus_123"
+            #
+            # Form 2: the expanded Customer object
+            # {
+            #     "id": "cus_123",
+            #     "name": "Customer Name",
+            # }
+            customer_reference = stripe_get(subscription, "customer")
+
+            # isinstance(customer_reference, str) means:
+            # "Is customer_reference a string?"
+            #
+            # If it is already a string, it is the Customer ID,
+            # so we use it directly.
+            if isinstance(customer_reference, str):
+                customer_id = customer_reference
+
+            # Otherwise, Stripe returned an expanded Customer object,
+            # so we retrieve the ID from that object.
+            else:
+                customer_id = stripe_get(customer_reference, "id")
+
+            subscription_status = stripe_get(subscription, "status")
+
+            subscription_metadata = stripe_metadata_to_dict(
+                stripe_get(subscription, "metadata", {}) or {}
+            )
+
+            contract_start_date = subscription_metadata.get("contract_start_date")
+            contract_end_date = subscription_metadata.get("contract_end_date")
+            inspection_fee_end_date = subscription_metadata.get("inspection_fee_end_date")
+
+            # cancel_at is a Stripe timestamp representing the date
+            # when Stripe currently plans to cancel the subscription.
+            cancel_at = stripe_get(subscription, "cancel_at")
+
+            # cancel_at_period_end should already be True or False.
+            #
+            # The third argument, False, means:
+            # "If Stripe does not return this field, use False."
+            #
+            # We do not need bool(...) because Stripe already returns
+            # a Boolean value for this property.
+            cancel_at_period_end = stripe_get(
+                subscription,
+                "cancel_at_period_end",
+                False,
+            )
+
+            # Convert the Stripe Unix timestamp into a readable date.
+            cancel_at_datetime = (
+                stripe_timestamp_to_utc_datetime(cancel_at)
+                if cancel_at
+                else None
+            )
+
+            # Stripe may return the schedule as:
+            #
+            # "sub_sched_123"
+            #
+            # or as an expanded Schedule object.
+            schedule_reference = stripe_get(subscription, "schedule")
+
+            schedule_id = None
+            schedule = None
+            schedule_status = None
+            schedule_end_behavior = None
+            schedule_phase_count = 0
+            schedule_last_phase_end = None
+            schedule_phases = []
+
+            # Start building the result row now.
+            # We fill in the schedule information afterward.
+            base_result = {
+                "subscription_id": subscription_id,
+                "customer_id": customer_id,
+                "subscription_status": subscription_status,
+                "contract_start_date": contract_start_date or "",
+                "contract_end_date": contract_end_date or "",
+                "inspection_fee_end_date": inspection_fee_end_date or "",
+                "cancel_at": cancel_at or "",
+                "cancel_at_date": cancel_at_datetime.date().isoformat() if cancel_at_datetime else "",
+                "cancel_at_period_end": cancel_at_period_end,
+                "schedule_id": "",
+                "schedule_status": "",
+                "schedule_end_behavior": "",
+                "schedule_phase_count": 0,
+                "schedule_last_phase_end": "",
+                "schedule_phases": [],
+                "action": "",
+                "safe_to_apply": False,
+                "reason": "",
+                "error": "",
+            }
+
+            # -----------------------------------------------------
+            # Retrieve and inspect the schedule
+            # -----------------------------------------------------
+
+            if schedule_reference:
+                try:
+                    # If Stripe returned only the schedule ID,
+                    # retrieve the full schedule object.
+                    if isinstance(schedule_reference, str):
+                        schedule_id = schedule_reference
+                        schedule = stripe.SubscriptionSchedule.retrieve(schedule_id)
+
+                    # Otherwise, Stripe already returned an expanded
+                    # schedule object.
+                    else:
+                        schedule = schedule_reference
+                        schedule_id = stripe_get(schedule, "id")
+
+                    schedule_status = stripe_get(schedule, "status")
+                    schedule_end_behavior = stripe_get(schedule, "end_behavior")
+
+                    # phases contains all current and future instructions
+                    # stored inside the schedule.
+                    phases = stripe_get(schedule, "phases", []) or []
+
+                    # len(phases) tells us how many phases exist.
+                    #
+                    # Your preview showed that most subscriptions have
+                    # one phase, while at least one has two phases.
+                    schedule_phase_count = len(phases)
+
+                    for phase in phases:
+                        phase_start_ts = stripe_get(phase, "start_date")
+                        phase_end_ts = stripe_get(phase, "end_date")
+
+                        phase_start_datetime = (
+                            stripe_timestamp_to_utc_datetime(phase_start_ts)
+                            if phase_start_ts
+                            else None
+                        )
+
+                        phase_end_datetime = (
+                            stripe_timestamp_to_utc_datetime(phase_end_ts)
+                            if phase_end_ts
+                            else None
+                        )
+
+                        phase_items = []
+
+                        # Read all Prices contained in this phase.
+                        for phase_item in stripe_get(phase, "items", []) or []:
+                            phase_price_reference = stripe_get(phase_item, "price")
+
+                            # The Price may be returned as only its ID.
+                            if isinstance(phase_price_reference, str):
+                                phase_price_id = phase_price_reference
+
+                            # Or it may be returned as an expanded Price object.
+                            else:
+                                phase_price_id = stripe_get(
+                                    phase_price_reference,
+                                    "id",
+                                )
+
+                            phase_items.append({
+                                "price_id": phase_price_id,
+                                "quantity": stripe_get(
+                                    phase_item,
+                                    "quantity",
+                                    1,
+                                ),
+                            })
+
+                        schedule_phases.append({
+                            "start_date": (
+                                phase_start_datetime.date().isoformat()
+                                if phase_start_datetime
+                                else ""
+                            ),
+                            "end_date": (
+                                phase_end_datetime.date().isoformat()
+                                if phase_end_datetime
+                                else ""
+                            ),
+                            "proration_behavior": stripe_get(
+                                phase,
+                                "proration_behavior",
+                                "",
+                            ),
+                            "items": phase_items,
+                        })
+
+                    # Get the end date of the final phase.
+                    if phases:
+                        last_phase = phases[-1]
+                        last_phase_end_ts = stripe_get(last_phase, "end_date")
+
+                        if last_phase_end_ts:
+                            last_phase_end_datetime = (
+                                stripe_timestamp_to_utc_datetime(
+                                    last_phase_end_ts
+                                )
+                            )
+
+                            schedule_last_phase_end = (
+                                last_phase_end_datetime.date().isoformat()
+                            )
+
+                except Exception as schedule_error:
+                    summary["error_count"] += 1
+
+                    base_result["schedule_id"] = schedule_id or ""
+                    base_result["action"] = "error"
+                    base_result["safe_to_apply"] = False
+                    base_result["reason"] = (
+                        "Could not retrieve or inspect "
+                        "the subscription schedule."
+                    )
+                    base_result["error"] = str(schedule_error)
+
+                    results.append(base_result)
+
+                    errors.append({
+                        "subscription_id": subscription_id,
+                        "customer_id": customer_id,
+                        "error_type": "schedule_retrieval_failed",
+                        "error": str(schedule_error),
+                    })
+
+                    # Stop processing this subscription and continue
+                    # with the next one.
+                    continue
+
+            # Add the schedule information to the result row.
+            base_result["schedule_id"] = schedule_id or ""
+            base_result["schedule_status"] = schedule_status or ""
+            base_result["schedule_end_behavior"] = schedule_end_behavior or ""
+            base_result["schedule_phase_count"] = schedule_phase_count
+            base_result["schedule_last_phase_end"] = schedule_last_phase_end or ""
+            base_result["schedule_phases"] = schedule_phases
+
+            # -----------------------------------------------------
+            # Classification rules
+            # -----------------------------------------------------
+
+            # True if Stripe currently shows a cancellation timestamp.
+            has_direct_cancel_at = cancel_at is not None
+
+            # True if Stripe is configured to cancel at the end of the current billing period.
+            has_cancel_at_period_end = cancel_at_period_end is True
+
+            # True if the subscription currently has a schedule.
+            has_schedule = schedule_id is not None
+
+            # A simple schedule means:
+            #
+            # 1. A schedule exists.
+            # 2. The schedule is active.
+            # 3. Its final behavior is to cancel the subscription.
+            # 4. It contains exactly one phase.
+            # 5. cancel_at_period_end is not separately enabled.
+            #
+            # cancel_at is allowed here because your production results
+            # showed that Stripe displays cancel_at together with these
+            # active cancel schedules.
+            is_simple_cancel_schedule = (
+                has_schedule
+                and schedule_status == "active"
+                and schedule_end_behavior == "cancel"
+                and schedule_phase_count == 1
+                and not has_cancel_at_period_end
+            )
+
+            # -----------------------------------------------------
+            # Case 1: Already open-ended
+            # -----------------------------------------------------
+
+            if (
+                not has_direct_cancel_at
+                and not has_cancel_at_period_end
+                and not has_schedule
+            ):
+                summary["already_forever_count"] += 1
+
+                base_result["action"] = "already_forever"
+                base_result["safe_to_apply"] = True
+                base_result["reason"] = (
+                    "Subscription has no cancel_at, "
+                    "cancel_at_period_end is false, "
+                    "and no schedule is attached."
+                )
+
+            # -----------------------------------------------------
+            # Case 2: Direct cancel_at only
+            # -----------------------------------------------------
+
+            elif (
+                has_direct_cancel_at
+                and not has_cancel_at_period_end
+                and not has_schedule
+            ):
+                summary["would_clear_cancel_at_count"] += 1
+
+                base_result["action"] = "would_clear_cancel_at"
+                base_result["safe_to_apply"] = True
+                base_result["reason"] = (
+                    "Subscription has a direct cancel_at date "
+                    "and no schedule. The future apply route "
+                    "could clear cancel_at while keeping the "
+                    "subscription active."
+                )
+
+            # -----------------------------------------------------
+            # Case 3: Simple one-phase cancel schedule
+            # -----------------------------------------------------
+
+            elif is_simple_cancel_schedule:
+                summary["would_release_schedule_count"] += 1
+
+                base_result["action"] = "would_release_schedule"
+                base_result["safe_to_apply"] = True
+                base_result["reason"] = (
+                    "Subscription has one active schedule phase "
+                    "with end_behavior=cancel. Releasing the "
+                    "schedule would stop its future instructions "
+                    "while keeping the current subscription in place."
+                )
+
+            # -----------------------------------------------------
+            # Case 4: More complicated schedule
+            # -----------------------------------------------------
+
+            elif has_schedule:
+                summary["manual_review_count"] += 1
+
+                base_result["action"] = "manual_review"
+                base_result["safe_to_apply"] = False
+                base_result["reason"] = (
+                    "Subscription has a schedule that is not a "
+                    "simple active one-phase cancel schedule. "
+                    "Review all schedule phases before releasing it."
+                )
+
+            # -----------------------------------------------------
+            # Case 5: Other unusual cancellation configuration
+            # -----------------------------------------------------
+
+            else:
+                summary["manual_review_count"] += 1
+
+                base_result["action"] = "manual_review"
+                base_result["safe_to_apply"] = False
+
+                ending_mechanisms = []
+
+                if has_direct_cancel_at:
+                    ending_mechanisms.append("cancel_at")
+
+                if has_cancel_at_period_end:
+                    ending_mechanisms.append("cancel_at_period_end")
+
+                base_result["reason"] = (
+                    "Subscription has an unusual ending configuration: "
+                    + ", ".join(ending_mechanisms)
+                    + ". Review manually before making Stripe changes."
+                )
+
+            results.append(base_result)
+
+    # -----------------------------------------------------
+    # Write CSV report
+    # -----------------------------------------------------
+
+    os.makedirs("logs", exist_ok=True)
+
+    timestamp = datetime.now(
+        timezone.utc
+    ).strftime("%Y-%m-%d_%H%M%S")
+
+    csv_path = os.path.join(
+        "logs",
+        f"contract_end_migration_preview_{timestamp}.csv",
+    )
+
+    fieldnames = [
+        "subscription_id",
+        "customer_id",
+        "subscription_status",
+        "contract_start_date",
+        "contract_end_date",
+        "inspection_fee_end_date",
+        "cancel_at",
+        "cancel_at_date",
+        "cancel_at_period_end",
+        "schedule_id",
+        "schedule_status",
+        "schedule_end_behavior",
+        "schedule_phase_count",
+        "schedule_last_phase_end",
+        "schedule_phases",
+        "action",
+        "safe_to_apply",
+        "reason",
+        "error",
+    ]
+
+    with open(
+        csv_path,
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=fieldnames,
+        )
+
+        writer.writeheader()
+
+        for result in results:
+            csv_row = result.copy()
+
+            # A CSV cell cannot directly contain a Python list.
+            # Convert schedule_phases into JSON text first.
+            csv_row["schedule_phases"] = json.dumps(
+                result.get("schedule_phases", []),
+                sort_keys=True,
+            )
+
+            writer.writerow(csv_row)
+
+    return {
+        "status": "preview_complete",
+        "read_only": True,
+        "target_subscription_id": target_subscription_id,
+        "statuses_checked": INSPECTION_BILLABLE_STATUSES,
+        "summary": summary,
+        "error_count": len(errors),
+        "errors": errors[:50],
+        "log_file": csv_path,
+
+        # Only return the first 30 rows in the browser response
+        # so the JSON output is not enormous.
+        #
+        # The complete results remain available in the CSV.
+        "sample_results": results[:30],
+    }
+
+# Read-only audit of subscriptions whose schedules are more complex
+# than a simple one-phase cancel schedule
+@main.route("/admin/audit-manual-review-schedules", methods=["GET"])
+def audit_manual_review_schedules():
+    """
+    READ-ONLY audit.
+
+    Finds subscriptions whose schedules are not simple one-phase
+    cancel schedules and groups them into patterns for investigation.
+
+    This route does NOT:
+    - release schedules
+    - cancel schedules
+    - clear cancel_at
+    - modify subscriptions
+    - modify metadata
+    """
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    target_subscription_id = request.args.get("subscription_id")
+
+    results = []
+    errors = []
+
+    summary = {
+        "checked_subscription_count": 0,
+        "manual_review_count": 0,
+        "two_phase_same_items_count": 0,
+        "two_phase_different_items_count": 0,
+        "three_or_more_phases_count": 0,
+        "non_cancel_schedule_count": 0,
+        "inactive_schedule_count": 0,
+        "other_pattern_count": 0,
+        "error_count": 0,
+    }
+
+    product_cache = {}
+
+    for requested_status in INSPECTION_BILLABLE_STATUSES:
+        subscriptions = stripe.Subscription.list(
+            status=requested_status,
+            limit=100,
+        )
+
+        for subscription in subscriptions.auto_paging_iter():
+            subscription_id = stripe_get(subscription, "id")
+
+            if target_subscription_id and subscription_id != target_subscription_id:
+                continue
+
+            summary["checked_subscription_count"] += 1
+
+            schedule_reference = stripe_get(subscription, "schedule")
+
+            # This route only investigates subscriptions with schedules.
+            if not schedule_reference:
+                continue
+
+            customer_reference = stripe_get(subscription, "customer")
+
+            if isinstance(customer_reference, str):
+                customer_id = customer_reference
+            else:
+                customer_id = stripe_get(customer_reference, "id")
+
+            try:
+                # Stripe may return only the schedule ID or an expanded object.
+                if isinstance(schedule_reference, str):
+                    schedule_id = schedule_reference
+                    schedule = stripe.SubscriptionSchedule.retrieve(schedule_id)
+                else:
+                    schedule = schedule_reference
+                    schedule_id = stripe_get(schedule, "id")
+
+                schedule_status = stripe_get(schedule, "status")
+                schedule_end_behavior = stripe_get(schedule, "end_behavior")
+                phases = stripe_get(schedule, "phases", []) or []
+                phase_count = len(phases)
+
+                cancel_at = stripe_get(subscription, "cancel_at")
+                cancel_at_datetime = (
+                    stripe_timestamp_to_utc_datetime(cancel_at)
+                    if cancel_at
+                    else None
+                )
+
+                metadata = stripe_metadata_to_dict(
+                    stripe_get(subscription, "metadata", {}) or {}
+                )
+
+                # This is the same rule used by the main preview route.
+                is_simple_cancel_schedule = (
+                    schedule_status == "active"
+                    and schedule_end_behavior == "cancel"
+                    and phase_count == 1
+                    and stripe_get(subscription, "cancel_at_period_end", False) is False
+                )
+
+                # Skip the 506 simple schedules.
+                if is_simple_cancel_schedule:
+                    continue
+
+                summary["manual_review_count"] += 1
+
+                customer_name = None
+                customer_email = None
+                customer_description = None
+
+                try:
+                    customer = stripe.Customer.retrieve(customer_id)
+
+                    customer_name = stripe_get(customer, "name")
+                    customer_email = stripe_get(customer, "email")
+                    customer_description = stripe_get(customer, "description")
+
+                except Exception as customer_error:
+                    errors.append({
+                        "subscription_id": subscription_id,
+                        "schedule_id": schedule_id,
+                        "customer_id": customer_id,
+                        "error_type": "customer_retrieval_failed",
+                        "error": str(customer_error),
+                    })
+
+                phase_details = []
+                phase_item_signatures = []
+
+                for phase_index, phase in enumerate(phases, start=1):
+                    phase_start_ts = stripe_get(phase, "start_date")
+                    phase_end_ts = stripe_get(phase, "end_date")
+
+                    phase_start_datetime = (
+                        stripe_timestamp_to_utc_datetime(phase_start_ts)
+                        if phase_start_ts
+                        else None
+                    )
+
+                    phase_end_datetime = (
+                        stripe_timestamp_to_utc_datetime(phase_end_ts)
+                        if phase_end_ts
+                        else None
+                    )
+
+                    phase_duration_days = None
+
+                    if phase_start_datetime and phase_end_datetime:
+                        phase_duration_days = (
+                            phase_end_datetime.date()
+                            - phase_start_datetime.date()
+                        ).days
+
+                    phase_items = []
+                    phase_signature = []
+
+                    for phase_item in stripe_get(phase, "items", []) or []:
+                        price_reference = stripe_get(phase_item, "price")
+
+                        if isinstance(price_reference, str):
+                            price_id = price_reference
+                            price = stripe.Price.retrieve(price_id)
+                        else:
+                            price = price_reference or {}
+                            price_id = stripe_get(price, "id")
+
+                        product_reference = stripe_get(price, "product")
+
+                        if isinstance(product_reference, str):
+                            product_id = product_reference
+
+                            if product_id not in product_cache:
+                                product_cache[product_id] = stripe.Product.retrieve(product_id)
+
+                            product = product_cache[product_id]
+                        else:
+                            product = product_reference or {}
+                            product_id = stripe_get(product, "id")
+
+                        product_name = stripe_get(product, "name")
+                        product_metadata = stripe_metadata_to_dict(
+                            stripe_get(product, "metadata", {}) or {}
+                        )
+
+                        item_type = determine_subscription_item_type(
+                            product_id=product_id,
+                            product_metadata=product_metadata,
+                        )
+
+                        quantity = stripe_get(phase_item, "quantity", 1)
+                        unit_amount = stripe_get(price, "unit_amount")
+                        currency = stripe_get(price, "currency")
+
+                        phase_items.append({
+                            "price_id": price_id,
+                            "product_id": product_id,
+                            "product_name": product_name,
+                            "item_type": item_type or "unknown",
+                            "quantity": quantity,
+                            "unit_amount": unit_amount,
+                            "currency": currency,
+                        })
+
+                        # This signature lets us compare phase contents.
+                        phase_signature.append({
+                            "product_id": product_id,
+                            "price_id": price_id,
+                            "quantity": quantity,
+                        })
+
+                    # Sort so item order does not affect the comparison.
+                    phase_signature.sort(
+                        key=lambda item: (
+                            str(item["product_id"]),
+                            str(item["price_id"]),
+                            item["quantity"],
+                        )
+                    )
+
+                    phase_item_signatures.append(phase_signature)
+
+                    phase_details.append({
+                        "phase_number": phase_index,
+                        "start_date": (
+                            phase_start_datetime.date().isoformat()
+                            if phase_start_datetime
+                            else ""
+                        ),
+                        "end_date": (
+                            phase_end_datetime.date().isoformat()
+                            if phase_end_datetime
+                            else ""
+                        ),
+                        "duration_days": phase_duration_days,
+                        "proration_behavior": stripe_get(
+                            phase,
+                            "proration_behavior",
+                            "",
+                        ),
+                        "billing_cycle_anchor": stripe_get(
+                            phase,
+                            "billing_cycle_anchor",
+                            "",
+                        ),
+                        "item_count": len(phase_items),
+                        "items": phase_items,
+                    })
+
+                all_phase_items_same = False
+
+                if phase_item_signatures:
+                    first_signature = phase_item_signatures[0]
+
+                    all_phase_items_same = all(
+                        signature == first_signature
+                        for signature in phase_item_signatures
+                    )
+
+                first_phase_duration_days = (
+                    phase_details[0]["duration_days"]
+                    if phase_details
+                    else None
+                )
+
+                short_first_phase = (
+                    first_phase_duration_days is not None
+                    and first_phase_duration_days <= 31
+                )
+
+                # Classify the complex schedule into a more useful pattern.
+                if schedule_status != "active":
+                    pattern = "inactive_schedule"
+                    recommended_action = (
+                        "Review schedule status manually before deciding "
+                        "whether any Stripe action is required."
+                    )
+                    summary["inactive_schedule_count"] += 1
+
+                elif schedule_end_behavior != "cancel":
+                    pattern = "non_cancel_schedule"
+                    recommended_action = (
+                        "Schedule does not end with cancel. Review its purpose "
+                        "before changing or releasing it."
+                    )
+                    summary["non_cancel_schedule_count"] += 1
+
+                elif phase_count == 2 and all_phase_items_same:
+                    pattern = "two_phase_same_items"
+                    recommended_action = (
+                        "Both phases contain the same items and Prices. "
+                        "The extra phase may only represent a timing or billing "
+                        "adjustment. Review dates and proration before release."
+                    )
+                    summary["two_phase_same_items_count"] += 1
+
+                elif phase_count == 2 and not all_phase_items_same:
+                    pattern = "two_phase_different_items"
+                    recommended_action = (
+                        "The phases contain different items or Prices. "
+                        "Do not release until the future change is understood."
+                    )
+                    summary["two_phase_different_items_count"] += 1
+
+                elif phase_count >= 3:
+                    pattern = "three_or_more_phases"
+                    recommended_action = (
+                        "Schedule contains three or more phases. "
+                        "Review every future phase manually."
+                    )
+                    summary["three_or_more_phases_count"] += 1
+
+                else:
+                    pattern = "other_pattern"
+                    recommended_action = (
+                        "Schedule does not match a known pattern. "
+                        "Review manually."
+                    )
+                    summary["other_pattern_count"] += 1
+
+                results.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "customer_name": customer_name,
+                    "customer_email": customer_email,
+                    "customer_description": customer_description,
+                    "subscription_status": stripe_get(subscription, "status"),
+                    "contract_start_date": metadata.get("contract_start_date", ""),
+                    "contract_end_date": metadata.get("contract_end_date", ""),
+                    "inspection_fee_end_date": metadata.get(
+                        "inspection_fee_end_date",
+                        "",
+                    ),
+                    "cancel_at": cancel_at or "",
+                    "cancel_at_date": (
+                        cancel_at_datetime.date().isoformat()
+                        if cancel_at_datetime
+                        else ""
+                    ),
+                    "cancel_at_period_end": stripe_get(
+                        subscription,
+                        "cancel_at_period_end",
+                        False,
+                    ),
+                    "schedule_id": schedule_id,
+                    "schedule_status": schedule_status,
+                    "schedule_end_behavior": schedule_end_behavior,
+                    "phase_count": phase_count,
+                    "all_phase_items_same": all_phase_items_same,
+                    "short_first_phase": short_first_phase,
+                    "first_phase_duration_days": first_phase_duration_days,
+                    "pattern": pattern,
+                    "safe_to_release": False,
+                    "recommended_action": recommended_action,
+                    "phases": phase_details,
+                    "error": "",
+                })
+
+            except Exception as schedule_error:
+                summary["error_count"] += 1
+
+                errors.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "error_type": "complex_schedule_audit_failed",
+                    "error": str(schedule_error),
+                })
+
+    os.makedirs("logs", exist_ok=True)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+
+    csv_path = os.path.join(
+        "logs",
+        f"manual_review_schedule_audit_{timestamp}.csv",
+    )
+
+    fieldnames = [
+        "subscription_id",
+        "customer_id",
+        "customer_name",
+        "customer_email",
+        "customer_description",
+        "subscription_status",
+        "contract_start_date",
+        "contract_end_date",
+        "inspection_fee_end_date",
+        "cancel_at",
+        "cancel_at_date",
+        "cancel_at_period_end",
+        "schedule_id",
+        "schedule_status",
+        "schedule_end_behavior",
+        "phase_count",
+        "all_phase_items_same",
+        "short_first_phase",
+        "first_phase_duration_days",
+        "pattern",
+        "safe_to_release",
+        "recommended_action",
+        "phases",
+        "error",
+    ]
+
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for result in results:
+            csv_row = result.copy()
+            csv_row["phases"] = json.dumps(
+                result.get("phases", []),
+                sort_keys=True,
+            )
+            writer.writerow(csv_row)
+
+    return {
+        "status": "audit_complete",
+        "read_only": True,
+        "target_subscription_id": target_subscription_id,
+        "summary": summary,
+        "error_count": len(errors),
+        "errors": errors[:50],
+        "log_file": csv_path,
+        "results": results,
     }
