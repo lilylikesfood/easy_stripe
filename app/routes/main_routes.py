@@ -2136,34 +2136,47 @@ def find_late_fee_candidates():
             continue
 
         customer= stripe_get(invoice, "customer")
-        subscription= stripe_get(invoice, "subscription")
 
         if isinstance(customer, str):
             customer_id = customer
-            customer_name= None
+            customer_name = None
             customer_email = None
         else:
-            customer_id= stripe_get(customer, "id")
-            customer_name= stripe_get(customer, "name")
-            customer_email= stripe_get(customer, "email")
+            customer_id = stripe_get(customer, "id")
+            customer_name = stripe_get(customer, "name")
+            customer_email = stripe_get(customer, "email")
 
-        if isinstance(subscription, str):
-            subscription_id = subscription
-            next_invoice_date = None
-        elif subscription:
+        subscription, subscription_lookup_source = resolve_invoice_subscription(invoice,customer_id)
+
+        if subscription:
             subscription_id = stripe_get(subscription, "id")
             current_period_end_ts = stripe_get(subscription, "current_period_end")
+            billing_cycle_anchor_ts = stripe_get(subscription, "billing_cycle_anchor")
 
             if current_period_end_ts:
                 next_invoice_date = datetime.fromtimestamp(
                     current_period_end_ts,
                     tz=timezone.utc
-                ).date().isoformat()
+                ).astimezone(TORONTO_TZ).date().isoformat()
+
+                next_invoice_date_source = "current_period_end"
+
+            elif billing_cycle_anchor_ts:
+                next_invoice_date = get_next_monthly_billing_date_from_anchor(
+                    billing_cycle_anchor_ts,
+                    now_toronto.date()
+                ).isoformat()
+
+                next_invoice_date_source = "billing_cycle_anchor_fallback"
+
             else:
                 next_invoice_date = None
+                next_invoice_date_source = "missing"
+
         else:
             subscription_id = None
             next_invoice_date = None
+            next_invoice_date_source = "no_subscription"
 
         due_date_ts= stripe_get(invoice, "due_date")
         created_ts= stripe_get(invoice, "created")
@@ -2223,6 +2236,8 @@ def find_late_fee_candidates():
             "reason": "overdue under contract logic",
             "subscription_id": subscription_id,
             "next_invoice_date": next_invoice_date,
+            "next_invoice_date_source": next_invoice_date_source,
+            "subscription_lookup_source": subscription_lookup_source,
         })
 
     late_fee_candidates.sort(
@@ -2239,6 +2254,121 @@ def find_late_fee_candidates():
             "total_late_fee": f"${cents_to_money(total_late_fee_cents):.2f}"
         },
         "candidates": late_fee_candidates
+    }
+
+# audit-current-period-fields
+@main.route("/admin/audit-current-period-fields")
+def audit_current_period_fields():
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    statuses = ["active", "past_due", "unpaid"]
+
+    summary = {
+        "checked": 0,
+        "has_current_period_end": 0,
+        "missing_current_period_end": 0,
+    }
+
+    examples = []
+
+    for status in statuses:
+        subscription =stripe.Subscription.list(
+            status=status,
+            limit=100
+        )
+
+        for sub in subscription.auto_paging_iter():
+            summary["checked"] += 1
+
+            current_period_end = stripe_get(sub, "current_period_end")
+
+            if current_period_end:
+                summary["has_current_period_end"] += 1
+
+            else:
+                summary["missing_current_period_end"] += 1
+
+                # gives you enough data to inspect the pattern without flooding the response
+                if len(examples) < 20:
+                    examples.append({
+                        "subscription_id": stripe_get(sub, "id"),
+                        "customer_id": stripe_get(sub, "customer"),
+                        "status": stripe_get(sub, "status"),
+                        "collection_method": stripe_get(sub, "collection_method"),
+                        "current_period_start": stripe_get(sub, "current_period_start"),
+                        "current_period_end": stripe_get(sub, "current_period_end"),
+                        "billing_cycle_anchor": stripe_get(sub, "billing_cycle_anchor"),
+                        "schedule": stripe_get(sub, "schedule"),
+                    })
+
+    return {
+        "summary": summary,
+        "examples_missing_current_period_end": examples,
+    }
+
+# find where Stripe stores the exact upcoming invoice date
+@main.route("/admin/debug-upcoming-invoice/<subscription_id>")
+def debug_upcoming_invoice(subscription_id):
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    try:
+        upcoming = stripe.Invoice.upcoming(subscription=subscription_id)
+
+        return {
+            "subscription_id": subscription_id,
+            "upcoming_invoice_id": stripe_get(upcoming, "id"),
+            "upcoming_created": stripe_get(upcoming, "created"),
+            "upcoming_next_payment_attempt": stripe_get(upcoming, "next_payment_attempt"),
+            "upcoming_period_start": stripe_get(upcoming, "period_start"),
+            "upcoming_period_end": stripe_get(upcoming, "period_end"),
+            "upcoming_due_date": stripe_get(upcoming, "due_date"),
+            "amount_due": stripe_get(upcoming, "amount_due"),
+            "status": "success"
+        }
+    
+    except Exception as e:
+        return {
+            "subscription_id": subscription_id,
+            "status": "failed",
+            "error": str(e)
+        }
+    
+# next place to inspect is the subscription schedule current/next phase
+@main.route("/admin/debug-schedule-next-date/<subscription_id>")
+def debug_schedule_next_date(subscription_id):
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    subscription = stripe.Subscription.retrieve(subscription_id)
+    schedule_id = stripe_get(subscription, "schedule")
+
+    if not schedule_id:
+        return {
+            "subscription_id": subscription_id,
+            "status": "no_schedule"
+        }
+
+    schedule = stripe.SubscriptionSchedule.retrieve(schedule_id)
+
+    phases = []
+
+    for phase in stripe_get(schedule, "phases", []):
+        phases.append({
+            "start_date": stripe_timestamp_to_utc_datetime(
+                stripe_get(phase, "start_date")
+            ).date().isoformat() if stripe_get(phase, "start_date") else None,
+            "end_date": stripe_timestamp_to_utc_datetime(
+                stripe_get(phase, "end_date")
+            ).date().isoformat() if stripe_get(phase, "end_date") else None,
+            "billing_cycle_anchor": stripe_get(phase, "billing_cycle_anchor"),
+        })
+
+    return {
+        "subscription_id": subscription_id,
+        "schedule_id": schedule_id,
+        "schedule_status": stripe_get(schedule, "status"),
+        "end_behavior": stripe_get(schedule, "end_behavior"),
+        "subscription_billing_cycle_anchor": stripe_get(subscription, "billing_cycle_anchor"),
+        "phases": phases
     }
 
 # If we ran today,who would receive a late fee and how much?
@@ -2437,6 +2567,43 @@ def apply_late_fee_to_invoice(invoice_id):
         "late_fee_base_cents": base_cents,
         "invoice_item_id": invoice_item.id
     }
+
+# invoices often store the subscription under invoice.parent.subscription_details.subscription
+def resolve_invoice_subscription(invoice, customer_id): 
+    subscription = stripe_get(invoice, "subscription")
+
+    if subscription and not isinstance(subscription, str):
+        return subscription, "invoice.subscription_expanded"
+    
+    if isinstance(subscription, str):
+        return stripe.Subscription.retrieve(subscription), "invoice.subscription_id"
+    
+    parent = stripe_get(invoice, "parent")
+    subscription_details = stripe_get(parent, "subscription_details", {}) if parent else {}
+    parent_subscription_id = stripe_get(subscription_details, "subscription")
+
+    if parent_subscription_id:
+        return stripe.Subscription.retrieve(parent_subscription_id), "invoice.parent.subscription_details"
+    
+    matches = []
+    
+    for status in ["active", "past_due", "unpaid"]:
+        subs =stripe.Subscription.list(
+            customer=customer_id,
+            status=status,
+            limit=100
+        )
+
+        for sub in subs.auto_paging_iter():
+            matches.append(sub)
+
+    if len(matches) == 1:
+        return matches[0], "customer_has_exactly_one_billable_subscription"
+
+    if len(matches) == 0:
+        return None, "no_billable_subscription_found"
+
+    return None, f"multiple_billable_subscriptions_found:{len(matches)}"
 
 # apply late fee for one person before apply to all
 @main.route("/admin/apply-late-fee-one/<invoice_id>", methods=["POST"])
@@ -3083,11 +3250,6 @@ def get_next_monthly_billing_date_from_anchor(anchor_ts, today_date):
 
     year = today_date.year
     month = today_date.month
-
-    print("Anchor datetime:", anchor_dt)
-    print("Anchor day:", anchor_dt.day)
-    print("Target year:", year)
-    print("Target month:", month)
 
     candidate = safe_date_for_month(year, month)
 
