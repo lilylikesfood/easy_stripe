@@ -6714,3 +6714,769 @@ def audit_inspection_fee_items():
         ),
         "sample_results": results[:20],
     }
+
+# configuration constants
+INSPECTION_FEE_PRODUCT_IDS = {
+    "prod_S2qigSJLyqaK77",
+    "prod_QRb4nqXhaz7pMn",
+}
+
+SUBSCRIPTION_ITEM_TYPE_METADATA_KEY = "item_type"
+
+INSPECTION_FEE_ITEM_TYPE = "inspection_fee"
+MONTHLY_SERVICE_ITEM_TYPE = "monthly_service_fee"
+
+# Item-type detection helper
+def determine_subscription_item_type(
+    product_id,
+    product_metadata,
+):
+    """
+    Determine the intended subscription-item metadata type.
+
+    Rules:
+    - Two manually confirmed Product IDs are inspection fees.
+    - Products with increaseable=true are monthly service fees.
+    - Anything else is unknown and must not be updated.
+
+    Returns:
+        "inspection_fee"
+        "monthly_service_fee"
+        None
+    """
+
+    product_metadata = product_metadata or {}
+
+    if product_id in INSPECTION_FEE_PRODUCT_IDS:
+        return INSPECTION_FEE_ITEM_TYPE
+
+    increaseable_value = str(
+        product_metadata.get(
+            "increaseable",
+            "",
+        )
+    ).strip().lower()
+
+    if increaseable_value == "true":
+        return MONTHLY_SERVICE_ITEM_TYPE
+
+    return None
+
+# Shared subscription-item collection helper
+# Both preview and apply need to inspect exactly the same subscriptions and use exactly the same classification rules
+def collect_subscription_item_metadata_candidates():
+    """
+    Collect and classify subscription items for metadata migration.
+
+    This helper reads Stripe only. It does not update anything.
+
+    Returns:
+        {
+            "results": [...],
+            "errors": [...],
+            "checked_subscription_count": int,
+            "checked_item_count": int,
+        }
+    """
+
+    subscription_statuses = [
+        "active",
+        "past_due",
+        "unpaid",
+    ]
+
+    results = []
+    errors = []
+
+    checked_subscription_count = 0
+    checked_item_count = 0
+
+    # Avoid retrieving the same Product repeatedly.
+    product_cache = {}
+
+    for requested_status in subscription_statuses:
+
+        try:
+            subscriptions = stripe.Subscription.list(
+                status=requested_status,
+                limit=100,
+            )
+
+            for subscription in subscriptions.auto_paging_iter():
+
+                subscription_id = stripe_get(
+                    subscription,
+                    "id",
+                )
+
+                customer_id = stripe_get(
+                    subscription,
+                    "customer",
+                )
+
+                subscription_status = stripe_get(
+                    subscription,
+                    "status",
+                )
+
+                checked_subscription_count += 1
+
+                try:
+                    subscription_items = (
+                        stripe.SubscriptionItem.list(
+                            subscription=subscription_id,
+                            limit=100,
+                        )
+                    )
+
+                    for item in (
+                        subscription_items.auto_paging_iter()
+                    ):
+
+                        checked_item_count += 1
+
+                        subscription_item_id = stripe_get(
+                            item,
+                            "id",
+                        )
+
+                        current_metadata = (
+                            stripe_metadata_to_dict(
+                                stripe_get(
+                                    item,
+                                    "metadata",
+                                    {},
+                                )
+                            )
+                        )
+
+                        current_item_type = (
+                            current_metadata.get(
+                                SUBSCRIPTION_ITEM_TYPE_METADATA_KEY
+                            )
+                        )
+
+                        price = stripe_get(
+                            item,
+                            "price",
+                            {},
+                        ) or {}
+
+                        price_id = stripe_get(
+                            price,
+                            "id",
+                        )
+
+                        unit_amount = stripe_get(
+                            price,
+                            "unit_amount",
+                        )
+
+                        currency = stripe_get(
+                            price,
+                            "currency",
+                        )
+
+                        product_reference = stripe_get(
+                            price,
+                            "product",
+                        )
+
+                        product = {}
+                        product_id = None
+                        product_name = None
+                        product_metadata = {}
+
+                        if isinstance(
+                            product_reference,
+                            str,
+                        ):
+                            product_id = product_reference
+
+                            if product_id not in product_cache:
+
+                                try:
+                                    product_cache[product_id] = (
+                                        stripe.Product.retrieve(
+                                            product_id
+                                        )
+                                    )
+
+                                except Exception as product_error:
+                                    product_cache[product_id] = None
+
+                                    errors.append({
+                                        "subscription_id": (
+                                            subscription_id
+                                        ),
+                                        "subscription_item_id": (
+                                            subscription_item_id
+                                        ),
+                                        "customer_id": customer_id,
+                                        "product_id": product_id,
+                                        "error_type": (
+                                            "product_retrieval_failed"
+                                        ),
+                                        "error": str(product_error),
+                                    })
+
+                            product = (
+                                product_cache.get(product_id)
+                                or {}
+                            )
+
+                        elif product_reference:
+                            product = product_reference
+
+                            product_id = stripe_get(
+                                product,
+                                "id",
+                            )
+
+                        if product:
+                            product_name = stripe_get(
+                                product,
+                                "name",
+                            )
+
+                            product_metadata = (
+                                stripe_metadata_to_dict(
+                                    stripe_get(
+                                        product,
+                                        "metadata",
+                                        {},
+                                    )
+                                )
+                            )
+
+                        intended_item_type = (
+                            determine_subscription_item_type(
+                                product_id=product_id,
+                                product_metadata=product_metadata,
+                            )
+                        )
+
+                        # -----------------------------------------
+                        # Determine the migration action
+                        # -----------------------------------------
+
+                        if intended_item_type is None:
+                            action = "unknown_product"
+                            reason = (
+                                "Product is not a confirmed inspection "
+                                "Product and does not have "
+                                "increaseable=true."
+                            )
+
+                        elif current_item_type is None:
+                            action = "would_update"
+                            reason = (
+                                "item_type metadata is missing."
+                            )
+
+                        elif (
+                            current_item_type
+                            == intended_item_type
+                        ):
+                            action = "already_complete"
+                            reason = (
+                                "Existing item_type metadata is correct."
+                            )
+
+                        else:
+                            action = "conflicting_metadata"
+                            reason = (
+                                "Existing item_type does not match the "
+                                "type determined from confirmed Product "
+                                "rules."
+                            )
+
+                        merged_metadata = current_metadata.copy()
+
+                        if intended_item_type is not None:
+                            merged_metadata[
+                                SUBSCRIPTION_ITEM_TYPE_METADATA_KEY
+                            ] = intended_item_type
+
+                        results.append({
+                            "action": action,
+                            "reason": reason,
+                            "subscription_id": subscription_id,
+                            "customer_id": customer_id,
+                            "subscription_status": (
+                                subscription_status
+                            ),
+                            "subscription_item_id": (
+                                subscription_item_id
+                            ),
+                            "product_id": product_id,
+                            "product_name": product_name,
+                            "price_id": price_id,
+                            "unit_amount": unit_amount,
+                            "currency": currency,
+                            "current_item_type": (
+                                current_item_type
+                            ),
+                            "intended_item_type": (
+                                intended_item_type
+                            ),
+                            "current_metadata": (
+                                current_metadata
+                            ),
+                            "merged_metadata": (
+                                merged_metadata
+                            ),
+                            "product_metadata": (
+                                product_metadata
+                            ),
+                        })
+
+                except Exception as subscription_error:
+                    errors.append({
+                        "subscription_id": subscription_id,
+                        "subscription_item_id": None,
+                        "customer_id": customer_id,
+                        "product_id": None,
+                        "error_type": (
+                            "subscription_item_collection_failed"
+                        ),
+                        "error": str(subscription_error),
+                    })
+
+        except Exception as status_error:
+            errors.append({
+                "subscription_id": None,
+                "subscription_item_id": None,
+                "customer_id": None,
+                "product_id": None,
+                "error_type": (
+                    "subscription_status_list_failed"
+                ),
+                "requested_status": requested_status,
+                "error": str(status_error),
+            })
+
+    return {
+        "results": results,
+        "errors": errors,
+        "checked_subscription_count": (
+            checked_subscription_count
+        ),
+        "checked_item_count": checked_item_count,
+    }
+
+# CSV-writing helper
+def write_subscription_item_metadata_csv(results, filename_prefix):
+    """
+    Write subscription-item metadata results to a CSV file.
+
+    Returns the generated CSV path.
+    """
+
+    os.makedirs(
+        "logs",
+        exist_ok=True,
+    )
+
+    timestamp = datetime.now(
+        timezone.utc
+    ).strftime("%Y-%m-%d_%H%M%S")
+
+    csv_path = os.path.join(
+        "logs",
+        f"{filename_prefix}_{timestamp}.csv",
+    )
+
+    fieldnames = [
+        "action",
+        "reason",
+        "subscription_id",
+        "customer_id",
+        "subscription_status",
+        "subscription_item_id",
+        "product_id",
+        "product_name",
+        "price_id",
+        "unit_amount",
+        "currency",
+        "current_item_type",
+        "intended_item_type",
+        "current_metadata",
+        "merged_metadata",
+        "product_metadata",
+        "apply_status",
+        "apply_error",
+    ]
+
+    with open(
+        csv_path,
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as csv_file:
+
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=fieldnames,
+        )
+
+        writer.writeheader()
+
+        for result in results:
+            csv_row = result.copy()
+
+            csv_row["current_metadata"] = json.dumps(
+                result.get(
+                    "current_metadata",
+                    {},
+                ),
+                sort_keys=True,
+            )
+
+            csv_row["merged_metadata"] = json.dumps(
+                result.get(
+                    "merged_metadata",
+                    {},
+                ),
+                sort_keys=True,
+            )
+
+            csv_row["product_metadata"] = json.dumps(
+                result.get(
+                    "product_metadata",
+                    {},
+                ),
+                sort_keys=True,
+            )
+
+            csv_row.setdefault(
+                "apply_status",
+                "",
+            )
+
+            csv_row.setdefault(
+                "apply_error",
+                "",
+            )
+
+            writer.writerow(csv_row)
+
+    return csv_path
+
+# preview-subscription-item-metadata
+@main.route("/admin/preview-subscription-item-metadata", methods=["GET"])
+def preview_subscription_item_metadata():
+    """
+    Preview subscription-item metadata migration.
+
+    This route is read-only.
+
+    It shows which subscription items:
+    - would be updated
+    - are already complete
+    - contain conflicting metadata
+    - belong to unknown Products
+    """
+
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
+
+    collection = (
+        collect_subscription_item_metadata_candidates()
+    )
+
+    results = collection["results"]
+    errors = collection["errors"]
+
+    summary = {
+        "would_update": 0,
+        "already_complete": 0,
+        "unknown_product": 0,
+        "conflicting_metadata": 0,
+    }
+
+    for result in results:
+        action = result["action"]
+
+        if action in summary:
+            summary[action] += 1
+
+    csv_path = write_subscription_item_metadata_csv(
+        results=results,
+        filename_prefix=(
+            "subscription_item_metadata_preview"
+        ),
+    )
+
+    return {
+        "status": "preview_complete",
+        "read_only": True,
+        "checked_subscription_count": collection[
+            "checked_subscription_count"
+        ],
+        "checked_item_count": collection[
+            "checked_item_count"
+        ],
+        "summary": summary,
+        "error_count": len(errors),
+        "errors": errors[:50],
+        "log_file": csv_path,
+        "sample_results": results[:30],
+    }
+
+# Apply route
+@main.route("/admin/apply-subscription-item-metadata", methods=["POST"])
+def apply_subscription_item_metadata():
+    """
+    Apply item_type metadata to known subscription items.
+
+    Required form fields:
+        confirm=APPLY
+        mode=test or mode=live
+
+    Safety behavior:
+    - Updates only items with action=would_update.
+    - Skips already-complete items.
+    - Skips unknown Products.
+    - Skips conflicting metadata.
+    - Preserves all existing item metadata.
+    - Writes a complete CSV log.
+    """
+
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
+
+    confirm = request.form.get(
+        "confirm"
+    )
+
+    if confirm != "APPLY":
+        return {
+            "error": (
+                "Confirmation required. "
+                "Submit confirm=APPLY."
+            )
+        }, 400
+
+    mode = request.form.get(
+        "mode"
+    )
+
+    if mode not in [
+        "test",
+        "live",
+    ]:
+        return {
+            "error": (
+                "Mode required. "
+                "Submit mode=test or mode=live."
+            )
+        }, 400
+
+    is_live_key = current_app.config[
+        "STRIPE_SECRET_KEY"
+    ].startswith("sk_live_")
+
+    if mode == "live" and not is_live_key:
+        return {
+            "error": (
+                "You submitted mode=live, "
+                "but the configured Stripe key is not live."
+            )
+        }, 400
+
+    if mode == "test" and is_live_key:
+        return {
+            "error": (
+                "You submitted mode=test, "
+                "but the configured Stripe key is live."
+            )
+        }, 400
+
+    collection = (
+        collect_subscription_item_metadata_candidates()
+    )
+
+    results = collection["results"]
+    errors = collection["errors"]
+
+    updated_count = 0
+    already_complete_count = 0
+    unknown_product_count = 0
+    conflicting_metadata_count = 0
+    failed_count = 0
+
+    for result in results:
+
+        action = result["action"]
+
+        if action == "already_complete":
+            already_complete_count += 1
+
+            result["apply_status"] = (
+                "skipped_already_complete"
+            )
+            result["apply_error"] = ""
+
+            continue
+
+        if action == "unknown_product":
+            unknown_product_count += 1
+
+            result["apply_status"] = (
+                "skipped_unknown_product"
+            )
+            result["apply_error"] = ""
+
+            continue
+
+        if action == "conflicting_metadata":
+            conflicting_metadata_count += 1
+
+            result["apply_status"] = (
+                "skipped_conflicting_metadata"
+            )
+            result["apply_error"] = ""
+
+            continue
+
+        if action != "would_update":
+            result["apply_status"] = (
+                "skipped_unrecognized_action"
+            )
+            result["apply_error"] = ""
+
+            continue
+
+        subscription_item_id = result[
+            "subscription_item_id"
+        ]
+
+        merged_metadata = result[
+            "merged_metadata"
+        ]
+
+        try:
+            updated_item = (
+                stripe.SubscriptionItem.modify(
+                    subscription_item_id,
+                    metadata=merged_metadata,
+                )
+            )
+
+            returned_metadata = (
+                stripe_metadata_to_dict(
+                    stripe_get(
+                        updated_item,
+                        "metadata",
+                        {},
+                    )
+                )
+            )
+
+            returned_item_type = returned_metadata.get(
+                SUBSCRIPTION_ITEM_TYPE_METADATA_KEY
+            )
+
+            intended_item_type = result[
+                "intended_item_type"
+            ]
+
+            if returned_item_type != intended_item_type:
+                failed_count += 1
+
+                result["apply_status"] = (
+                    "verification_failed"
+                )
+
+                result["apply_error"] = (
+                    "Stripe update returned unexpected "
+                    f"item_type={returned_item_type!r}; "
+                    f"expected {intended_item_type!r}."
+                )
+
+                errors.append({
+                    "subscription_id": result[
+                        "subscription_id"
+                    ],
+                    "subscription_item_id": (
+                        subscription_item_id
+                    ),
+                    "customer_id": result[
+                        "customer_id"
+                    ],
+                    "product_id": result[
+                        "product_id"
+                    ],
+                    "error_type": (
+                        "metadata_verification_failed"
+                    ),
+                    "error": result["apply_error"],
+                })
+
+                continue
+
+            updated_count += 1
+
+            result["apply_status"] = "updated"
+            result["apply_error"] = ""
+
+        except Exception as update_error:
+            failed_count += 1
+
+            result["apply_status"] = "update_failed"
+            result["apply_error"] = str(
+                update_error
+            )
+
+            errors.append({
+                "subscription_id": result[
+                    "subscription_id"
+                ],
+                "subscription_item_id": (
+                    subscription_item_id
+                ),
+                "customer_id": result[
+                    "customer_id"
+                ],
+                "product_id": result[
+                    "product_id"
+                ],
+                "error_type": (
+                    "subscription_item_metadata_update_failed"
+                ),
+                "error": str(update_error),
+            })
+
+    csv_path = write_subscription_item_metadata_csv(
+        results=results,
+        filename_prefix=(
+            "subscription_item_metadata_apply"
+        ),
+    )
+
+    return {
+        "status": "apply_complete",
+        "mode": mode,
+        "checked_subscription_count": collection[
+            "checked_subscription_count"
+        ],
+        "checked_item_count": collection[
+            "checked_item_count"
+        ],
+        "updated_count": updated_count,
+        "already_complete_count": (
+            already_complete_count
+        ),
+        "unknown_product_count": (
+            unknown_product_count
+        ),
+        "conflicting_metadata_count": (
+            conflicting_metadata_count
+        ),
+        "failed_count": failed_count,
+        "error_count": len(errors),
+        "errors": errors[:50],
+        "log_file": csv_path,
+        "sample_results": results[:30],
+    }
