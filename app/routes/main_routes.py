@@ -38,6 +38,8 @@ from flask import Response
 import csv
 import io
 
+import json
+
 main = Blueprint("main", __name__)
 
 
@@ -3996,6 +3998,11 @@ def late_fee_dashboard():
 
 # helper
 def stripe_metadata_to_dict(metadata):
+    """
+    Safely convert Stripe metadata into a normal Python dictionary.
+
+    This helper does not modify Stripe.
+    """
     if not metadata:
         return {}
 
@@ -4053,6 +4060,159 @@ def get_missing_inspection_metadata_keys(metadata):
             missing_keys.append(key)
 
     return missing_keys
+
+def normalize_audit_text(value):
+    """
+    Convert a value into normalized lowercase text for audit comparisons.
+    "Annual Inspection Fee"  ->  "annual inspection fee"
+    """
+
+    if value is None:
+        return ""
+
+    return str(value).strip().lower()
+
+def classify_inspection_fee_item(
+    product_name,
+    price_nickname,
+    price_lookup_key,
+    item_metadata,
+    product_metadata,
+):
+    """
+    Classify a Stripe subscription item using conservative audit rules.
+
+    This is discovery logic only.
+
+    It must not be reused later for automatically deleting subscription
+    items until Product IDs or Price IDs have been manually confirmed.
+    """
+
+    item_metadata = item_metadata or {}
+    product_metadata = product_metadata or {}
+
+    inspection_evidence = []
+    main_service_evidence = []
+
+    # Normalize important text fields.
+    normalized_product_name = normalize_audit_text(product_name)
+    normalized_price_nickname = normalize_audit_text(price_nickname)
+    normalized_lookup_key = normalize_audit_text(price_lookup_key)
+
+    # Metadata keys that may describe the type of fee.
+    possible_type_keys = {
+        "type",
+        "fee_type",
+        "billing_type",
+        "item_type",
+        "category",
+        "service_type",
+    }
+
+    inspection_metadata_values = {
+        "inspection",
+        "inspection_fee",
+        "annual_inspection",
+        "annual_inspection_fee",
+    }
+
+    main_service_metadata_values = {
+        "main_service",
+        "main_service_fee",
+        "monthly_service",
+        "monthly_service_fee",
+        "service_fee",
+    }
+
+    # Check subscription-item metadata.
+    for key, value in item_metadata.items():
+        normalized_key = normalize_audit_text(key)
+        normalized_value = normalize_audit_text(value)
+
+        if normalized_key in possible_type_keys:
+            if normalized_value in inspection_metadata_values:
+                inspection_evidence.append(
+                    f"item_metadata:{key}={value}"
+                )
+
+            if normalized_value in main_service_metadata_values:
+                main_service_evidence.append(
+                    f"item_metadata:{key}={value}"
+                )
+
+    # Check product metadata.
+    for key, value in product_metadata.items():
+        normalized_key = normalize_audit_text(key)
+        normalized_value = normalize_audit_text(value)
+
+        if normalized_key in possible_type_keys:
+            if normalized_value in inspection_metadata_values:
+                inspection_evidence.append(
+                    f"product_metadata:{key}={value}"
+                )
+
+            if normalized_value in main_service_metadata_values:
+                main_service_evidence.append(
+                    f"product_metadata:{key}={value}"
+                )
+
+    # Product or Price names containing "inspection" are useful evidence
+    # during discovery.
+    if "inspection" in normalized_product_name:
+        inspection_evidence.append(
+            f"product_name:{product_name}"
+        )
+
+    if "inspection" in normalized_price_nickname:
+        inspection_evidence.append(
+            f"price_nickname:{price_nickname}"
+        )
+
+    if "inspection" in normalized_lookup_key:
+        inspection_evidence.append(
+            f"price_lookup_key:{price_lookup_key}"
+        )
+
+    # Only use clear main-service phrases here.
+    clear_main_service_phrases = {
+        "main service",
+        "monthly service",
+        "service fee",
+        "monthly fee",
+    }
+
+    for phrase in clear_main_service_phrases:
+        if phrase in normalized_product_name:
+            main_service_evidence.append(
+                f"product_name:{product_name}"
+            )
+            break
+
+    for phrase in clear_main_service_phrases:
+        if phrase in normalized_price_nickname:
+            main_service_evidence.append(
+                f"price_nickname:{price_nickname}"
+            )
+            break
+
+    # Conflicting evidence is deliberately classified as ambiguous.
+    if inspection_evidence and main_service_evidence:
+        classification = "ambiguous"
+
+    elif inspection_evidence:
+        classification = "inspection_fee"
+
+    elif main_service_evidence:
+        classification = "main_service_fee"
+
+    else:
+        classification = "unknown"
+
+    return {
+        "classification": classification,
+        "inspection_evidence": inspection_evidence,
+        "main_service_evidence": main_service_evidence,
+    }
 
 INSPECTION_BILLABLE_STATUSES = [
     "active",
@@ -5587,4 +5747,970 @@ def audit_products():
     return {
         "count": len(results),
         "results": results,
+    }
+
+# audit_inspection_fee_items
+@main.route("/admin/audit-inspection-fee-items", methods=["GET"])
+def audit_inspection_fee_items():
+    """
+    Read-only audit route.
+
+    Inspects subscription items for active, past_due, and unpaid
+    subscriptions.
+
+    The route collects:
+    - Subscription information
+    - Customer information
+    - Subscription item information
+    - Price information
+    - Product information
+    - Existing item and Product metadata
+
+    It also summarizes:
+    - All Products found
+    - How many subscription items use each Product
+    - How many subscriptions contain 1, 2, 3, etc. items
+    - Whether customers whose description starts with "3" have
+      inspection-fee items
+
+    This route does not modify Stripe.
+    """
+
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
+
+    subscription_statuses = [
+        "active",
+        "past_due",
+        "unpaid",
+    ]
+
+    results = []
+    errors = []
+
+    checked_subscription_count = 0
+    checked_item_count = 0
+
+    # Cache Stripe Products during this request.
+    # Many subscription items reuse the same Product.
+    product_cache = {}
+
+    # Cache Stripe Customers during this request.
+    # Normally each subscription has one customer, but caching still
+    # prevents duplicate retrieval if a customer has multiple subscriptions.
+    customer_cache = {}
+
+    # One summary entry per unique Product ID.
+    product_summary = {}
+
+    # Records the number of items inside each subscription.
+    #
+    # Example:
+    # {
+    #     "sub_123": 2,
+    #     "sub_456": 1,
+    # }
+    subscription_item_counts = {}
+
+    # Stores information needed to inspect subscriptions after all
+    # of their items have been processed.
+    subscription_summary = {}
+
+    for requested_status in subscription_statuses:
+
+        subscriptions = stripe.Subscription.list(
+            status=requested_status,
+            limit=100,
+        )
+
+        for subscription in subscriptions.auto_paging_iter():
+
+            subscription_id = stripe_get(
+                subscription,
+                "id",
+            )
+
+            customer_id = stripe_get(
+                subscription,
+                "customer",
+            )
+
+            subscription_status = stripe_get(
+                subscription,
+                "status",
+            )
+
+            checked_subscription_count += 1
+
+            # Start this subscription with zero counted items.
+            subscription_item_counts[subscription_id] = 0
+
+            # ---------------------------------------------------------
+            # Retrieve customer information
+            # ---------------------------------------------------------
+
+            customer = {}
+            customer_name = None
+            customer_email = None
+            customer_description = None
+
+            if isinstance(customer_id, str):
+
+                if customer_id not in customer_cache:
+
+                    try:
+                        customer_cache[customer_id] = (
+                            stripe.Customer.retrieve(customer_id)
+                        )
+
+                    except Exception as customer_error:
+
+                        customer_cache[customer_id] = None
+
+                        errors.append({
+                            "subscription_id": subscription_id,
+                            "subscription_item_id": None,
+                            "customer_id": customer_id,
+                            "product_id": None,
+                            "error_type": (
+                                "customer_retrieval_failed"
+                            ),
+                            "error": str(customer_error),
+                        })
+
+                customer = (
+                    customer_cache.get(customer_id)
+                    or {}
+                )
+
+            elif customer_id:
+                # Stripe may return an expanded Customer object.
+                customer = customer_id
+
+                customer_id = stripe_get(
+                    customer,
+                    "id",
+                )
+
+            if customer:
+
+                customer_name = stripe_get(
+                    customer,
+                    "name",
+                )
+
+                customer_email = stripe_get(
+                    customer,
+                    "email",
+                )
+
+                customer_description = stripe_get(
+                    customer,
+                    "description",
+                )
+
+            normalized_customer_description = (
+                str(customer_description).strip()
+                if customer_description is not None
+                else ""
+            )
+
+            customer_description_starts_with_3 = (
+                normalized_customer_description.startswith("3")
+            )
+
+            subscription_summary[subscription_id] = {
+                "subscription_id": subscription_id,
+                "customer_id": customer_id,
+                "customer_name": customer_name,
+                "customer_email": customer_email,
+                "customer_description": customer_description,
+                "customer_description_starts_with_3": (
+                    customer_description_starts_with_3
+                ),
+                "subscription_status": subscription_status,
+                "item_count": 0,
+                "product_ids": [],
+                "product_names": [],
+                "inspection_candidate_item_count": 0,
+            }
+
+            try:
+                # Listing subscription items separately ensures that
+                # pagination is handled correctly.
+                subscription_items = stripe.SubscriptionItem.list(
+                    subscription=subscription_id,
+                    limit=100,
+                )
+
+                for item in subscription_items.auto_paging_iter():
+
+                    checked_item_count += 1
+
+                    subscription_item_counts[subscription_id] += 1
+
+                    subscription_summary[
+                        subscription_id
+                    ]["item_count"] += 1
+
+                    subscription_item_id = stripe_get(
+                        item,
+                        "id",
+                    )
+
+                    quantity = stripe_get(
+                        item,
+                        "quantity",
+                    )
+
+                    item_metadata = stripe_metadata_to_dict(
+                        stripe_get(
+                            item,
+                            "metadata",
+                            {},
+                        )
+                    )
+
+                    # -------------------------------------------------
+                    # Price information
+                    # -------------------------------------------------
+
+                    price = stripe_get(
+                        item,
+                        "price",
+                        {},
+                    ) or {}
+
+                    price_id = stripe_get(
+                        price,
+                        "id",
+                    )
+
+                    price_nickname = stripe_get(
+                        price,
+                        "nickname",
+                    )
+
+                    price_lookup_key = stripe_get(
+                        price,
+                        "lookup_key",
+                    )
+
+                    unit_amount = stripe_get(
+                        price,
+                        "unit_amount",
+                    )
+
+                    unit_amount_decimal = stripe_get(
+                        price,
+                        "unit_amount_decimal",
+                    )
+
+                    currency = stripe_get(
+                        price,
+                        "currency",
+                    )
+
+                    price_active = stripe_get(
+                        price,
+                        "active",
+                    )
+
+                    recurring = stripe_get(
+                        price,
+                        "recurring",
+                        {},
+                    ) or {}
+
+                    recurring_interval = stripe_get(
+                        recurring,
+                        "interval",
+                    )
+
+                    recurring_interval_count = stripe_get(
+                        recurring,
+                        "interval_count",
+                    )
+
+                    recurring_usage_type = stripe_get(
+                        recurring,
+                        "usage_type",
+                    )
+
+                    # -------------------------------------------------
+                    # Product information
+                    # -------------------------------------------------
+
+                    product_reference = stripe_get(
+                        price,
+                        "product",
+                    )
+
+                    product = {}
+                    product_id = None
+                    product_name = None
+                    product_description = None
+                    product_active = None
+                    product_metadata = {}
+
+                    if isinstance(product_reference, str):
+
+                        product_id = product_reference
+
+                        if product_id not in product_cache:
+
+                            try:
+                                product_cache[product_id] = (
+                                    stripe.Product.retrieve(
+                                        product_id
+                                    )
+                                )
+
+                            except Exception as product_error:
+
+                                product_cache[product_id] = None
+
+                                errors.append({
+                                    "subscription_id": (
+                                        subscription_id
+                                    ),
+                                    "subscription_item_id": (
+                                        subscription_item_id
+                                    ),
+                                    "customer_id": customer_id,
+                                    "product_id": product_id,
+                                    "error_type": (
+                                        "product_retrieval_failed"
+                                    ),
+                                    "error": str(product_error),
+                                })
+
+                        product = (
+                            product_cache.get(product_id)
+                            or {}
+                        )
+
+                    elif product_reference:
+                        # Stripe may return an expanded Product.
+                        product = product_reference
+
+                        product_id = stripe_get(
+                            product,
+                            "id",
+                        )
+
+                    if product:
+
+                        product_name = stripe_get(
+                            product,
+                            "name",
+                        )
+
+                        product_description = stripe_get(
+                            product,
+                            "description",
+                        )
+
+                        product_active = stripe_get(
+                            product,
+                            "active",
+                        )
+
+                        product_metadata = (
+                            stripe_metadata_to_dict(
+                                stripe_get(
+                                    product,
+                                    "metadata",
+                                    {},
+                                )
+                            )
+                        )
+
+                    subscription_summary[
+                        subscription_id
+                    ]["product_ids"].append(product_id)
+
+                    subscription_summary[
+                        subscription_id
+                    ]["product_names"].append(product_name)
+
+                    # -------------------------------------------------
+                    # Discovery-only inspection candidate
+                    # -------------------------------------------------
+                    #
+                    # This does NOT become the permanent production rule.
+                    # It is only used to make the audit easier to review.
+                    #
+                    # The final metadata migration will use confirmed
+                    # Product IDs.
+                    # -------------------------------------------------
+
+                    normalized_product_name = (
+                        str(product_name).strip().lower()
+                        if product_name
+                        else ""
+                    )
+
+                    normalized_product_description = (
+                        str(product_description).strip().lower()
+                        if product_description
+                        else ""
+                    )
+
+                    inspection_name_candidate = (
+                        "inspect" in normalized_product_name
+                        or
+                        "inspect" in normalized_product_description
+                    )
+
+                    if inspection_name_candidate:
+                        subscription_summary[
+                            subscription_id
+                        ]["inspection_candidate_item_count"] += 1
+
+                    # -------------------------------------------------
+                    # Build Product summary
+                    # -------------------------------------------------
+
+                    product_summary_key = (
+                        product_id
+                        if product_id
+                        else "missing_product_id"
+                    )
+
+                    if product_summary_key not in product_summary:
+
+                        product_summary[product_summary_key] = {
+                            "product_id": product_id,
+                            "product_name": product_name,
+                            "product_description": (
+                                product_description
+                            ),
+                            "product_active": product_active,
+                            "product_metadata": product_metadata,
+                            "item_count": 0,
+                            "subscription_ids": set(),
+                            "customer_ids": set(),
+                            "price_ids": set(),
+                            "unit_amounts": set(),
+                            "currencies": set(),
+                            "intervals": set(),
+                            "interval_counts": set(),
+                            "ottawa_item_count": 0,
+                            "non_ottawa_item_count": 0,
+                        }
+
+                    summary = product_summary[
+                        product_summary_key
+                    ]
+
+                    summary["item_count"] += 1
+
+                    summary["subscription_ids"].add(
+                        subscription_id
+                    )
+
+                    if customer_id:
+                        summary["customer_ids"].add(
+                            customer_id
+                        )
+
+                    if price_id:
+                        summary["price_ids"].add(
+                            price_id
+                        )
+
+                    if unit_amount is not None:
+                        summary["unit_amounts"].add(
+                            unit_amount
+                        )
+
+                    if currency:
+                        summary["currencies"].add(
+                            currency
+                        )
+
+                    if recurring_interval:
+                        summary["intervals"].add(
+                            recurring_interval
+                        )
+
+                    if recurring_interval_count is not None:
+                        summary["interval_counts"].add(
+                            recurring_interval_count
+                        )
+
+                    if customer_description_starts_with_3:
+                        summary["ottawa_item_count"] += 1
+                    else:
+                        summary["non_ottawa_item_count"] += 1
+
+                    # -------------------------------------------------
+                    # Store full item-level audit row
+                    # -------------------------------------------------
+
+                    results.append({
+                        "subscription_id": subscription_id,
+                        "customer_id": customer_id,
+                        "customer_name": customer_name,
+                        "customer_email": customer_email,
+                        "customer_description": (
+                            customer_description
+                        ),
+                        "customer_description_starts_with_3": (
+                            customer_description_starts_with_3
+                        ),
+                        "subscription_status": (
+                            subscription_status
+                        ),
+                        "subscription_item_id": (
+                            subscription_item_id
+                        ),
+                        "quantity": quantity,
+                        "product_id": product_id,
+                        "product_name": product_name,
+                        "product_description": (
+                            product_description
+                        ),
+                        "product_active": product_active,
+                        "price_id": price_id,
+                        "price_nickname": price_nickname,
+                        "price_lookup_key": price_lookup_key,
+                        "price_active": price_active,
+                        "unit_amount": unit_amount,
+                        "unit_amount_decimal": (
+                            unit_amount_decimal
+                        ),
+                        "currency": currency,
+                        "recurring_interval": (
+                            recurring_interval
+                        ),
+                        "recurring_interval_count": (
+                            recurring_interval_count
+                        ),
+                        "recurring_usage_type": (
+                            recurring_usage_type
+                        ),
+                        "item_metadata": item_metadata,
+                        "product_metadata": product_metadata,
+                        "inspection_name_candidate": (
+                            inspection_name_candidate
+                        ),
+                    })
+
+            except Exception as subscription_error:
+
+                errors.append({
+                    "subscription_id": subscription_id,
+                    "subscription_item_id": None,
+                    "customer_id": customer_id,
+                    "product_id": None,
+                    "error_type": (
+                        "subscription_item_audit_failed"
+                    ),
+                    "error": str(subscription_error),
+                })
+
+    # -------------------------------------------------------------
+    # Summarize subscription item counts
+    # -------------------------------------------------------------
+
+    subscription_item_count_summary = {}
+
+    for item_count in subscription_item_counts.values():
+
+        item_count_key = str(item_count)
+
+        subscription_item_count_summary[item_count_key] = (
+            subscription_item_count_summary.get(
+                item_count_key,
+                0,
+            )
+            + 1
+        )
+
+    # -------------------------------------------------------------
+    # Create JSON-safe Product summary
+    # -------------------------------------------------------------
+
+    product_summary_results = []
+
+    for summary in product_summary.values():
+
+        product_summary_results.append({
+            "product_id": summary["product_id"],
+            "product_name": summary["product_name"],
+            "product_description": (
+                summary["product_description"]
+            ),
+            "product_active": summary["product_active"],
+            "product_metadata": summary["product_metadata"],
+            "item_count": summary["item_count"],
+            "subscription_count": len(
+                summary["subscription_ids"]
+            ),
+            "customer_count": len(
+                summary["customer_ids"]
+            ),
+            "price_ids": sorted(
+                summary["price_ids"]
+            ),
+            "unit_amounts": sorted(
+                summary["unit_amounts"]
+            ),
+            "currencies": sorted(
+                summary["currencies"]
+            ),
+            "intervals": sorted(
+                summary["intervals"]
+            ),
+            "interval_counts": sorted(
+                summary["interval_counts"]
+            ),
+            "ottawa_item_count": (
+                summary["ottawa_item_count"]
+            ),
+            "non_ottawa_item_count": (
+                summary["non_ottawa_item_count"]
+            ),
+        })
+
+    product_summary_results.sort(
+        key=lambda row: row["item_count"],
+        reverse=True,
+    )
+
+    # -------------------------------------------------------------
+    # Summarize subscriptions by Ottawa/non-Ottawa and item count
+    # -------------------------------------------------------------
+
+    subscription_summary_results = list(
+        subscription_summary.values()
+    )
+
+    subscription_summary_results.sort(
+        key=lambda row: (
+            row["item_count"],
+            str(row["customer_description"] or ""),
+        )
+    )
+
+    ottawa_subscription_count = 0
+    non_ottawa_subscription_count = 0
+
+    ottawa_one_item_count = 0
+    ottawa_two_item_count = 0
+    ottawa_other_item_count = 0
+
+    non_ottawa_one_item_count = 0
+    non_ottawa_two_item_count = 0
+    non_ottawa_other_item_count = 0
+
+    ottawa_with_inspection_candidate_count = 0
+    non_ottawa_without_inspection_candidate_count = 0
+
+    for summary in subscription_summary_results:
+
+        is_ottawa = summary[
+            "customer_description_starts_with_3"
+        ]
+
+        item_count = summary["item_count"]
+
+        inspection_candidate_count = summary[
+            "inspection_candidate_item_count"
+        ]
+
+        if is_ottawa:
+            ottawa_subscription_count += 1
+
+            if item_count == 1:
+                ottawa_one_item_count += 1
+            elif item_count == 2:
+                ottawa_two_item_count += 1
+            else:
+                ottawa_other_item_count += 1
+
+            if inspection_candidate_count > 0:
+                ottawa_with_inspection_candidate_count += 1
+
+        else:
+            non_ottawa_subscription_count += 1
+
+            if item_count == 1:
+                non_ottawa_one_item_count += 1
+            elif item_count == 2:
+                non_ottawa_two_item_count += 1
+            else:
+                non_ottawa_other_item_count += 1
+
+            if inspection_candidate_count == 0:
+                non_ottawa_without_inspection_candidate_count += 1
+
+    regional_summary = {
+        "ottawa_rule_used_for_audit": (
+            "customer description starts with 3"
+        ),
+        "ottawa_subscription_count": (
+            ottawa_subscription_count
+        ),
+        "non_ottawa_subscription_count": (
+            non_ottawa_subscription_count
+        ),
+        "ottawa_one_item_count": (
+            ottawa_one_item_count
+        ),
+        "ottawa_two_item_count": (
+            ottawa_two_item_count
+        ),
+        "ottawa_other_item_count": (
+            ottawa_other_item_count
+        ),
+        "non_ottawa_one_item_count": (
+            non_ottawa_one_item_count
+        ),
+        "non_ottawa_two_item_count": (
+            non_ottawa_two_item_count
+        ),
+        "non_ottawa_other_item_count": (
+            non_ottawa_other_item_count
+        ),
+        "ottawa_with_inspection_candidate_count": (
+            ottawa_with_inspection_candidate_count
+        ),
+        "non_ottawa_without_inspection_candidate_count": (
+            non_ottawa_without_inspection_candidate_count
+        ),
+    }
+
+    # -------------------------------------------------------------
+    # Create CSV files
+    # -------------------------------------------------------------
+
+    os.makedirs(
+        "logs",
+        exist_ok=True,
+    )
+
+    timestamp = datetime.now(
+        timezone.utc
+    ).strftime("%Y-%m-%d_%H%M%S")
+
+    item_csv_path = os.path.join(
+        "logs",
+        f"inspection_fee_item_audit_{timestamp}.csv",
+    )
+
+    product_csv_path = os.path.join(
+        "logs",
+        f"inspection_fee_product_summary_{timestamp}.csv",
+    )
+
+    subscription_csv_path = os.path.join(
+        "logs",
+        f"inspection_fee_subscription_summary_{timestamp}.csv",
+    )
+
+    # -------------------------------------------------------------
+    # Item-level CSV
+    # -------------------------------------------------------------
+
+    item_fieldnames = [
+        "subscription_id",
+        "customer_id",
+        "customer_name",
+        "customer_email",
+        "customer_description",
+        "customer_description_starts_with_3",
+        "subscription_status",
+        "subscription_item_id",
+        "quantity",
+        "product_id",
+        "product_name",
+        "product_description",
+        "product_active",
+        "price_id",
+        "price_nickname",
+        "price_lookup_key",
+        "price_active",
+        "unit_amount",
+        "unit_amount_decimal",
+        "currency",
+        "recurring_interval",
+        "recurring_interval_count",
+        "recurring_usage_type",
+        "item_metadata",
+        "product_metadata",
+        "inspection_name_candidate",
+    ]
+
+    with open(
+        item_csv_path,
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as item_csv_file:
+
+        writer = csv.DictWriter(
+            item_csv_file,
+            fieldnames=item_fieldnames,
+        )
+
+        writer.writeheader()
+
+        for result in results:
+
+            csv_row = result.copy()
+
+            csv_row["item_metadata"] = json.dumps(
+                result["item_metadata"],
+                sort_keys=True,
+            )
+
+            csv_row["product_metadata"] = json.dumps(
+                result["product_metadata"],
+                sort_keys=True,
+            )
+
+            writer.writerow(csv_row)
+
+    # -------------------------------------------------------------
+    # Product-summary CSV
+    # -------------------------------------------------------------
+
+    product_fieldnames = [
+        "product_id",
+        "product_name",
+        "product_description",
+        "product_active",
+        "product_metadata",
+        "item_count",
+        "subscription_count",
+        "customer_count",
+        "price_ids",
+        "unit_amounts",
+        "currencies",
+        "intervals",
+        "interval_counts",
+        "ottawa_item_count",
+        "non_ottawa_item_count",
+    ]
+
+    with open(
+        product_csv_path,
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as product_csv_file:
+
+        writer = csv.DictWriter(
+            product_csv_file,
+            fieldnames=product_fieldnames,
+        )
+
+        writer.writeheader()
+
+        for result in product_summary_results:
+
+            csv_row = result.copy()
+
+            csv_row["product_metadata"] = json.dumps(
+                result["product_metadata"],
+                sort_keys=True,
+            )
+
+            csv_row["price_ids"] = json.dumps(
+                result["price_ids"],
+            )
+
+            csv_row["unit_amounts"] = json.dumps(
+                result["unit_amounts"],
+            )
+
+            csv_row["currencies"] = json.dumps(
+                result["currencies"],
+            )
+
+            csv_row["intervals"] = json.dumps(
+                result["intervals"],
+            )
+
+            csv_row["interval_counts"] = json.dumps(
+                result["interval_counts"],
+            )
+
+            writer.writerow(csv_row)
+
+    # -------------------------------------------------------------
+    # Subscription-summary CSV
+    # -------------------------------------------------------------
+
+    subscription_fieldnames = [
+        "subscription_id",
+        "customer_id",
+        "customer_name",
+        "customer_email",
+        "customer_description",
+        "customer_description_starts_with_3",
+        "subscription_status",
+        "item_count",
+        "product_ids",
+        "product_names",
+        "inspection_candidate_item_count",
+    ]
+
+    with open(
+        subscription_csv_path,
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as subscription_csv_file:
+
+        writer = csv.DictWriter(
+            subscription_csv_file,
+            fieldnames=subscription_fieldnames,
+        )
+
+        writer.writeheader()
+
+        for result in subscription_summary_results:
+
+            csv_row = result.copy()
+
+            csv_row["product_ids"] = json.dumps(
+                result["product_ids"],
+            )
+
+            csv_row["product_names"] = json.dumps(
+                result["product_names"],
+            )
+
+            writer.writerow(csv_row)
+
+    return {
+        "status": "audit_complete",
+        "read_only": True,
+        "checked_subscription_count": (
+            checked_subscription_count
+        ),
+        "checked_item_count": checked_item_count,
+        "unique_product_count": len(
+            product_summary_results
+        ),
+        "unique_customer_count": len(
+            customer_cache
+        ),
+        "subscription_item_count_summary": (
+            subscription_item_count_summary
+        ),
+        "regional_summary": regional_summary,
+        "product_summary": product_summary_results,
+        "error_count": len(errors),
+        "errors": errors[:50],
+        "item_log_file": item_csv_path,
+        "product_summary_log_file": product_csv_path,
+        "subscription_summary_log_file": (
+            subscription_csv_path
+        ),
+        "sample_results": results[:20],
     }
