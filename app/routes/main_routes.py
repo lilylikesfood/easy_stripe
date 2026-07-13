@@ -4044,6 +4044,33 @@ def get_effective_cancel_datetime(subscription):
 
     return None, "missing"
 
+# Check every required metadata key and return a list of the ones that are absent or empty
+def get_missing_inspection_metadata_keys(metadata):
+    missing_keys = []
+
+    for key in REQUIRED_INSPECTION_METADATA_KEYS:
+        if not metadata.get(key):
+            missing_keys.append(key)
+
+    return missing_keys
+
+INSPECTION_BILLABLE_STATUSES = [
+    "active",
+    "past_due",
+    "unpaid",
+]
+
+REQUIRED_INSPECTION_METADATA_KEYS = [
+    "contract_start_date",
+    "contract_end_date",
+    "contract_term_years",
+    "inspection_fee_start_date",
+    "inspection_fee_end_date",
+    "inspection_fee_years",
+    "inspection_fee_status",
+    "billing_rule_version",
+]
+
 # audit inspection fee
 @main.route("/admin/audit-inspection-fees")
 def audit_inspection_fees(): 
@@ -4858,6 +4885,680 @@ def apply_inspection_metadata():
         "failed_count": failed_count,
         "results": results,
         "log_file": log_path
+    }
+
+# building Audit which active/past_due/unpaid subscriptions are missing inspection metadata
+@main.route("/admin/audit-inspection-metadata-coverage")
+def audit_inspection_metadata_coverage():
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    billable_statuses = [
+        "active",
+        "past_due",
+        "unpaid",
+    ]
+
+    required_metadata_keys = [
+        "contract_start_date",
+        "contract_end_date",
+        "contract_term_years",
+        "inspection_fee_start_date",
+        "inspection_fee_end_date",
+        "inspection_fee_years",
+        "inspection_fee_status",
+        "billing_rule_version",
+    ]
+
+    summary = {
+        "checked" : 0,
+        "complete_count" : 0,
+        "missing_metadata_count" : 0,
+        "status_counts" : {
+            "active" : 0,
+            "past_due" : 0,
+            "unpaid" : 0,
+        },
+    }
+
+    missing_results = []
+
+    for status in billable_statuses:
+        subscriptions =stripe.Subscription.list(
+            status= status,
+            limit=100,
+        )
+
+        for subscription in subscriptions.auto_paging_iter():
+            summary["checked"] += 1
+            summary["status_counts"][status] += 1
+
+            metadata = stripe_metadata_to_dict(stripe_get(subscription, "metadata", {}) or {})
+
+            missing_keys = []
+
+            for key in required_metadata_keys: 
+                if not metadata.get(key):
+                    missing_keys.append(key)
+
+            if missing_keys:
+                summary["missing_metadata_count"] += 1
+
+                missing_results.append({
+                    "subscription_id": stripe_get(subscription, "id"),
+                    "customer_id": stripe_get(subscription, "customer"),
+                    "status": stripe_get(subscription, "status"),
+                    "missing_keys": missing_keys,
+                    "current_metadata": metadata,
+                })
+
+            else:
+                summary["complete_count"] += 1
+
+    return {
+        "summary" : summary,
+        "missing_results" : missing_results,
+    }
+
+# investigate the four active subscriptions so we know why they were missed
+@main.route("/admin/debug-missing-inspection-metadata-active")
+def debug_missing_inspection_metadata_active():
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    subscription_ids = [
+        "sub_1TTnDHE2kujhweZxsJOp2viU",
+        "sub_1SACWKE2kujhweZxyHi6aCwU",
+        "sub_1RvHSbE2kujhweZxWhe1XR7r",
+        "sub_1PY7MyE2kujhweZxWBAmzpHU",
+    ]
+
+    results = []
+
+    for subscription_id in subscription_ids:
+        subscription = stripe.Subscription.retrieve(
+            subscription_id,
+            expand=["customer", "latest_invoice"]
+        )
+
+        customer = stripe_get(subscription, "customer")
+        latest_invoice = stripe_get(subscription, "latest_invoice")
+        metadata = stripe_metadata_to_dict(
+            stripe_get(subscription, "metadata", {}) or {}
+        )
+
+        results.append({
+            "subscription_id": subscription_id,
+            "subscription_status": stripe_get(subscription, "status"),
+            "subscription_created": stripe_timestamp_to_utc_datetime(
+                stripe_get(subscription, "created")
+            ).isoformat() if stripe_get(subscription, "created") else None,
+
+            "customer_id": stripe_get(customer, "id"),
+            "customer_email": stripe_get(customer, "email"),
+
+            "latest_invoice_id": stripe_get(latest_invoice, "id"),
+            "latest_invoice_status": stripe_get(latest_invoice, "status"),
+            "latest_invoice_paid": stripe_get(latest_invoice, "paid"),
+            "latest_invoice_amount_remaining": stripe_get(
+                latest_invoice,
+                "amount_remaining"
+            ),
+
+            "current_metadata": metadata,
+        })
+
+    return {
+        "count": len(results),
+        "results": results,
+    }
+
+# repair only active/past_due/unpaid subscriptions that are still missing metadata
+@main.route("/admin/preview-missing-inspection-metadata-apply")
+def preview_missing_inspection_metadata_apply():
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    target_subscription_id = request.args.get("subscription_id")
+
+    results = []
+
+    checked_count = 0
+    missing_count = 0
+    complete_skipped_count = 0
+    unsafe_count = 0
+
+    for status in INSPECTION_BILLABLE_STATUSES:
+        subscriptions = stripe.Subscription.list(
+            status=status,
+            limit=100,
+            expand=["data.customer", "data.schedule"],
+        )
+
+        for subscription in subscriptions.auto_paging_iter():
+            subscription_id = stripe_get(subscription, "id")
+
+            if (
+                target_subscription_id
+                and subscription_id != target_subscription_id
+            ):
+                continue
+
+            checked_count += 1
+
+            customer = stripe_get(subscription, "customer")
+            customer_id = stripe_get(customer, "id")
+
+            current_metadata = stripe_metadata_to_dict(
+                stripe_get(subscription, "metadata", {}) or {}
+            )
+
+            missing_keys = get_missing_inspection_metadata_keys(
+                current_metadata
+            )
+
+            if not missing_keys:
+                complete_skipped_count += 1
+                continue
+
+            missing_count += 1
+
+            contract_start_dt = stripe_timestamp_to_utc_datetime(
+                stripe_get(customer, "created")
+            )
+
+            if not contract_start_dt:
+                unsafe_count += 1
+
+                results.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "subscription_status": stripe_get(
+                        subscription,
+                        "status"
+                    ),
+                    "action": "unsafe_skip",
+                    "reason": "missing_customer_created_date",
+                    "missing_keys": missing_keys,
+                    "current_metadata": current_metadata,
+                })
+
+                continue
+
+            expected_inspection_end_dt = (
+                contract_start_dt + relativedelta(years=3)
+            )
+
+            expected_contract_end_dt = (
+                contract_start_dt + relativedelta(years=50)
+            )
+
+            metadata_to_merge = {
+                "contract_start_date": (
+                    contract_start_dt.date().isoformat()
+                ),
+                "contract_end_date": (
+                    expected_contract_end_dt.date().isoformat()
+                ),
+                "contract_term_years": "50",
+                "inspection_fee_start_date": (
+                    contract_start_dt.date().isoformat()
+                ),
+                "inspection_fee_end_date": (
+                    expected_inspection_end_dt.date().isoformat()
+                ),
+                "inspection_fee_years": "3",
+                "inspection_fee_status": "active",
+                "billing_rule_version": "1",
+            }
+
+            final_metadata_after_merge = {
+                **current_metadata,
+                **metadata_to_merge,
+            }
+
+            results.append({
+                "subscription_id": subscription_id,
+                "customer_id": customer_id,
+                "subscription_status": stripe_get(
+                    subscription,
+                    "status"
+                ),
+                "missing_keys": missing_keys,
+                "current_metadata": current_metadata,
+                "would_add_metadata": metadata_to_merge,
+                "final_metadata_after_merge": (
+                    final_metadata_after_merge
+                ),
+                "action": "preview_only_no_changes",
+            })
+
+    return {
+        "summary": {
+            "statuses_checked": INSPECTION_BILLABLE_STATUSES,
+            "checked_count": checked_count,
+            "missing_count": missing_count,
+            "complete_skipped_count": complete_skipped_count,
+            "unsafe_count": unsafe_count,
+            "preview_result_count": len(results),
+        },
+        "results": results,
+    }
+
+# repair only active/past_due/unpaid subscriptions that are still missing metadata
+@main.route("/admin/apply-missing-inspection-metadata", methods=["POST"])
+def apply_missing_inspection_metadata():
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
+
+    confirm = request.form.get("confirm")
+
+    if confirm != "APPLY":
+        return {
+            "error": "Confirmation required. Submit confirm=APPLY."
+        }, 400
+
+    mode = request.form.get("mode")
+
+    if mode not in ["test", "live"]:
+        return {
+            "error": "Mode required. Submit mode=test or mode=live."
+        }, 400
+
+    is_live_key = current_app.config[
+        "STRIPE_SECRET_KEY"
+    ].startswith("sk_live_")
+
+    if mode == "live" and not is_live_key:
+        return {
+            "error": (
+                "You submitted mode=live, "
+                "but Stripe key is not live."
+            )
+        }, 400
+
+    if mode == "test" and is_live_key:
+        return {
+            "error": (
+                "You submitted mode=test, "
+                "but Stripe key is live."
+            )
+        }, 400
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    target_subscription_id = request.form.get(
+        "subscription_id"
+    )
+
+    results = []
+    log_rows = []
+
+    checked_count = 0
+    updated_count = 0
+    skipped_complete_count = 0
+    failed_count = 0
+
+    os.makedirs("logs", exist_ok=True)
+
+    timestamp = datetime.now().strftime(
+        "%Y-%m-%d_%H%M%S"
+    )
+
+    log_filename = (
+        f"missing_inspection_metadata_apply_log_"
+        f"{timestamp}.csv"
+    )
+
+    log_path = os.path.join(
+        "logs",
+        log_filename
+    )
+
+    for status in INSPECTION_BILLABLE_STATUSES:
+        subscriptions = stripe.Subscription.list(
+            status=status,
+            limit=100,
+            expand=["data.customer"],
+        )
+
+        for subscription in subscriptions.auto_paging_iter():
+            subscription_id = stripe_get(
+                subscription,
+                "id"
+            )
+
+            if (
+                target_subscription_id
+                and subscription_id != target_subscription_id
+            ):
+                continue
+
+            checked_count += 1
+
+            customer = stripe_get(
+                subscription,
+                "customer"
+            )
+
+            customer_id = stripe_get(
+                customer,
+                "id"
+            )
+
+            current_metadata = stripe_metadata_to_dict(
+                stripe_get(
+                    subscription,
+                    "metadata",
+                    {}
+                ) or {}
+            )
+
+            missing_keys = (
+                get_missing_inspection_metadata_keys(
+                    current_metadata
+                )
+            )
+
+            if not missing_keys:
+                skipped_complete_count += 1
+
+                results.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "subscription_status": stripe_get(
+                        subscription,
+                        "status"
+                    ),
+                    "action": "skipped_already_complete",
+                })
+
+                continue
+
+            contract_start_dt = (
+                stripe_timestamp_to_utc_datetime(
+                    stripe_get(customer, "created")
+                )
+            )
+
+            if not contract_start_dt:
+                failed_count += 1
+
+                results.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "subscription_status": stripe_get(
+                        subscription,
+                        "status"
+                    ),
+                    "action": "failed",
+                    "reason": (
+                        "missing_customer_created_date"
+                    ),
+                })
+
+                log_rows.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "subscription_status": stripe_get(
+                        subscription,
+                        "status"
+                    ),
+                    "action": "failed",
+                    "missing_keys_before": ",".join(
+                        missing_keys
+                    ),
+                    "reason": (
+                        "missing_customer_created_date"
+                    ),
+                    "error": "",
+                    "contract_start_date": "",
+                    "contract_end_date": "",
+                    "contract_term_years": "",
+                    "inspection_fee_start_date": "",
+                    "inspection_fee_end_date": "",
+                    "inspection_fee_years": "",
+                    "inspection_fee_status": "",
+                    "billing_rule_version": "",
+                })
+
+                continue
+
+            expected_inspection_end_dt = (
+                contract_start_dt
+                + relativedelta(years=3)
+            )
+
+            expected_contract_end_dt = (
+                contract_start_dt
+                + relativedelta(years=50)
+            )
+
+            metadata_to_merge = {
+                "contract_start_date": (
+                    contract_start_dt
+                    .date()
+                    .isoformat()
+                ),
+                "contract_end_date": (
+                    expected_contract_end_dt
+                    .date()
+                    .isoformat()
+                ),
+                "contract_term_years": "50",
+                "inspection_fee_start_date": (
+                    contract_start_dt
+                    .date()
+                    .isoformat()
+                ),
+                "inspection_fee_end_date": (
+                    expected_inspection_end_dt
+                    .date()
+                    .isoformat()
+                ),
+                "inspection_fee_years": "3",
+                "inspection_fee_status": "active",
+                "billing_rule_version": "1",
+            }
+
+            new_metadata = {
+                **current_metadata,
+                **metadata_to_merge,
+            }
+
+            try:
+                stripe.Subscription.modify(
+                    subscription_id,
+                    metadata=new_metadata,
+                )
+
+                updated_count += 1
+
+                results.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "subscription_status": stripe_get(
+                        subscription,
+                        "status"
+                    ),
+                    "action": "metadata_updated",
+                    "missing_keys_before": missing_keys,
+                    "metadata": new_metadata,
+                })
+
+                log_rows.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "subscription_status": stripe_get(
+                        subscription,
+                        "status"
+                    ),
+                    "action": "metadata_updated",
+                    "missing_keys_before": ",".join(
+                        missing_keys
+                    ),
+                    "reason": "",
+                    "error": "",
+                    "contract_start_date": (
+                        new_metadata[
+                            "contract_start_date"
+                        ]
+                    ),
+                    "contract_end_date": (
+                        new_metadata[
+                            "contract_end_date"
+                        ]
+                    ),
+                    "contract_term_years": (
+                        new_metadata[
+                            "contract_term_years"
+                        ]
+                    ),
+                    "inspection_fee_start_date": (
+                        new_metadata[
+                            "inspection_fee_start_date"
+                        ]
+                    ),
+                    "inspection_fee_end_date": (
+                        new_metadata[
+                            "inspection_fee_end_date"
+                        ]
+                    ),
+                    "inspection_fee_years": (
+                        new_metadata[
+                            "inspection_fee_years"
+                        ]
+                    ),
+                    "inspection_fee_status": (
+                        new_metadata[
+                            "inspection_fee_status"
+                        ]
+                    ),
+                    "billing_rule_version": (
+                        new_metadata[
+                            "billing_rule_version"
+                        ]
+                    ),
+                })
+
+            except Exception as e:
+                failed_count += 1
+
+                results.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "subscription_status": stripe_get(
+                        subscription,
+                        "status"
+                    ),
+                    "action": "failed",
+                    "missing_keys_before": missing_keys,
+                    "error": str(e),
+                })
+
+                log_rows.append({
+                    "subscription_id": subscription_id,
+                    "customer_id": customer_id,
+                    "subscription_status": stripe_get(
+                        subscription,
+                        "status"
+                    ),
+                    "action": "failed",
+                    "missing_keys_before": ",".join(
+                        missing_keys
+                    ),
+                    "reason": "",
+                    "error": str(e),
+                    "contract_start_date": (
+                        metadata_to_merge[
+                            "contract_start_date"
+                        ]
+                    ),
+                    "contract_end_date": (
+                        metadata_to_merge[
+                            "contract_end_date"
+                        ]
+                    ),
+                    "contract_term_years": (
+                        metadata_to_merge[
+                            "contract_term_years"
+                        ]
+                    ),
+                    "inspection_fee_start_date": (
+                        metadata_to_merge[
+                            "inspection_fee_start_date"
+                        ]
+                    ),
+                    "inspection_fee_end_date": (
+                        metadata_to_merge[
+                            "inspection_fee_end_date"
+                        ]
+                    ),
+                    "inspection_fee_years": (
+                        metadata_to_merge[
+                            "inspection_fee_years"
+                        ]
+                    ),
+                    "inspection_fee_status": (
+                        metadata_to_merge[
+                            "inspection_fee_status"
+                        ]
+                    ),
+                    "billing_rule_version": (
+                        metadata_to_merge[
+                            "billing_rule_version"
+                        ]
+                    ),
+                })
+
+                continue
+
+    fieldnames = [
+        "subscription_id",
+        "customer_id",
+        "subscription_status",
+        "action",
+        "missing_keys_before",
+        "reason",
+        "error",
+        "contract_start_date",
+        "contract_end_date",
+        "contract_term_years",
+        "inspection_fee_start_date",
+        "inspection_fee_end_date",
+        "inspection_fee_years",
+        "inspection_fee_status",
+        "billing_rule_version",
+    ]
+
+    with open(
+        log_path,
+        "w",
+        newline="",
+        encoding="utf-8"
+    ) as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fieldnames
+        )
+
+        writer.writeheader()
+        writer.writerows(log_rows)
+
+    return {
+        "status": "ok",
+        "mode": mode,
+        "target_subscription_id": (
+            target_subscription_id
+        ),
+        "statuses_checked": (
+            INSPECTION_BILLABLE_STATUSES
+        ),
+        "checked_count": checked_count,
+        "updated_count": updated_count,
+        "skipped_complete_count": (
+            skipped_complete_count
+        ),
+        "failed_count": failed_count,
+        "results": results,
+        "log_file": log_path,
     }
 
 # product audit

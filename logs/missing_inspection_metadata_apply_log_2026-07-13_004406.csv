@@ -1,0 +1,2 @@
+subscription_id,customer_id,subscription_status,action,missing_keys_before,reason,error,contract_start_date,contract_end_date,contract_term_years,inspection_fee_start_date,inspection_fee_end_date,inspection_fee_years,inspection_fee_status,billing_rule_version
+sub_1TTnDHE2kujhweZxsJOp2viU,cus_USieRzJ5q7pL3Y,active,metadata_updated,"contract_start_date,contract_end_date,contract_term_years,inspection_fee_start_date,inspection_fee_end_date,inspection_fee_years,inspection_fee_status,billing_rule_version",,,2026-05-05,2076-05-05,50,2026-05-05,2029-05-05,3,active,1
