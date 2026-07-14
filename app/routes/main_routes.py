@@ -7520,6 +7520,7 @@ def preview_contract_end_migration():
     # Example:
     # /admin/preview-contract-end-migration?subscription_id=sub_123
     target_subscription_id = request.args.get("subscription_id")
+    # request.args means: "Read parameters that come after a ? in the URL."
 
     results = []
     errors = []
@@ -7597,24 +7598,15 @@ def preview_contract_end_migration():
             #
             # We do not need bool(...) because Stripe already returns
             # a Boolean value for this property.
-            cancel_at_period_end = stripe_get(
-                subscription,
-                "cancel_at_period_end",
-                False,
-            )
+            cancel_at_period_end = stripe_get(subscription, "cancel_at_period_end", False)
 
             # Convert the Stripe Unix timestamp into a readable date.
-            cancel_at_datetime = (
-                stripe_timestamp_to_utc_datetime(cancel_at)
-                if cancel_at
-                else None
-            )
+            cancel_at_datetime = (stripe_timestamp_to_utc_datetime(cancel_at) if cancel_at else None)
 
             # Stripe may return the schedule as:
-            #
             # "sub_sched_123"
-            #
-            # or as an expanded Schedule object.
+            
+            # or as an expanded Schedule object
             schedule_reference = stripe_get(subscription, "schedule")
 
             schedule_id = None
@@ -7624,6 +7616,8 @@ def preview_contract_end_migration():
             schedule_phase_count = 0
             schedule_last_phase_end = None
             schedule_phases = []
+            # A signature is a simplified list used to compare the billing items in every schedule phase
+            schedule_phase_signatures = []
 
             # Start building the result row now.
             # We fill in the schedule information afterward.
@@ -7643,6 +7637,7 @@ def preview_contract_end_migration():
                 "schedule_phase_count": 0,
                 "schedule_last_phase_end": "",
                 "schedule_phases": [],
+                "all_schedule_phase_items_same": False,
                 "action": "",
                 "safe_to_apply": False,
                 "reason": "",
@@ -7661,8 +7656,7 @@ def preview_contract_end_migration():
                         schedule_id = schedule_reference
                         schedule = stripe.SubscriptionSchedule.retrieve(schedule_id)
 
-                    # Otherwise, Stripe already returned an expanded
-                    # schedule object.
+                    # Otherwise, Stripe already returned an expanded schedule object
                     else:
                         schedule = schedule_reference
                         schedule_id = stripe_get(schedule, "id")
@@ -7684,19 +7678,12 @@ def preview_contract_end_migration():
                         phase_start_ts = stripe_get(phase, "start_date")
                         phase_end_ts = stripe_get(phase, "end_date")
 
-                        phase_start_datetime = (
-                            stripe_timestamp_to_utc_datetime(phase_start_ts)
-                            if phase_start_ts
-                            else None
-                        )
+                        phase_start_datetime = stripe_timestamp_to_utc_datetime(phase_start_ts) if phase_start_ts else None
 
-                        phase_end_datetime = (
-                            stripe_timestamp_to_utc_datetime(phase_end_ts)
-                            if phase_end_ts
-                            else None
-                        )
+                        phase_end_datetime = stripe_timestamp_to_utc_datetime(phase_end_ts) if phase_end_ts else None
 
                         phase_items = []
+                        phase_signature = []
 
                         # Read all Prices contained in this phase.
                         for phase_item in stripe_get(phase, "items", []) or []:
@@ -7708,54 +7695,54 @@ def preview_contract_end_migration():
 
                             # Or it may be returned as an expanded Price object.
                             else:
-                                phase_price_id = stripe_get(
-                                    phase_price_reference,
-                                    "id",
-                                )
+                                phase_price_id = stripe_get(phase_price_reference, "id")
+
+                            quantity = stripe_get(phase_item, "quantity", 1)
 
                             phase_items.append({
                                 "price_id": phase_price_id,
-                                "quantity": stripe_get(
-                                    phase_item,
-                                    "quantity",
-                                    1,
-                                ),
+                                "quantity": quantity,
                             })
 
+                            phase_signature.append({
+                                "price_id": phase_price_id,
+                                "quantity": quantity,
+                            })
+
+                        phase_signature.sort(
+                            key=lambda item: (
+                                str(item["price_id"]), 
+                                item["quantity"]
+                            )
+                        )
+                        # sort() rearranges the items in the list into a consistent order
+                        # When sorting each dictionary, use its price_id first and its quantity second
+                        # roughly like this
+                        # def sorting_rule(item):
+                            # return (
+                            #     str(item["price_id"]),
+                            #     item["quantity"],
+                            # )
+
+                        schedule_phase_signatures.append(phase_signature)
+
                         schedule_phases.append({
-                            "start_date": (
-                                phase_start_datetime.date().isoformat()
-                                if phase_start_datetime
-                                else ""
-                            ),
-                            "end_date": (
-                                phase_end_datetime.date().isoformat()
-                                if phase_end_datetime
-                                else ""
-                            ),
-                            "proration_behavior": stripe_get(
-                                phase,
-                                "proration_behavior",
-                                "",
-                            ),
+                            "start_date": phase_start_datetime.date().isoformat() if phase_start_datetime else "",
+                            "end_date": phase_end_datetime.date().isoformat() if phase_end_datetime else "",
+                            "proration_behavior": stripe_get(phase, "proration_behavior", ""),
                             "items": phase_items,
                         })
 
                     # Get the end date of the final phase.
                     if phases:
+                        # last item
                         last_phase = phases[-1]
                         last_phase_end_ts = stripe_get(last_phase, "end_date")
 
                         if last_phase_end_ts:
-                            last_phase_end_datetime = (
-                                stripe_timestamp_to_utc_datetime(
-                                    last_phase_end_ts
-                                )
-                            )
+                            last_phase_end_datetime = stripe_timestamp_to_utc_datetime(last_phase_end_ts)
 
-                            schedule_last_phase_end = (
-                                last_phase_end_datetime.date().isoformat()
-                            )
+                            schedule_last_phase_end = last_phase_end_datetime.date().isoformat()
 
                 except Exception as schedule_error:
                     summary["error_count"] += 1
@@ -7763,10 +7750,7 @@ def preview_contract_end_migration():
                     base_result["schedule_id"] = schedule_id or ""
                     base_result["action"] = "error"
                     base_result["safe_to_apply"] = False
-                    base_result["reason"] = (
-                        "Could not retrieve or inspect "
-                        "the subscription schedule."
-                    )
+                    base_result["reason"] = "Could not retrieve or inspect the subscription schedule."
                     base_result["error"] = str(schedule_error)
 
                     results.append(base_result)
@@ -7782,6 +7766,26 @@ def preview_contract_end_migration():
                     # with the next one.
                     continue
 
+            all_schedule_phase_items_same = False
+
+            if schedule_phase_signatures:
+                first_phase_signature = schedule_phase_signatures[0]
+
+                # all() checks a group of True/False results
+                # It returns True only when every result is True
+                all_schedule_phase_items_same = all(
+                    phase_signature == first_phase_signature
+                    for phase_signature in schedule_phase_signatures
+                )
+                # Compare every phase signature with the first phase signature. Return True only if every phase matches the first one
+                # equivalent would be
+                # all_schedule_phase_items_same = True
+
+                # for phase_signature in schedule_phase_signatures:
+                #     if phase_signature != first_phase_signature:
+                #         all_schedule_phase_items_same = False
+                #         break
+
             # Add the schedule information to the result row.
             base_result["schedule_id"] = schedule_id or ""
             base_result["schedule_status"] = schedule_status or ""
@@ -7789,6 +7793,7 @@ def preview_contract_end_migration():
             base_result["schedule_phase_count"] = schedule_phase_count
             base_result["schedule_last_phase_end"] = schedule_last_phase_end or ""
             base_result["schedule_phases"] = schedule_phases
+            base_result["all_schedule_phase_items_same"] = all_schedule_phase_items_same
 
             # -----------------------------------------------------
             # Classification rules
@@ -7803,22 +7808,21 @@ def preview_contract_end_migration():
             # True if the subscription currently has a schedule.
             has_schedule = schedule_id is not None
 
-            # A simple schedule means:
-            #
+            # A reviewed release schedule means:
             # 1. A schedule exists.
             # 2. The schedule is active.
-            # 3. Its final behavior is to cancel the subscription.
+            # 3. Its end behavior is cancel.
             # 4. It contains exactly one phase.
-            # 5. cancel_at_period_end is not separately enabled.
+            # 5. The phase items can be read and compared by Price ID and quantity.
+            # 6. cancel_at_period_end is not separately enabled.
             #
-            # cancel_at is allowed here because your production results
-            # showed that Stripe displays cancel_at together with these
-            # active cancel schedules.
-            is_simple_cancel_schedule = (
+            # cancel_at is allowed because Stripe commonly sets it from the final schedule end date
+            is_reviewed_release_schedule = (
                 has_schedule
                 and schedule_status == "active"
                 and schedule_end_behavior == "cancel"
                 and schedule_phase_count == 1
+                and all_schedule_phase_items_same
                 and not has_cancel_at_period_end
             )
 
@@ -7862,34 +7866,56 @@ def preview_contract_end_migration():
                 )
 
             # -----------------------------------------------------
-            # Case 3: Simple one-phase cancel schedule
+            # Case 3: Safe schedule release
             # -----------------------------------------------------
 
-            elif is_simple_cancel_schedule:
+            elif is_reviewed_release_schedule:
                 summary["would_release_schedule_count"] += 1
 
                 base_result["action"] = "would_release_schedule"
                 base_result["safe_to_apply"] = True
                 base_result["reason"] = (
-                    "Subscription has one active schedule phase "
-                    "with end_behavior=cancel. Releasing the "
-                    "schedule would stop its future instructions "
-                    "while keeping the current subscription in place."
+                    "Subscription has one active schedule phase with "
+                    "end_behavior=cancel. The schedule can be released "
+                    "and the remaining cancel_at can be cleared."
                 )
 
             # -----------------------------------------------------
-            # Case 4: More complicated schedule
+            # Case 4: Schedule requires manual review
             # -----------------------------------------------------
 
             elif has_schedule:
                 summary["manual_review_count"] += 1
 
+                manual_review_reasons = []
+
+                if schedule_status != "active":
+                    manual_review_reasons.append(f"schedule_status_{schedule_status}")
+
+                if schedule_end_behavior != "cancel":
+                    manual_review_reasons.append(
+                        f"end_behavior_{schedule_end_behavior}"
+                    )
+
+                if schedule_phase_count < 1:
+                    manual_review_reasons.append("schedule_has_no_phases")
+
+                if schedule_phase_count > 1:
+                    manual_review_reasons.append(f"multiple_schedule_phases_{schedule_phase_count}")
+
+                if not all_schedule_phase_items_same:
+                    manual_review_reasons.append(
+                        "schedule_phases_have_different_prices_or_quantities"
+                    )
+
+                if has_cancel_at_period_end:
+                    manual_review_reasons.append("cancel_at_period_end_true")
+
                 base_result["action"] = "manual_review"
                 base_result["safe_to_apply"] = False
                 base_result["reason"] = (
-                    "Subscription has a schedule that is not a "
-                    "simple active one-phase cancel schedule. "
-                    "Review all schedule phases before releasing it."
+                    "Schedule requires manual review: "
+                    + ", ".join(manual_review_reasons)
                 )
 
             # -----------------------------------------------------
@@ -7924,14 +7950,9 @@ def preview_contract_end_migration():
 
     os.makedirs("logs", exist_ok=True)
 
-    timestamp = datetime.now(
-        timezone.utc
-    ).strftime("%Y-%m-%d_%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
 
-    csv_path = os.path.join(
-        "logs",
-        f"contract_end_migration_preview_{timestamp}.csv",
-    )
+    csv_path = os.path.join("logs", f"contract_end_migration_preview_{timestamp}.csv")
 
     fieldnames = [
         "subscription_id",
@@ -7949,18 +7970,14 @@ def preview_contract_end_migration():
         "schedule_phase_count",
         "schedule_last_phase_end",
         "schedule_phases",
+        "all_schedule_phase_items_same",
         "action",
         "safe_to_apply",
         "reason",
         "error",
     ]
 
-    with open(
-        csv_path,
-        "w",
-        newline="",
-        encoding="utf-8-sig",
-    ) as csv_file:
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as csv_file:
         writer = csv.DictWriter(
             csv_file,
             fieldnames=fieldnames,
@@ -7990,9 +8007,7 @@ def preview_contract_end_migration():
         "errors": errors[:50],
         "log_file": csv_path,
 
-        # Only return the first 30 rows in the browser response
-        # so the JSON output is not enormous.
-        #
+        # Only return the first 30 rows in the browser response so the JSON output is not enormous
         # The complete results remain available in the CSV.
         "sample_results": results[:30],
     }
