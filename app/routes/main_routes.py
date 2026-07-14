@@ -8421,3 +8421,485 @@ def audit_manual_review_schedules():
         "log_file": csv_path,
         "results": results,
     }
+
+# Apply one contract-end migration action only.
+# This route is intentionally limited to one subscription per request.
+@main.route("/admin/apply-contract-end-migration-one/<subscription_id>", methods=["POST"])
+def apply_contract_end_migration_one(subscription_id):
+    """
+    LIVE write route for one subscription only.
+
+    Supported actions:
+    - release_schedule
+    - clear_cancel_at
+
+    Every attempt creates a one-row CSV audit log.
+    """
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    confirm = request.form.get("confirm")
+    mode = request.form.get("mode")
+    requested_action = request.form.get("action")
+
+    if confirm != "APPLY":
+        return {
+            "error": "Confirmation required. Submit confirm=APPLY."
+        }, 400
+
+    if mode not in ["test", "live"]:
+        return {
+            "error": "Mode required. Submit mode=test or mode=live."
+        }, 400
+
+    is_live_key = current_app.config["STRIPE_SECRET_KEY"].startswith("sk_live_")
+
+    if mode == "live" and not is_live_key:
+        return {
+            "error": "You submitted mode=live, but Stripe key is not live."
+        }, 400
+
+    if mode == "test" and is_live_key:
+        return {
+            "error": "You submitted mode=test, but Stripe key is live."
+        }, 400
+
+    if requested_action not in ["release_schedule", "clear_cancel_at"]:
+        return {
+            "error": (
+                "Invalid action. Submit action=release_schedule "
+                "or action=clear_cancel_at."
+            )
+        }, 400
+
+    migrated_at = datetime.now(timezone.utc).isoformat()
+
+    log_row = {
+        "migrated_at": migrated_at,
+        "mode": mode,
+        "action": requested_action,
+        "subscription_id": subscription_id,
+        "customer_id": "",
+        "schedule_id_before": "",
+        "status_before": "",
+        "status_after": "",
+        "cancel_at_before": "",
+        "cancel_at_after": "",
+        "cancel_at_period_end_before": "",
+        "cancel_at_period_end_after": "",
+        "billing_cycle_anchor_before": "",
+        "billing_cycle_anchor_after": "",
+        "items_before": [],
+        "items_after": [],
+        "schedule_cleared": False,
+        "cancel_at_cleared": False,
+        "cancel_at_period_end_false": False,
+        "billing_cycle_anchor_unchanged": False,
+        "items_unchanged": False,
+        "subscription_still_billable": False,
+        "verification_passed": False,
+        "result_status": "started",
+        "error": "",
+    }
+
+    try:
+        subscription_before = stripe.Subscription.retrieve(subscription_id)
+
+        customer_reference = stripe_get(subscription_before, "customer")
+
+        if isinstance(customer_reference, str):
+            customer_id = customer_reference
+        else:
+            customer_id = stripe_get(customer_reference, "id")
+
+        status_before = stripe_get(subscription_before, "status")
+        schedule_before = stripe_get(subscription_before, "schedule")
+        cancel_at_before = stripe_get(subscription_before, "cancel_at")
+        cancel_at_period_end_before = stripe_get(
+            subscription_before,
+            "cancel_at_period_end",
+            False,
+        )
+        billing_cycle_anchor_before = stripe_get(subscription_before, "billing_cycle_anchor")
+        items_before = get_contract_end_migration_item_snapshot(subscription_before)
+
+        if isinstance(schedule_before, str):
+            schedule_id_before = schedule_before
+        else:
+            schedule_id_before = stripe_get(schedule_before, "id")
+
+        log_row.update({
+            "customer_id": customer_id or "",
+            "schedule_id_before": schedule_id_before or "",
+            "status_before": status_before or "",
+            "cancel_at_before": cancel_at_before or "",
+            "cancel_at_period_end_before": cancel_at_period_end_before,
+            "billing_cycle_anchor_before": billing_cycle_anchor_before or "",
+            "items_before": items_before,
+        })
+
+        if requested_action == "release_schedule":
+            if not schedule_id_before:
+                log_row["result_status"] = "rejected"
+                log_row["error"] = (
+                    "Subscription does not have an attached schedule."
+                )
+
+                csv_path = write_contract_end_migration_log(log_row)
+
+                return {
+                    "status": "rejected",
+                    "subscription_id": subscription_id,
+                    "action": requested_action,
+                    "error": log_row["error"],
+                    "log_file": csv_path,
+                }, 400
+
+            schedule = stripe.SubscriptionSchedule.retrieve(schedule_id_before)
+
+            schedule_status = stripe_get(schedule, "status")
+            schedule_subscription = stripe_get(schedule, "subscription")
+
+            if isinstance(schedule_subscription, str):
+                schedule_subscription_id = schedule_subscription
+            else:
+                schedule_subscription_id = stripe_get(schedule_subscription,"id")
+
+            if schedule_subscription_id != subscription_id:
+                log_row["result_status"] = "rejected"
+                log_row["error"] = (
+                    "The attached schedule does not belong to "
+                    "the requested subscription."
+                )
+
+                csv_path = write_contract_end_migration_log(log_row)
+
+                return {
+                    "status": "rejected",
+                    "subscription_id": subscription_id,
+                    "schedule_id": schedule_id_before,
+                    "error": log_row["error"],
+                    "log_file": csv_path,
+                }, 400
+
+            if schedule_status not in ["active", "not_started"]:
+                log_row["result_status"] = "rejected"
+                log_row["error"] = (
+                    "Schedule cannot be released because its status is "
+                    f"{schedule_status}."
+                )
+
+                csv_path = write_contract_end_migration_log(log_row)
+
+                return {
+                    "status": "rejected",
+                    "subscription_id": subscription_id,
+                    "schedule_id": schedule_id_before,
+                    "error": log_row["error"],
+                    "log_file": csv_path,
+                }, 400
+
+            stripe.SubscriptionSchedule.release(schedule_id_before)
+
+            # Releasing the schedule removes the schedule association,
+            # but Stripe may leave the old cancel_at date on the subscription.
+            # Clear it so the subscription becomes truly open-ended.
+            stripe.Subscription.modify(
+                subscription_id,
+                cancel_at="",
+                proration_behavior="none",
+            )
+
+        elif requested_action == "clear_cancel_at":
+            if schedule_id_before:
+                log_row["result_status"] = "rejected"
+                log_row["error"] = (
+                    "Subscription has a schedule. Use "
+                    "action=release_schedule instead."
+                )
+
+                csv_path = write_contract_end_migration_log(log_row)
+
+                return {
+                    "status": "rejected",
+                    "subscription_id": subscription_id,
+                    "schedule_id": schedule_id_before,
+                    "error": log_row["error"],
+                    "log_file": csv_path,
+                }, 400
+
+            if cancel_at_before is None:
+                log_row["result_status"] = "rejected"
+                log_row["error"] = (
+                    "Subscription does not have cancel_at set."
+                )
+
+                csv_path = write_contract_end_migration_log(log_row)
+
+                return {
+                    "status": "rejected",
+                    "subscription_id": subscription_id,
+                    "error": log_row["error"],
+                    "log_file": csv_path,
+                }, 400
+
+            stripe.Subscription.modify(
+                subscription_id,
+                cancel_at="",
+                proration_behavior="none",
+            )
+
+        subscription_after = stripe.Subscription.retrieve(subscription_id)
+
+        status_after = stripe_get(subscription_after, "status")
+        schedule_after = stripe_get(subscription_after, "schedule")
+        cancel_at_after = stripe_get(subscription_after, "cancel_at")
+        cancel_at_period_end_after = stripe_get(subscription_after, "cancel_at_period_end", False)
+        billing_cycle_anchor_after = stripe_get(subscription_after, "billing_cycle_anchor")
+        items_after = get_contract_end_migration_item_snapshot(subscription_after)
+
+        schedule_cleared = schedule_after is None
+        cancel_at_cleared = cancel_at_after is None
+        cancel_at_period_end_false = cancel_at_period_end_after is False
+
+        billing_cycle_anchor_unchanged = (
+            billing_cycle_anchor_before == billing_cycle_anchor_after
+        )
+
+        items_unchanged = items_before == items_after
+
+        subscription_still_billable = (
+            status_after in INSPECTION_BILLABLE_STATUSES
+        )
+
+        verification_passed = (
+            schedule_cleared
+            and cancel_at_cleared
+            and cancel_at_period_end_false
+            and billing_cycle_anchor_unchanged
+            and items_unchanged
+            and subscription_still_billable
+        )
+
+        log_row.update({
+            "status_after": status_after or "",
+            "cancel_at_after": cancel_at_after or "",
+            "cancel_at_period_end_after": cancel_at_period_end_after,
+            "billing_cycle_anchor_after": billing_cycle_anchor_after or "",
+            "items_after": items_after,
+            "schedule_cleared": schedule_cleared,
+            "cancel_at_cleared": cancel_at_cleared,
+            "cancel_at_period_end_false": cancel_at_period_end_false,
+            "billing_cycle_anchor_unchanged": (
+                billing_cycle_anchor_unchanged
+            ),
+            "items_unchanged": items_unchanged,
+            "subscription_still_billable": (
+                subscription_still_billable
+            ),
+            "verification_passed": verification_passed,
+            "result_status": (
+                "verified_success"
+                if verification_passed
+                else "verification_failed"
+            ),
+        })
+
+        csv_path = write_contract_end_migration_log(log_row)
+
+        response_status = 200 if verification_passed else 500
+
+        return {
+            "status": log_row["result_status"],
+            "mode": mode,
+            "action": requested_action,
+            "subscription_id": subscription_id,
+            "customer_id": customer_id,
+            "verification_passed": verification_passed,
+            "before": {
+                "status": status_before,
+                "schedule": schedule_id_before,
+                "cancel_at": cancel_at_before,
+                "cancel_at_period_end": cancel_at_period_end_before,
+                "billing_cycle_anchor": billing_cycle_anchor_before,
+                "items": items_before,
+            },
+            "after": {
+                "status": status_after,
+                "schedule": schedule_after,
+                "cancel_at": cancel_at_after,
+                "cancel_at_period_end": cancel_at_period_end_after,
+                "billing_cycle_anchor": billing_cycle_anchor_after,
+                "items": items_after,
+            },
+            "checks": {
+                "schedule_cleared": schedule_cleared,
+                "cancel_at_cleared": cancel_at_cleared,
+                "cancel_at_period_end_false": (
+                    cancel_at_period_end_false
+                ),
+                "billing_cycle_anchor_unchanged": (
+                    billing_cycle_anchor_unchanged
+                ),
+                "items_unchanged": items_unchanged,
+                "subscription_still_billable": (
+                    subscription_still_billable
+                ),
+            },
+            "log_file": csv_path,
+        }, response_status
+
+    except stripe.error.StripeError as stripe_error:
+        log_row["result_status"] = "stripe_error"
+        log_row["error"] = str(stripe_error)
+
+        csv_path = write_contract_end_migration_log(log_row)
+
+        return {
+            "status": "failed",
+            "subscription_id": subscription_id,
+            "action": requested_action,
+            "error": str(stripe_error),
+            "log_file": csv_path,
+        }, 500
+
+    except Exception as error:
+        log_row["result_status"] = "unexpected_error"
+        log_row["error"] = str(error)
+
+        csv_path = write_contract_end_migration_log(log_row)
+
+        return {
+            "status": "failed",
+            "subscription_id": subscription_id,
+            "action": requested_action,
+            "error": str(error),
+            "log_file": csv_path,
+        }, 500
+
+@main.route("/admin/debug-subscription-schedule/<schedule_id>")
+def debug_subscription_schedule(schedule_id):
+    if not session.get("logged_in"):
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    schedule = stripe.SubscriptionSchedule.retrieve(schedule_id)
+
+    phases = stripe_get(schedule, "phases", []) or []
+
+    phase_results = []
+
+    for index, phase in enumerate(phases, start=1):
+        phase_items = []
+
+        for phase_item in stripe_get(phase, "items", []) or []:
+            price_reference = stripe_get(phase_item, "price")
+
+            if isinstance(price_reference, str):
+                price_id = price_reference
+            else:
+                price_id = stripe_get(price_reference, "id")
+
+            phase_items.append({
+                "price_id": price_id,
+                "quantity": stripe_get(phase_item, "quantity", 1),
+            })
+
+        phase_results.append({
+            "phase_number": index,
+            "start_date": stripe_get(phase, "start_date"),
+            "end_date": stripe_get(phase, "end_date"),
+            "proration_behavior": stripe_get(phase, "proration_behavior"),
+            "items": phase_items,
+        })
+
+    return {
+        "schedule_id": stripe_get(schedule, "id"),
+        "subscription_id": stripe_get(schedule, "subscription"),
+        "status": stripe_get(schedule, "status"),
+        "end_behavior": stripe_get(schedule, "end_behavior"),
+        "phase_count": len(phases),
+        "phases": phase_results,
+    }
+
+def get_contract_end_migration_item_snapshot(subscription):
+    items_object = stripe_get(subscription, "items", {})
+    subscription_items = stripe_get(items_object, "data", []) or []
+
+    item_snapshot = []
+
+    for item in subscription_items:
+        price = stripe_get(item, "price", {}) or {}
+
+        item_snapshot.append({
+            "subscription_item_id": stripe_get(item, "id"),
+            "price_id": stripe_get(price, "id"),
+            "quantity": stripe_get(item, "quantity", 1),
+        })
+
+    item_snapshot.sort(
+        key=lambda item: (
+            str(item["subscription_item_id"]),
+            str(item["price_id"]),
+            item["quantity"],
+        )
+    )
+
+    return item_snapshot
+
+
+def write_contract_end_migration_log(log_row):
+    os.makedirs("logs", exist_ok=True)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S_%f")
+
+    csv_path = os.path.join(
+        "logs",
+        f"contract_end_migration_one_{timestamp}.csv",
+    )
+
+    fieldnames = [
+        "migrated_at",
+        "mode",
+        "action",
+        "subscription_id",
+        "customer_id",
+        "schedule_id_before",
+        "status_before",
+        "status_after",
+        "cancel_at_before",
+        "cancel_at_after",
+        "cancel_at_period_end_before",
+        "cancel_at_period_end_after",
+        "billing_cycle_anchor_before",
+        "billing_cycle_anchor_after",
+        "items_before",
+        "items_after",
+        "schedule_cleared",
+        "cancel_at_cleared",
+        "cancel_at_period_end_false",
+        "billing_cycle_anchor_unchanged",
+        "items_unchanged",
+        "subscription_still_billable",
+        "verification_passed",
+        "result_status",
+        "error",
+    ]
+
+    csv_row = log_row.copy()
+    csv_row["items_before"] = json.dumps(
+        log_row.get("items_before", []),
+        sort_keys=True,
+    )
+    csv_row["items_after"] = json.dumps(
+        log_row.get("items_after", []),
+        sort_keys=True,
+    )
+
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow(csv_row)
+
+    return csv_path
