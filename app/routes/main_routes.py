@@ -7169,6 +7169,124 @@ def write_subscription_item_metadata_csv(results, filename_prefix):
 
     return csv_path
 
+# 
+def build_phase_business_signature(phase):
+    items = []
+
+    for item in stripe_get(phase, "items", []):
+        price = stripe_get(item, "price", {})
+        price_id = (
+            stripe_get(price, "id")
+            if not isinstance(price, str)
+            else price
+        )
+
+        item_signature = {
+            "price_id": price_id,
+            "quantity": stripe_get(item, "quantity", 1),
+            "tax_rates": sorted([
+                stripe_get(tax_rate, "id")
+                if not isinstance(tax_rate, str)
+                else tax_rate
+                for tax_rate in stripe_get(item, "tax_rates", [])
+            ]),
+        }
+
+        items.append(item_signature)
+
+    items.sort(
+        key=lambda item: (
+            item["price_id"] or "",
+            item["quantity"],
+            tuple(item["tax_rates"]),
+        )
+    )
+
+    return {
+        "items": items,
+        "add_invoice_items": stripe_value_to_plain_python(stripe_get(phase, "add_invoice_items", []) or []),
+        "discounts": stripe_value_to_plain_python(stripe_get(phase, "discounts", []) or []),
+        "default_tax_rates": sorted([
+            stripe_get(tax_rate, "id")
+            if not isinstance(tax_rate, str)
+            else tax_rate
+            for tax_rate in stripe_get(
+                phase,
+                "default_tax_rates",
+                [],
+            )
+        ]),
+        "automatic_tax": stripe_value_to_plain_python(stripe_get(phase, "automatic_tax")),
+        "collection_method": stripe_get(
+            phase,
+            "collection_method",
+        ),
+        "default_payment_method": stripe_get(
+            phase,
+            "default_payment_method",
+        ),
+        "invoice_settings": stripe_value_to_plain_python(stripe_get(phase, "invoice_settings")),
+        "billing_cycle_anchor": stripe_get(
+            phase,
+            "billing_cycle_anchor",
+        ),
+        "billing_thresholds": stripe_value_to_plain_python(stripe_get(phase, "billing_thresholds")),
+        "trial_end": stripe_get(
+            phase,
+            "trial_end",
+        ),
+        "metadata": stripe_metadata_to_dict(stripe_get(phase, "metadata", {}) or {}),
+    }
+
+# {} in the printed output does not guarantee the object is a Python dict.
+# Many libraries (Stripe, SQLAlchemy, Pydantic, etc.) create custom objects that behave like dictionaries and print like dictionaries, but are actually custom classes underneath.
+# json.dumps() only knows how to serialize standard Python types unless you convert those custom objects first.
+# Serialize = convert an object into a format that can be stored or sent somewhere else.
+# Think of it as packing an object into a standard format.
+def stripe_value_to_plain_python(value):
+    if value is None:
+        return None
+
+    if hasattr(value, "to_dict_recursive"):
+        return stripe_value_to_plain_python(
+            value.to_dict_recursive()
+        )
+
+    if isinstance(value, dict):
+        return {
+            str(key): stripe_value_to_plain_python(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple)):
+        return [
+            stripe_value_to_plain_python(item)
+            for item in value
+        ]
+
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    return str(value)
+
+# signature_differences
+def get_signature_differences(
+    first_signature,
+    other_signature,
+):
+    differences = []
+
+    all_keys = sorted(
+        set(first_signature.keys())
+        | set(other_signature.keys())
+    )
+
+    for key in all_keys:
+        if first_signature.get(key) != other_signature.get(key):
+            differences.append(key)
+
+    return differences
+
 # preview-subscription-item-metadata
 @main.route("/admin/preview-subscription-item-metadata", methods=["GET"])
 def preview_subscription_item_metadata():
@@ -7532,6 +7650,7 @@ def preview_contract_end_migration():
         "would_release_schedule_count": 0,
         "manual_review_count": 0,
         "error_count": 0,
+        "would_release_equivalent_two_phase_schedule_count": 0,
     }
 
     # Reuse the statuses already defined for inspection-fee work:
@@ -7618,6 +7737,7 @@ def preview_contract_end_migration():
             schedule_phases = []
             # A signature is a simplified list used to compare the billing items in every schedule phase
             schedule_phase_signatures = []
+            phases = []
 
             # Start building the result row now.
             # We fill in the schedule information afterward.
@@ -7638,6 +7758,8 @@ def preview_contract_end_migration():
                 "schedule_last_phase_end": "",
                 "schedule_phases": [],
                 "all_schedule_phase_items_same": False,
+                "all_phase_business_settings_same": False,
+                "phase_business_differences": [],
                 "action": "",
                 "safe_to_apply": False,
                 "reason": "",
@@ -7767,6 +7889,9 @@ def preview_contract_end_migration():
                     continue
 
             all_schedule_phase_items_same = False
+            all_phase_business_settings_same = False
+            phase_business_differences = []
+            phase_business_signatures = []
 
             if schedule_phase_signatures:
                 first_phase_signature = schedule_phase_signatures[0]
@@ -7786,6 +7911,51 @@ def preview_contract_end_migration():
                 #         all_schedule_phase_items_same = False
                 #         break
 
+                phase_business_signatures = [
+                    build_phase_business_signature(phase)
+                    for phase in phases
+                ]
+
+                first_phase_business_signature = (
+                    phase_business_signatures[0]
+                    if phase_business_signatures
+                    else None
+                )
+
+                all_phase_business_settings_same = (
+                    bool(phase_business_signatures)
+                    and all(
+                        signature == first_phase_business_signature
+                        for signature in phase_business_signatures
+                    )
+                )
+
+                if len(phase_business_signatures) > 1:
+                    for phase_number, signature in enumerate(
+                        phase_business_signatures[1:],
+                        start=2,
+                    ):
+                        differing_fields = get_signature_differences(
+                            first_phase_business_signature,
+                            signature,
+                        )
+
+                        # to show the exact values for each differing field
+                        if differing_fields:
+                            field_values = {}
+
+                            for field in differing_fields:
+                                field_values[field] = {
+                                    "phase_1": first_phase_business_signature[field],
+                                    f"phase_{phase_number}": signature[field],
+                                }
+
+                            phase_business_differences.append({
+                                "phase_number": phase_number,
+                                "fields": differing_fields,
+                                "values": field_values,
+                            })
+
             # Add the schedule information to the result row.
             base_result["schedule_id"] = schedule_id or ""
             base_result["schedule_status"] = schedule_status or ""
@@ -7794,6 +7964,8 @@ def preview_contract_end_migration():
             base_result["schedule_last_phase_end"] = schedule_last_phase_end or ""
             base_result["schedule_phases"] = schedule_phases
             base_result["all_schedule_phase_items_same"] = all_schedule_phase_items_same
+            base_result["all_phase_business_settings_same"] = all_phase_business_settings_same
+            base_result["phase_business_differences"] = phase_business_differences
 
             # -----------------------------------------------------
             # Classification rules
@@ -7823,6 +7995,16 @@ def preview_contract_end_migration():
                 and schedule_end_behavior == "cancel"
                 and schedule_phase_count == 1
                 and all_schedule_phase_items_same
+                and not has_cancel_at_period_end
+            )
+
+            is_reviewed_equivalent_two_phase_schedule = (
+                has_schedule
+                and schedule_status == "active"
+                and schedule_end_behavior == "cancel"
+                and schedule_phase_count == 2
+                and all_schedule_phase_items_same
+                and all_phase_business_settings_same
                 and not has_cancel_at_period_end
             )
 
@@ -7880,6 +8062,16 @@ def preview_contract_end_migration():
                     "and the remaining cancel_at can be cleared."
                 )
 
+            elif is_reviewed_equivalent_two_phase_schedule:
+                summary["would_release_equivalent_two_phase_schedule_count"] += 1
+
+                base_result["action"] = "would_release_equivalent_two_phase_schedule"
+                base_result["safe_to_apply"] = True
+                base_result["reason"] = (
+                    "Subscription has two equivalent schedule phases. "
+                    "Only phase timing or ignored transition fields differ."
+                )
+
             # -----------------------------------------------------
             # Case 4: Schedule requires manual review
             # -----------------------------------------------------
@@ -7900,8 +8092,19 @@ def preview_contract_end_migration():
                 if schedule_phase_count < 1:
                     manual_review_reasons.append("schedule_has_no_phases")
 
-                if schedule_phase_count > 1:
+                if (
+                    schedule_phase_count > 1
+                    and not all_phase_business_settings_same
+                ):
                     manual_review_reasons.append(f"multiple_schedule_phases_{schedule_phase_count}")
+
+                if (
+                    schedule_phase_count > 1
+                    and not all_phase_business_settings_same
+                ):
+                    manual_review_reasons.append(
+                        "schedule_phases_have_different_business_settings"
+                    )
 
                 if not all_schedule_phase_items_same:
                     manual_review_reasons.append(
@@ -7971,6 +8174,8 @@ def preview_contract_end_migration():
         "schedule_last_phase_end",
         "schedule_phases",
         "all_schedule_phase_items_same",
+        "all_phase_business_settings_same",
+        "phase_business_differences",
         "action",
         "safe_to_apply",
         "reason",
@@ -7990,8 +8195,21 @@ def preview_contract_end_migration():
 
             # A CSV cell cannot directly contain a Python list.
             # Convert schedule_phases into JSON text first.
+            # json.dumps()
+            # The s means: returns a String
+            # Before dict -> json.dumps() -> str
+
+            # What does json.dump() do? No s
+            # Instead of returning a string,it writes directly into a file
+
+            # loads means  JSON string  ->  Python object
             csv_row["schedule_phases"] = json.dumps(
                 result.get("schedule_phases", []),
+                sort_keys=True,
+            )
+
+            csv_row["phase_business_differences"] = json.dumps(
+                stripe_value_to_plain_python(result.get("phase_business_differences", [])),
                 sort_keys=True,
             )
 
@@ -8009,7 +8227,20 @@ def preview_contract_end_migration():
 
         # Only return the first 30 rows in the browser response so the JSON output is not enormous
         # The complete results remain available in the CSV.
-        "sample_results": results[:30],
+        # "sample_results": results[:30],
+
+        # to view "manual_review" result only
+        "sample_results": [
+            result 
+            for result in results 
+            if result["action"] == "manual_review"
+        ],
+        # is exactly equivalent to:
+        # sample_results = []
+
+        # for result in results:
+        #     if result["action"] == "manual_review":
+        #         sample_results.append(result)
     }
 
 # Read-only audit of subscriptions whose schedules are more complex
