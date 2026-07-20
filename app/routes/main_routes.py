@@ -9652,3 +9652,261 @@ def apply_contract_end_migration_all():
             == "verified_success"
         ][:20],
     }
+
+# Classification of inspection fee 
+def classify_expired_inspection_fee_subscription(subscription, customer_description, today):
+    billable_statuses = {
+        "active",
+        "past_due",
+        "unpaid"
+    }
+
+    metadata = stripe_metadata_to_dict(stripe_get(subscription, "metadata", {}) or {})
+    # inspection_fee_end_date_raw contains text (it is a string), not a date
+    # and strings do not have .isoformat()
+    inspection_fee_end_date_raw = metadata.get("inspection_fee_end_date")
+
+    inspection_fee_status = metadata.get("inspection_fee_status")
+    status = stripe_get(subscription, "status")
+
+    inspection_items = []
+    monthly_service_items = []
+    other_items = []
+
+    subscription_items = stripe_get(subscription, "items", {}) or {}
+    item_data = stripe_get(subscription_items, "data", []) or []
+
+    for item in item_data:
+        item_metadata = stripe_metadata_to_dict(stripe_get(item, "metadata", {}) or {})
+        item_type = item_metadata.get("item_type")
+
+        if item_type == "inspection_fee":
+            inspection_items.append(item)
+        elif item_type == "monthly_service_fee": 
+            monthly_service_items.append(item)
+        else:
+            other_items.append(item)
+
+    subscription_id = stripe_get(subscription, "id")
+
+    customer = stripe_get(subscription, "customer")
+
+    if isinstance(customer, str):
+        customer_id = customer
+    else: 
+        customer_id = stripe_get(customer, "id")
+
+    schedule = stripe_get(subscription, "schedule")
+    cancel_at = stripe_get(subscription, "cancel_at")
+    cancel_at_period_end = stripe_get(subscription, "cancel_at_period_end")
+    billing_cycle_anchor = stripe_get(subscription, "billing_cycle_anchor")
+    inspection_item_id = None
+
+    if schedule is None or isinstance(schedule, str):
+        schedule_id = schedule
+    else:
+        schedule_id = stripe_get(schedule, "id")
+
+    result = {
+        "subscription_id": subscription_id,
+        "customer_id": customer_id,
+        "subscription_status": status,
+        "inspection_fee_end_date": inspection_fee_end_date_raw,
+        "inspection_fee_status": inspection_fee_status,
+        "inspection_item_count": len(inspection_items),
+        "monthly_service_item_count": len(monthly_service_items),
+        "other_item_count": len(other_items),
+        "classification": None,
+        "safe_to_apply": False,
+        "reason": None,
+        "schedule_id": schedule_id,
+        "cancel_at": cancel_at,
+        "cancel_at_period_end": cancel_at_period_end,
+        "billing_cycle_anchor": billing_cycle_anchor,
+        "inspection_item_id": inspection_item_id
+    }
+
+    if status not in billable_statuses:
+        result["classification"] = "manual_review"
+        result["reason"] = f"Subscription status is not billable: {status}"
+
+        return result
+    
+    if schedule_id:
+        result["classification"] = "manual_review"
+        result["reason"] = f"Attached schedule exists: {schedule_id}"
+
+        return result
+
+    if cancel_at is not None or cancel_at_period_end is True:
+        result["classification"] = "manual_review"
+        result["reason"] = "Subscription is not fully open-ended."
+
+        return result
+    
+    # Ottawa rule
+    normalized_description = (customer_description or "").strip()
+    is_ottawa = normalized_description.startswith("3")
+
+    if is_ottawa and len(inspection_items) >= 1:
+        result["classification"] = "manual_review"
+        result["reason"] = "Ottawa subscriptions should not contain an inspection fee item. "
+
+        return result
+    
+    if is_ottawa and len(inspection_items) == 0:
+        result["classification"] = "not_applicable"
+        result["reason"] = "Ottawa subscription correctly has no inspection fee item."
+
+        return result
+
+    if not inspection_fee_end_date_raw: 
+        result["classification"] = "manual_review"
+        result["reason"] = "Inspection fee end date is missing. "
+
+        return result
+
+    try: 
+        # convert string into an actual date object
+        # asking the date class to take this string and create a date object from it
+        inspection_fee_end_date = date.fromisoformat(inspection_fee_end_date_raw)
+
+    except (TypeError, ValueError):
+        result["classification"] = "manual_review"
+        result["reason"] = f"Invalid inspection fee end date: {inspection_fee_end_date_raw}"
+
+        return result
+    
+    # .isoformat() converts the date into text
+    result["inspection_fee_end_date"] = inspection_fee_end_date.isoformat()
+
+    if today < inspection_fee_end_date:
+        result["classification"] = "not_due_yet"
+        result["reason"] = f"Inspection fee does not expire until {inspection_fee_end_date.isoformat()}"
+
+        return result
+
+    if len(monthly_service_items) != 1:
+        result["classification"] = "manual_review"
+        result["reason"] = f"Expected exactly 1 monthly service item, but found {len(monthly_service_items)}."
+
+        return result
+    
+    if len(inspection_items) != 1:
+        result["classification"] = "manual_review"
+        result["reason"] = f"Expected exactly 1 inspection fee item, but found {len(inspection_items)}."
+
+        return result
+
+    if len(other_items) != 0:
+        result["classification"] = "manual_review"
+        result["reason"] = f"Expected 0 unrecognized subscription items, but found {len(other_items)}."
+
+        return result
+    
+    inspection_item = inspection_items[0]
+    inspection_item_id = stripe_get(inspection_item, "id")
+
+    result["inspection_item_id"] = inspection_item_id
+
+    if inspection_fee_status != "active":
+        result["classification"] = "manual_review"
+        result["reason"] = f"Expected inspection_fee_status to be active, but found: {inspection_fee_status!r}"
+        # The !r makes missing or unusual values obvious: None, '', 'ACTIVE'
+
+        return result
+
+    result["classification"] = "would_remove_inspection_fee"
+    result["safe_to_apply"] = True
+    result["reason"] = "Inspection fee has expired and is eligible for removal."
+
+    return result
+
+# Preview route of inspection fee
+@main.route("/admin/preview-expired-inspection-fees")
+def preview_expired_inspection_fees():
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    target_subscription_id = request.args.get("subscription_id")
+    today = datetime.now(timezone.utc).date()
+
+    billable_statuses = [
+        "active",
+        "past_due",
+        "unpaid",
+    ]
+
+    results = []
+
+    classification_counts = {
+        "would_remove_inspection_fee": 0,
+        "not_due_yet": 0,
+        "not_applicable": 0,
+        "manual_review": 0,
+    }
+
+    # a targeted subscription
+    if target_subscription_id: 
+        subscription = stripe.Subscription.retrieve(
+            target_subscription_id,
+            expand=["customer"]
+        )
+
+        customer = stripe_get(subscription, "customer")
+
+        customer_description = stripe_get(customer, "description", "")
+
+        result = classify_expired_inspection_fee_subscription(
+            subscription=subscription,
+            customer_description=customer_description,
+            today=today,
+        )
+
+        results.append(result)
+
+        classification = result["classification"]
+
+        # The second argument in .get() is a default value
+        # Give me the current count for this classification. If no count exists yet, pretend its current count is zero
+        classification_counts[classification] = classification_counts.get(classification, 0) + 1
+        # same as classification_counts[classification] += 1 
+        # but it will crash if the classifier ever returns an unexpected classification. The .get(classification, 0) version is more defensive.
+
+    # For the bulk path
+    else:
+        for status in billable_statuses:
+            subscriptions = stripe.Subscription.list(
+                status=status,
+                limit=100,
+                expand=["data.customer"],
+            )
+
+            for subscription in subscriptions.auto_paging_iter():
+                customer = stripe_get(subscription, "customer")
+
+                customer_description = stripe_get(customer, "description", "")
+
+                result = classify_expired_inspection_fee_subscription(
+                    subscription=subscription,
+                    customer_description=customer_description,
+                    today=today,
+                )
+
+                results.append(result)
+
+                classification = result["classification"]
+
+                classification_counts[classification] = classification_counts.get(classification, 0) + 1
+
+    safe_to_apply_count = sum(1 for result in results if result["safe_to_apply"] is True)
+
+    return {
+        "read_only": True,
+        "target_subscription_id": target_subscription_id,
+        "today": today.isoformat(),
+        "checked_count": len(results),
+        "safe_to_apply_count": safe_to_apply_count,
+        "classification_counts": classification_counts,
+        "results": results,
+    }
+
