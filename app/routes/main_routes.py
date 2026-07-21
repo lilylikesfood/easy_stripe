@@ -3294,6 +3294,228 @@ def debug_carry_forward_invoice(invoice_id):
         "collection_method": stripe_get(invoice, "collection_method")
     }
 
+# debug accounting and tax composition
+@main.route("/admin/debug-invoice-accounting/<invoice_id>", methods=["GET"])
+def debug_invoice_accounting(invoice_id):
+    """
+    Read-only accounting and tax inspection for one Stripe invoice.
+
+    This route does not create, modify, void, pay, or finalize anything.
+    """
+
+    if not session.get("logged_in"):
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    try: 
+        invoice = stripe.Invoice.retrieve(
+            invoice_id,
+            expand=["customer", "lines.data.price.product"]
+            )
+        
+    except stripe.error.StripeError as error:
+        return {
+            "status": "failed",
+            "read_only": True,
+            "invoice_id": invoice_id,
+            "error": str(error),
+        }, 400
+
+    customer = stripe_get(invoice, "customer")
+
+    if isinstance(customer, str):
+        customer_id = customer
+        customer_name = None
+        customer_email = None
+
+    else: 
+        customer_id = stripe_get(customer, "id")
+        customer_name = stripe_get(customer, "name")
+        customer_email = stripe_get(customer, "email")
+
+    total_tax_amounts = []
+
+    for tax_amount in stripe_get(invoice, "total_tax_amounts", []) or []:
+        tax_rate_reference = stripe_get(tax_amount, "tax_rate")
+
+        if isinstance(tax_rate_reference, str):
+            tax_rate_id = tax_rate_reference
+            tax_rate_percentage = None
+            tax_rate_display_name = None
+
+        else: 
+            tax_rate_id = stripe_get(tax_rate_reference, "id")
+            tax_rate_percentage = stripe_get(tax_rate_reference, "percentage")
+            tax_rate_display_name = stripe_get(tax_rate_reference, "display_name")
+
+        total_tax_amounts.append({
+            "amount_cents": stripe_get(tax_amount, "amount", 0),
+            "amount": cents_to_money(stripe_get(tax_amount, "amount", 0)),
+            "inclusive": stripe_get(tax_amount, "inclusive"),
+            "tax_rate_id": tax_rate_id,
+            "tax_rate_percentage": tax_rate_percentage,
+            "tax_rate_display_name": tax_rate_display_name,
+            "taxability_reason": stripe_get(tax_amount, "taxability_reason"),
+        })
+
+    line_results = []
+
+    lines = stripe_get(invoice, "lines", {})
+    line_data = stripe_get(lines, "data", []) or []
+
+    for line in line_data:
+        line_metadata = stripe_metadata_to_dict(stripe_get(line, "metadata", {}) or {})
+
+        price = stripe_get(line, "price", {}) or {}
+        price_id = stripe_get(price, "id")
+        tax_behavior = stripe_get(price, "tax_behavior")
+        product_reference = stripe_get(price, "product")
+
+        if isinstance(product_reference, str): 
+            product_id = product_reference
+            product_name = None
+            product_tax_code = None
+
+        else:
+            product_id = stripe_get(product_reference, "id")
+            product_name = stripe_get(product_reference, "name")
+            tax_code_reference = stripe_get(product_reference, "tax_code")
+
+            if isinstance(tax_code_reference, str):
+                product_tax_code = tax_code_reference
+            else:
+                product_tax_code = stripe_get(tax_code_reference, "id")
+
+        line_tax_amounts = []
+
+        for tax_amount in stripe_get(line, "tax_amounts", []) or []:
+            tax_rate_reference = stripe_get(tax_amount, "tax_rate")
+
+            if isinstance(tax_rate_reference, str):
+                tax_rate_id = tax_rate_reference
+                tax_rate_percentage = None
+                tax_rate_display_name = None
+
+            else:
+                tax_rate_id = stripe_get(tax_rate_reference, "id")
+                tax_rate_percentage = stripe_get(tax_rate_reference, "percentage")
+                tax_rate_display_name = stripe_get(tax_rate_reference, "display_name")
+
+            line_tax_amounts.append({
+                "amount_cents": stripe_get(tax_amount, "amount", 0),
+                "amount": cents_to_money(stripe_get(tax_amount, "amount", 0)),
+                "inclusive": stripe_get(tax_amount, "inclusive"),
+                "tax_rate_id": tax_rate_id,
+                "tax_rate_percentage": tax_rate_percentage,
+                "tax_rate_display_name": tax_rate_display_name,
+                "taxability_reason": stripe_get(tax_amount, "taxability_reason"),
+            })
+
+        amount_excluding_tax = stripe_get(line, "amount_excluding_tax")
+
+        line_results.append({
+            "line_id": stripe_get(line, "id"),
+            "type": stripe_get(line, "type"),
+            "description": stripe_get(line, "description"),
+            "amount_cents": stripe_get(line, "amount", 0),
+            "amount": cents_to_money(stripe_get(line, "amount", 0)),
+            "amount_excluding_tax_cents": amount_excluding_tax,
+            "amount_excluding_tax": cents_to_money(amount_excluding_tax) if amount_excluding_tax is not None else None,
+            "currency": stripe_get(line, "currency"),
+            "quantity": stripe_get(line, "quantity"),
+            "invoice_item_id": stripe_get(line, "invoice_item"),
+            "subscription_item_id": stripe_get(line, "subscription_item"),
+            "price_id": price_id,
+            "price_tax_behavior": tax_behavior,
+            "product_id": product_id,
+            "product_name": product_name,
+            "product_tax_code": product_tax_code,
+            "metadata": line_metadata,
+            "tax_amounts": line_tax_amounts,
+            "taxes_raw": stripe_value_to_plain_python(stripe_get(line, "taxes", []) or []),
+            "discount_amounts": stripe_value_to_plain_python(stripe_get(line, "discount_amounts", []) or []),
+            "period": stripe_value_to_plain_python(stripe_get(line, "period")),
+            "parent_raw": stripe_value_to_plain_python(stripe_get(line, "parent")),
+            "pricing_raw": stripe_value_to_plain_python(stripe_get(line, "pricing")),
+        })
+
+    total_taxes_raw = stripe_get(invoice, "total_taxes", []) or []
+    calculated_tax_cents = 0
+
+    for tax_entry in total_taxes_raw:
+        calculated_tax_cents += stripe_get(tax_entry, "amount", 0)
+
+    return {
+        "status": "success",
+        "read_only": True,
+        "invoice": {
+            "invoice_id": stripe_get(invoice, "id"),
+            "invoice_number": stripe_get(invoice, "number"),
+            "status": stripe_get(invoice, "status"),
+            "currency": stripe_get(invoice, "currency"),
+            "collection_method": stripe_get(invoice, "collection_method"),
+            "automatic_tax": stripe_value_to_plain_python(stripe_get(invoice, "automatic_tax")),
+            "subtotal_cents": stripe_get(invoice, "subtotal", 0),
+            "subtotal": cents_to_money(stripe_get(invoice, "subtotal", 0)),
+
+            "subtotal_excluding_tax_cents": stripe_get(invoice, "subtotal_excluding_tax"),
+            "subtotal_excluding_tax": (
+                cents_to_money(stripe_get(invoice, "subtotal_excluding_tax" )) 
+                if stripe_get(invoice, "subtotal_excluding_tax") is not None else None
+            ),
+
+            "total_cents": stripe_get(invoice, "total", 0),
+            "total": cents_to_money(stripe_get(invoice, "total", 0)),
+
+            "total_excluding_tax_cents": stripe_get(invoice, "total_excluding_tax"),
+            "total_excluding_tax": (
+                cents_to_money(stripe_get(invoice, "total_excluding_tax"))
+                if stripe_get(invoice, "total_excluding_tax") is not None else None
+            ),
+
+            "legacy_tax_field_cents": stripe_get(invoice, "tax", 0),
+            "legacy_tax_field": cents_to_money(stripe_get(invoice, "tax", 0)),
+
+            "calculated_tax_cents": calculated_tax_cents,
+            "calculated_tax": cents_to_money(calculated_tax_cents),
+
+            "amount_due_cents": stripe_get(invoice, "amount_due", 0),
+            "amount_due": cents_to_money(stripe_get(invoice, "amount_due", 0)),
+
+            "amount_paid_cents": stripe_get(invoice, "amount_paid", 0),
+            "amount_paid": cents_to_money(stripe_get(invoice, "amount_paid", 0)),
+
+            "amount_remaining_cents": stripe_get(invoice, "amount_remaining", 0),
+            "amount_remaining": cents_to_money(stripe_get(invoice, "amount_remaining", 0) ),
+
+            "starting_balance_cents": stripe_get(invoice, "starting_balance", 0),
+            "starting_balance": cents_to_money(stripe_get(invoice, "starting_balance", 0)),
+
+            "ending_balance_cents": stripe_get(invoice, "ending_balance", 0),
+            "ending_balance": cents_to_money(stripe_get(invoice, "ending_balance", 0)),
+
+            "pre_payment_credit_notes_amount_cents": stripe_get(invoice, "pre_payment_credit_notes_amount", 0),
+            "post_payment_credit_notes_amount_cents": stripe_get(invoice, "post_payment_credit_notes_amount", 0),
+
+            "total_discount_amounts": stripe_value_to_plain_python(stripe_get(invoice, "total_discount_amounts", []) or []),
+
+            "total_tax_amounts": total_tax_amounts,
+            "total_taxes_raw": stripe_value_to_plain_python(stripe_get(invoice, "total_taxes", []) or []),
+            "created": stripe_get(invoice, "created"),
+            "due_date": stripe_get(invoice, "due_date"),
+        },
+
+        "customer": {
+            "customer_id": customer_id,
+            "customer_name": customer_name,
+            "customer_email": customer_email,
+        },
+
+        "line_count": len(line_results),
+        "lines": line_results,
+    }
+
 # debug customer
 @main.route("/admin/debug-customer/<customer_id>")
 def debug_customer(customer_id):
