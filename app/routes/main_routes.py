@@ -10447,3 +10447,66 @@ def create_expired_inspection_fee_test_subscription():
         ),
         "inspection_fee_status": "active",
     }
+
+# bulk apply to remove expire inspection fee
+@main.route("/admin/apply-expired-inspection-fees-all", methods=["POST"])
+def apply_expired_inspection_fees_all():
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    confirm = request.form.get("confirm")
+
+    if confirm != "APPLY":
+        return {
+            "error": "Confirmation required. Submit confirm=APPLY."
+        }, 400
+
+    mode = request.form.get("mode")
+
+    if mode not in [
+        "test",
+        "live",
+    ]:
+        return {
+            "error": "Mode required. Submit mode=test or mode=live."
+        }, 400
+
+    is_live_key = current_app.config["STRIPE_SECRET_KEY"].startswith("sk_live_")
+
+    if mode == "live" and not is_live_key:
+        return {
+            "error": "You submitted mode=live, but Stripe key is not live."
+        }, 400
+
+    if mode == "test" and is_live_key:
+        return {
+            "error": "You submitted mode=test, but Stripe key is live."
+        }, 400
+
+    # Validate controlled batch size
+    max_apply_raw = request.form.get("max_apply")
+
+    if not max_apply_raw:
+        return {
+            "error": "max_apply is required. For example, submit max_apply=5."
+        }, 400
+
+    try:
+        max_apply = int(max_apply_raw)
+
+    except ValueError:
+        return {
+            "error": "max_apply must be a whole number."
+        }, 400
+
+    if max_apply < 1:
+        return {
+            "error": "max_apply must be at least 1."
+        }, 400
+
+    # Prevent an accidental absurd value
+    if max_apply > 1000:
+        return {
+            "error": "max_apply cannot be greater than 1000."
+        }, 400
+
+    
