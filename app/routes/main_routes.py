@@ -2927,7 +2927,7 @@ def carry_forward_invoice_balance(invoice_id):
             "next_invoice_date": candidate.get("next_invoice_date")
         }
     
-    metadata= {
+    metadata = {
         "type": "carry_forward_balance",
         "source_invoice_id": invoice_id,
         "source_invoice_number": invoice_number or "",
@@ -9785,6 +9785,18 @@ def classify_expired_inspection_fee_subscription(subscription, customer_descript
         result["reason"] = f"Inspection fee does not expire until {inspection_fee_end_date.isoformat()}"
 
         return result
+    
+    # distinguish already_removed and manual_review
+    if (
+        len(inspection_items) == 0
+        and len(monthly_service_items) == 1
+        and len(other_items) == 0
+        and inspection_fee_status == "removed"
+    ):
+        result["classification"] = "already_removed"
+        result["reason"] = "Inspection fee was already removed."
+
+        return result
 
     if len(monthly_service_items) != 1:
         result["classification"] = "manual_review"
@@ -9843,6 +9855,7 @@ def preview_expired_inspection_fees():
         "not_due_yet": 0,
         "not_applicable": 0,
         "manual_review": 0,
+        "already_removed": 0,
     }
 
     # a targeted subscription
@@ -9910,3 +9923,527 @@ def preview_expired_inspection_fees():
         "results": results,
     }
 
+# apply_expired_inspection_fee_internal
+def apply_expired_inspection_fee_internal(subscription_id, mode):
+    allowed_modes = {
+        "test",
+        "live",
+    }
+
+    if not subscription_id:
+        return {
+            "subscription_id": subscription_id,
+            "mode": mode,
+            "success": False,
+            "action": "not_applied",
+            "stage": "input_validation",
+            "reason": "Subscription ID is required.",
+        }
+
+    if mode not in allowed_modes:
+        return {
+            "subscription_id": subscription_id,
+            "mode": mode,
+            "success": False,
+            "action": "not_applied",
+            "stage": "input_validation",
+            "reason": f"Unsupported mode: {mode!r}",
+        }
+
+    try:
+        subscription = stripe.Subscription.retrieve(
+            subscription_id,
+            expand=["customer"],
+        )
+
+    except stripe.error.StripeError as exc:
+        return {
+            "subscription_id": subscription_id,
+            "mode": mode,
+            "success": False,
+            "action": "not_applied",
+            "stage": "subscription_retrieval",
+            "reason": str(exc),
+        }
+
+    customer = stripe_get(subscription, "customer")
+
+    customer_description = stripe_get(customer, "description", "")
+
+    today = datetime.now(timezone.utc).date()
+
+    classification_result = classify_expired_inspection_fee_subscription(
+        subscription=subscription,
+        customer_description=customer_description,
+        today=today,
+    )
+
+    if (
+        classification_result["classification"] != "would_remove_inspection_fee"
+        or classification_result["safe_to_apply"] is not True
+    ):
+        return {
+            "subscription_id": subscription_id,
+            "customer_id": classification_result["customer_id"],
+            "mode": mode,
+            "success": False,
+            "action": "not_applied",
+            "stage": "pre_write_validation",
+            "reason": classification_result["reason"],
+            "classification": classification_result["classification"],
+            "safe_to_apply": classification_result["safe_to_apply"],
+            "inspection_item_id": classification_result["inspection_item_id"],
+            "before": classification_result,
+        }
+
+    inspection_item_id = classification_result["inspection_item_id"]
+
+    if not inspection_item_id:
+        return {
+            "subscription_id": subscription_id,
+            "customer_id": classification_result["customer_id"],
+            "mode": mode,
+            "success": False,
+            "action": "not_applied",
+            "stage": "pre_write_validation",
+            "reason": "Classifier marked the subscription safe, but no inspection item ID was returned.",
+            "classification": classification_result["classification"],
+            "safe_to_apply": classification_result["safe_to_apply"],
+            "inspection_item_id": None,
+            "before": classification_result,
+        }
+
+    try: 
+        deleted_item = stripe.SubscriptionItem.delete(inspection_item_id, proration_behavior="none")
+
+    except stripe.error.StripeError as exc: 
+        return {
+            "subscription_id": subscription_id,
+            "customer_id": classification_result["customer_id"],
+            "mode": mode,
+            "success": False,
+            "action": "not_applied",
+            "stage": "inspection_item_deletion",
+            "inspection_item_id": inspection_item_id,
+            "before": classification_result,
+            "reason": str(exc),
+            "writes": {
+                "inspection_item_deleted": False,
+                "metadata_updated": False,
+            },
+        }
+    
+    deleted = stripe_get(deleted_item, "deleted")
+
+    if deleted is not True:
+        return {
+            "subscription_id": subscription_id,
+            "customer_id": classification_result["customer_id"],
+            "mode": mode,
+            "success": False,
+            "action": "not_applied",
+            "stage": "inspection_item_deletion",
+            "reason": "Subscription item deletion was not confirmed by Stripe.",
+            "inspection_item_id": inspection_item_id,
+            "before": classification_result,
+            "writes": {
+                "inspection_item_deleted": False,
+                "metadata_updated": False,
+            },
+        }
+
+    # update metadata
+    try: 
+        stripe.Subscription.modify(
+            subscription_id,
+            metadata={
+                "inspection_fee_status": "removed",
+            })
+
+    except stripe.error.StripeError as exc:
+        return {
+            "subscription_id": subscription_id,
+            "customer_id": classification_result["customer_id"],
+            "mode": mode,
+            "success": False,
+            "action": "partial_failure",
+            "stage": "metadata_update",
+            "reason": str(exc),
+            "inspection_item_id": inspection_item_id,
+            "before": classification_result,
+            "writes": {
+                "inspection_item_deleted": True,
+                "metadata_updated": False,
+            },
+            "requires_metadata_repair": True,
+        }
+
+    # retrieve subscription again
+    try:
+        final_subscription = stripe.Subscription.retrieve(
+            subscription_id,
+            expand=["customer"],
+        )
+
+    except stripe.error.StripeError as exc:
+        return {
+            "subscription_id": subscription_id,
+            "customer_id": classification_result["customer_id"],
+            "mode": mode,
+            "success": False,
+            "action": "verification_failed",
+            "stage": "post_write_retrieval",
+            "reason": str(exc),
+            "inspection_item_id": inspection_item_id,
+            "before": classification_result,
+            "writes": {
+                "inspection_item_deleted": True,
+                "metadata_updated": True,
+            },
+            "requires_manual_review": True,
+        }
+
+    # verify the final subscription
+    final_metadata = stripe_metadata_to_dict(stripe_get(final_subscription, "metadata", {}) or {})
+    final_status = stripe_get(final_subscription, "status")
+
+    final_items = stripe_get(final_subscription, "items", {}) or {}
+    final_item_data = stripe_get(final_items, "data", []) or []
+    
+    final_inspection_items = []
+    final_monthly_service_items = []
+    final_other_items = []
+
+    # final_item_data is already a list, so don’t call it like a function
+    for item in final_item_data:
+        item_metadata = stripe_metadata_to_dict(stripe_get(item, "metadata", {}) or {})
+        item_type = item_metadata.get("item_type")
+
+        if item_type == "inspection_fee":
+            final_inspection_items.append(item)
+        elif item_type == "monthly_service_fee": 
+            final_monthly_service_items.append(item)
+        else:
+            final_other_items.append(item)
+
+    final_inspection_fee_status = final_metadata.get("inspection_fee_status")
+
+    billable_statuses = {
+        "active",
+        "past_due",
+        "unpaid",
+    }
+
+    inspection_item_count_is_zero = len(final_inspection_items) == 0
+
+    monthly_service_item_count_is_one = len(final_monthly_service_items) == 1
+
+    other_item_count_is_zero = len(final_other_items) == 0
+
+    inspection_fee_status_is_removed = final_inspection_fee_status == "removed"
+
+    subscription_remains_billable = final_status in billable_statuses
+
+    # use all(...) Because it returns True only when every Boolean inside is True
+    verification_passed = all([
+        inspection_item_count_is_zero,
+        monthly_service_item_count_is_one,
+        other_item_count_is_zero,
+        inspection_fee_status_is_removed,
+        subscription_remains_billable,
+    ])
+
+    verification = {
+        "inspection_item_count_is_zero": inspection_item_count_is_zero,
+        "monthly_service_item_count_is_one": monthly_service_item_count_is_one,
+        "other_item_count_is_zero": other_item_count_is_zero,
+        "inspection_fee_status_is_removed": inspection_fee_status_is_removed,
+        "subscription_remains_billable": subscription_remains_billable,
+    }
+
+    after = {
+        "subscription_status": final_status,
+        "inspection_fee_status": final_inspection_fee_status,
+        "inspection_item_count": len(final_inspection_items),
+        "monthly_service_item_count": len(final_monthly_service_items),
+        "other_item_count": len(final_other_items),
+    }
+
+    if not verification_passed:
+        return {
+            "subscription_id": subscription_id,
+            "customer_id": classification_result["customer_id"],
+            "mode": mode,
+            "success": False,
+            "action": "verification_failed",
+            "stage": "final_verification",
+            "reason": "The Stripe writes completed, but the final subscription state did not pass verification.",
+            "inspection_item_id": inspection_item_id,
+            "before": classification_result,
+            "after": after,
+            "writes": {
+                "inspection_item_deleted": True,
+                "metadata_updated": True,
+            },
+            "verification": verification,
+            "verification_passed": False,
+            "requires_manual_review": True,
+        }
+    
+    # success return
+    return {
+        "subscription_id": subscription_id,
+        "customer_id": classification_result["customer_id"],
+        "mode": mode,
+        "success": True,
+        "action": "inspection_fee_removed",
+        "stage": "completed",
+        "reason": "The expired inspection-fee item was removed successfully.",
+        "inspection_item_id": inspection_item_id,
+        "before": classification_result,
+        "after": after,
+        "writes": {
+            "inspection_item_deleted": True,
+            "metadata_updated": True,
+        },
+        "verification": verification,
+        "verification_passed": True,
+        "requires_manual_review": False,
+    }
+    
+# apply-expired-inspection-fee-one subscription
+@main.route("/admin/apply-expired-inspection-fee-one/<subscription_id>", methods=["POST"])
+def apply_expired_inspection_fee_one(subscription_id): 
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    confirm = request.form.get("confirm")
+    mode = request.form.get("mode")
+
+    allowed_modes = {
+        "test",
+        "live",
+    }
+
+    if confirm != "APPLY":
+        return {
+            "error": "Confirmation required. Submit confirm=APPLY."
+        }, 400
+
+    if mode not in allowed_modes:
+        return {
+            "error": "Mode required. Submit mode=test or mode=live."
+        }, 400
+
+    is_live_key = current_app.config["STRIPE_SECRET_KEY"].startswith("sk_live_")
+
+    if mode == "live" and not is_live_key:
+        return {
+            "error": "You submitted mode=live, but Stripe key is not live."
+        }, 400
+
+    if mode == "test" and is_live_key:
+        return {
+            "error": "You submitted mode=test, but Stripe key is live."
+        }, 400
+
+    result = apply_expired_inspection_fee_internal(subscription_id, mode)
+
+    return result
+
+@main.route("/admin/create-expired-inspection-fee-test-subscription", methods=["POST"])
+def create_expired_inspection_fee_test_subscription():
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    confirm = request.form.get("confirm")
+    mode = request.form.get("mode")
+
+    if confirm != "CREATE_TEST_DATA":
+        return {
+            "error": (
+                "Confirmation required. "
+                "Submit confirm=CREATE_TEST_DATA."
+            )
+        }, 400
+
+    if mode != "test":
+        return {
+            "error": (
+                "This route only supports mode=test."
+            )
+        }, 400
+
+    is_live_key = current_app.config[
+        "STRIPE_SECRET_KEY"
+    ].startswith("sk_live_")
+
+    if is_live_key:
+        return {
+            "error": (
+                "Refusing to create test data because "
+                "the configured Stripe key is live."
+            )
+        }, 400
+
+    today = datetime.now(timezone.utc).date()
+
+    contract_start_date = (
+        today - relativedelta(years=3, days=1)
+    )
+
+    inspection_fee_end_date = (
+        today - timedelta(days=1)
+    )
+
+    contract_end_date = (
+        contract_start_date + relativedelta(years=50)
+    )
+
+    # Create a non-Ottawa fake customer.
+    # Description must not start with "3".
+    customer = stripe.Customer.create(
+        name="Inspection Removal Test Customer",
+        email="inspection-removal-test@example.com",
+        description="TEST CUSTOMER - NOT OTTAWA",
+    )
+
+    # Create the monthly-service Product.
+    monthly_service_product = stripe.Product.create(
+        name="Test Monthly Geothermal Service",
+        metadata={
+            "increaseable": "true",
+        },
+    )
+
+    # Create its recurring monthly Price.
+    monthly_service_price = stripe.Price.create(
+        product=monthly_service_product.id,
+        unit_amount=10000,
+        currency="cad",
+        recurring={
+            "interval": "month",
+        },
+    )
+
+    # Create the inspection-fee Product.
+    inspection_fee_product = stripe.Product.create(
+        name="Test Monthly Inspection Fee",
+    )
+
+    # Create its recurring monthly Price.
+    inspection_fee_price = stripe.Price.create(
+        product=inspection_fee_product.id,
+        unit_amount=2500,
+        currency="cad",
+        recurring={
+            "interval": "month",
+        },
+    )
+
+    # Create an active subscription without requiring a test card.
+    subscription = stripe.Subscription.create(
+        customer=customer.id,
+        collection_method="send_invoice",
+        days_until_due=20,
+        items=[
+            {
+                "price": monthly_service_price.id,
+                "quantity": 1,
+            },
+            {
+                "price": inspection_fee_price.id,
+                "quantity": 1,
+            },
+        ],
+        metadata={
+            "contract_start_date": (
+                contract_start_date.isoformat()
+            ),
+            "contract_end_date": (
+                contract_end_date.isoformat()
+            ),
+            "contract_term_years": "50",
+            "inspection_fee_start_date": (
+                contract_start_date.isoformat()
+            ),
+            "inspection_fee_end_date": (
+                inspection_fee_end_date.isoformat()
+            ),
+            "inspection_fee_years": "3",
+            "inspection_fee_status": "active",
+            "billing_rule_version": "1",
+        },
+    )
+
+    subscription_items = stripe.SubscriptionItem.list(
+        subscription=subscription.id,
+        limit=100,
+    )
+
+    monthly_service_item_id = None
+    inspection_item_id = None
+
+    for item in subscription_items.auto_paging_iter():
+        price = stripe_get(item, "price", {}) or {}
+        price_id = stripe_get(price, "id")
+
+        if price_id == monthly_service_price.id:
+            monthly_service_item_id = stripe_get(
+                item,
+                "id",
+            )
+
+            stripe.SubscriptionItem.modify(
+                monthly_service_item_id,
+                metadata={
+                    "item_type": "monthly_service_fee",
+                },
+            )
+
+        elif price_id == inspection_fee_price.id:
+            inspection_item_id = stripe_get(
+                item,
+                "id",
+            )
+
+            stripe.SubscriptionItem.modify(
+                inspection_item_id,
+                metadata={
+                    "item_type": "inspection_fee",
+                },
+            )
+
+    final_subscription = stripe.Subscription.retrieve(
+        subscription.id,
+        expand=["customer"],
+    )
+
+    return {
+        "status": "test_subscription_created",
+        "mode": mode,
+        "customer_id": customer.id,
+        "subscription_id": subscription.id,
+        "subscription_status": stripe_get(
+            final_subscription,
+            "status",
+        ),
+        "monthly_service_product_id": (
+            monthly_service_product.id
+        ),
+        "monthly_service_price_id": (
+            monthly_service_price.id
+        ),
+        "monthly_service_item_id": (
+            monthly_service_item_id
+        ),
+        "inspection_fee_product_id": (
+            inspection_fee_product.id
+        ),
+        "inspection_fee_price_id": (
+            inspection_fee_price.id
+        ),
+        "inspection_item_id": inspection_item_id,
+        "inspection_fee_end_date": (
+            inspection_fee_end_date.isoformat()
+        ),
+        "inspection_fee_status": "active",
+    }
