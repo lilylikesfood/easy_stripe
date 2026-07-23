@@ -2926,17 +2926,73 @@ def carry_forward_invoice_balance(invoice_id):
             "days_until_next_invoice": candidate.get("days_until_next_invoice"),
             "next_invoice_date": candidate.get("next_invoice_date")
         }
+
+    carry_forward_amount_cents = candidate.get("proposed_carry_forward_amount_cents")
+
+    source_total_excluding_tax_cents = candidate.get("source_total_excluding_tax_cents")
+
+    if source_total_excluding_tax_cents is None:
+        return {
+            "status": "skipped",
+            "reason": "Source total_excluding_tax is unavailable",
+            "invoice_id": invoice_id,
+            "source_total_excluding_tax_cents": None,
+            "proposed_carry_forward_amount_cents": carry_forward_amount_cents,
+        }
+
+    if carry_forward_amount_cents is None:
+        return {
+            "status": "skipped", 
+            "reason": "Proposed carry-forward amount is unavailable",
+            "invoice_id": invoice_id,
+            "source_total_excluding_tax_cents": source_total_excluding_tax_cents,
+            "proposed_carry_forward_amount_cents": None,
+            }
+    
+    if carry_forward_amount_cents != source_total_excluding_tax_cents:
+        return {
+            "status": "skipped",
+            "reason": "Proposed carry-forward amount does not match source total_excluding_tax",
+            "invoice_id": invoice_id,
+            "source_total_excluding_tax_cents": source_total_excluding_tax_cents,
+            "proposed_carry_forward_amount_cents": carry_forward_amount_cents,
+            "manual_action_required": True,
+        }
     
     metadata = {
         "type": "carry_forward_balance",
         "source_invoice_id": invoice_id,
         "source_invoice_number": invoice_number or "",
+        "source_total_cents": str(source_invoice_total_cents),
+        "source_total_excluding_tax_cents": str(source_total_excluding_tax_cents),
+        "source_amount_remaining_cents": str(source_invoice_amount_remaining_cents),
+        "accounting_rule_version": "pre_tax_carry_forward_v1",
     }
 
-    stripe.Invoice.void_invoice(invoice_id)
+    try: 
+        stripe.Invoice.void_invoice(invoice_id)
 
-    invoice_after= stripe.Invoice.retrieve(invoice_id)
-    old_invoice_status_after = stripe_get(invoice_after, "status")
+        invoice_after= stripe.Invoice.retrieve(invoice_id)
+        old_invoice_status_after = stripe_get(invoice_after, "status")
+
+    except Exception as e:
+        return {
+            "status": "partial_failure",
+            "reason": "Source invoice void or verification failed",
+            "invoice_id": invoice_id,
+            "source_invoice_number": invoice_number,
+            "customer_id": customer_id,
+            "old_invoice_status_before": old_invoice_status_before,
+            "old_invoice_status_after": None,
+            "source_invoice_void_status_uncertain": True,
+            "source_invoice_total_cents": source_invoice_total_cents,
+            "source_total_excluding_tax_cents": source_total_excluding_tax_cents,
+            "source_invoice_amount_remaining_cents": source_invoice_amount_remaining_cents,
+            "intended_carry_forward_amount_cents": carry_forward_amount_cents,
+            "invoice_item_created": False,
+            "manual_review_required": True,
+            "error": str(e),
+        }
 
     if old_invoice_status_after != "void":
         return {
@@ -2948,12 +3004,18 @@ def carry_forward_invoice_balance(invoice_id):
             "amount_remaining_cents": amount_remaining,
             "old_invoice_status_before": old_invoice_status_before,
             "old_invoice_status_after": old_invoice_status_after,
+            "source_invoice_total_cents": source_invoice_total_cents,
+            "source_total_excluding_tax_cents": source_total_excluding_tax_cents,
+            "source_invoice_amount_remaining_cents": source_invoice_amount_remaining_cents,
+            "intended_carry_forward_amount_cents": carry_forward_amount_cents,
         }
     
     try:
         invoice_item= stripe.InvoiceItem.create(
             customer=customer_id, 
-            amount=amount_remaining,
+            # amount_remaining = tax-inclusive old balance
+            # carry forward approved pre-tax balance
+            amount=carry_forward_amount_cents,
             currency="cad",
             description=carry_forward_description, 
             metadata=metadata
@@ -2961,25 +3023,43 @@ def carry_forward_invoice_balance(invoice_id):
 
     except Exception as e:
         return {
-            "status": "failed",
-            "reason": "Invoice was voided, but carry-forward invoice item creation failed. Manual review required.",
-            "error": str(e),
+            "status": "partial_failure",
+            "reason": "Source invoice was voided but carry-forward item creation failed",
             "invoice_id": invoice_id,
             "source_invoice_number": invoice_number,
             "customer_id": customer_id,
-            "amount_remaining_cents": amount_remaining,
             "old_invoice_status_before": old_invoice_status_before,
             "old_invoice_status_after": old_invoice_status_after,
-            "invoice_item_id": None,
-            "manual_action_required": True,
-            "source_invoice_created_ts": source_invoice_created_ts,
-            "source_invoice_due_date_ts": source_invoice_due_date_ts,
+            "source_invoice_was_voided": True,
+            "invoice_item_created": False,
             "source_invoice_total_cents": source_invoice_total_cents,
+            "source_total_excluding_tax_cents": source_total_excluding_tax_cents,
             "source_invoice_amount_remaining_cents": source_invoice_amount_remaining_cents,
-            "carried_forward_amount_cents": 0,
+            "intended_carry_forward_amount_cents": carry_forward_amount_cents,
             "carry_forward_description": carry_forward_description,
+            "manual_action_required": True,
+            "requires_carry_forward_item_repair": True,
+            "error": str(e),
         }
 
+    created_amount = stripe_get(invoice_item, "amount")
+
+    if created_amount != carry_forward_amount_cents:
+        return {
+            "status": "partial_failure",
+            "reason": "Carry-forward item was created with an unexpected amount",
+            "invoice_id": invoice_id,
+            "source_invoice_number": invoice_number,
+            "customer_id": customer_id,
+            "invoice_item_id": stripe_get(invoice_item, "id"),
+            "old_invoice_status_before": old_invoice_status_before,
+            "old_invoice_status_after": old_invoice_status_after,
+            "source_invoice_was_voided": True,
+            "invoice_item_created": True,
+            "expected_amount_cents": carry_forward_amount_cents,
+            "actual_amount_cents": created_amount,
+            "manual_action_required": True,
+        }
 
     return {
         "status": "success",
@@ -2997,8 +3077,9 @@ def carry_forward_invoice_balance(invoice_id):
         "source_invoice_created_ts": source_invoice_created_ts,
         "source_invoice_due_date_ts": source_invoice_due_date_ts,
         "source_invoice_total_cents": source_invoice_total_cents,
+        "source_total_excluding_tax_cents": source_total_excluding_tax_cents,
         "source_invoice_amount_remaining_cents": source_invoice_amount_remaining_cents,
-        "carried_forward_amount_cents": amount_remaining,
+        "carried_forward_amount_cents": carry_forward_amount_cents,
         "carry_forward_description": carry_forward_description,
     }
 
@@ -3074,6 +3155,14 @@ def find_carry_forward_candidates():
         invoice_id= stripe_get(invoice, "id")
         amount_remaining= stripe_get(invoice, "amount_remaining")
         currency= stripe_get(invoice, "currency")
+
+        # include/exlude tax revise
+        total = stripe_get(invoice, "total")
+        total_excluding_tax = stripe_get(invoice, "total_excluding_tax")
+        amount_paid = stripe_get(invoice, "amount_paid", 0)
+        pre_payment_credit_notes_amount = stripe_get(invoice, "pre_payment_credit_notes_amount", 0)
+        post_payment_credit_notes_amount = stripe_get(invoice, "post_payment_credit_notes_amount", 0)
+
         customer= stripe_get(invoice, "customer")
         parent = stripe_get(invoice, "parent")
         subscription = stripe_get(invoice, "subscription")
@@ -3158,9 +3247,32 @@ def find_carry_forward_candidates():
 
         already_exists = carry_forward_already_exists(customer_id, invoice_id)
 
+        # without tax carry forward
+        fully_unpaid = (
+            amount_remaining == total
+            and amount_paid == 0
+        )
+
+        has_no_credit_notes = (
+            pre_payment_credit_notes_amount == 0
+            and post_payment_credit_notes_amount == 0
+        )
+
+        has_safe_tax_exclusive_amount = (
+            total_excluding_tax is not None
+            and total_excluding_tax > 0
+        )
+
+        safe_accounting_structure = (
+            fully_unpaid
+            and has_no_credit_notes
+            and has_safe_tax_exclusive_amount
+        )
+
         eligible_to_apply = (
             not already_exists
             and days_until_next_invoice == 1
+            and safe_accounting_structure
         )
 
         # for special case: invoice is going to be generated the same day but later time to generate invoice
@@ -3177,6 +3289,18 @@ def find_carry_forward_candidates():
             skip_reason = "subscription was not expanded"
         elif days_until_next_invoice is None:
             skip_reason = "next invoice date unavailable"
+
+        # Only automate completely unpaid invoices.
+        elif amount_remaining != total:
+            skip_reason = "manual review: amount_remaining does not equal invoice total"
+        # without tax carry forward
+        elif amount_paid != 0:
+            skip_reason = "manual review: invoice has a payment applied"
+        elif not has_no_credit_notes:
+            skip_reason = "manual review: invoice contains credit-note activity"
+        elif not has_safe_tax_exclusive_amount:
+            skip_reason = "manual review: total_excluding_tax is missing or invalid"
+
         elif days_until_next_invoice != 1:
             skip_reason = f"next invoice is not tomorrow; days_until_next_invoice={days_until_next_invoice}"
         # for special case: invoice is going to be generated the same day but later time to generate invoice
@@ -3196,7 +3320,23 @@ def find_carry_forward_candidates():
             "effective_due_date": effective_due_date.date().isoformat(),
             "days_overdue": days_overdue,
             "eligible_to_apply": eligible_to_apply,
-            "skip_reason": skip_reason
+            "skip_reason": skip_reason,
+            # without tax carry forward
+            "source_total_cents": total,
+            "source_total": cents_to_money(total),
+            "source_total_excluding_tax_cents": total_excluding_tax,
+            "source_total_excluding_tax": (
+                cents_to_money(total_excluding_tax) if total_excluding_tax is not None else None
+            ),
+            "source_amount_paid_cents": amount_paid,
+            "source_amount_paid": cents_to_money(amount_paid),
+            "fully_unpaid": fully_unpaid,
+            "has_no_credit_notes": has_no_credit_notes,
+            "safe_accounting_structure": safe_accounting_structure,
+            "proposed_carry_forward_amount_cents": total_excluding_tax if safe_accounting_structure else None,
+            "proposed_carry_forward_amount": (
+                cents_to_money(total_excluding_tax) if safe_accounting_structure else None
+            ),
         })
 
     return {
@@ -3261,7 +3401,11 @@ def get_next_monthly_billing_date_from_anchor(anchor_ts, today_date):
 
     candidate = safe_date_for_month(year, month)
 
-    if candidate < today_date:
+    # <   means move forward only when the candidate is before today
+    # <=  means move forward when the candidate is before today or is today
+
+    # If today is the billing day, the next invoice is next month, not today.
+    if candidate <= today_date:
         if month == 12:
             candidate = safe_date_for_month(year + 1, 1)
         else:
