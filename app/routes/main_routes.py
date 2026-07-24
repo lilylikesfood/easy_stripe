@@ -40,6 +40,8 @@ import io
 
 import json
 
+import time
+
 main = Blueprint("main", __name__)
 
 
@@ -2927,6 +2929,16 @@ def carry_forward_invoice_balance(invoice_id):
             "next_invoice_date": candidate.get("next_invoice_date")
         }
 
+    if not candidate.get("subscription_id"):
+        return {
+            "status": "skipped",
+            "reason": "Target subscription could not be determined safely",
+            "invoice_id": invoice_id,
+            "subscription_lookup_source": candidate.get(
+                "subscription_lookup_source"
+            )
+        }
+
     carry_forward_amount_cents = candidate.get("proposed_carry_forward_amount_cents")
 
     source_total_excluding_tax_cents = candidate.get("source_total_excluding_tax_cents")
@@ -2963,6 +2975,7 @@ def carry_forward_invoice_balance(invoice_id):
         "type": "carry_forward_balance",
         "source_invoice_id": invoice_id,
         "source_invoice_number": invoice_number or "",
+        "target_subscription_id": candidate["subscription_id"],
         "source_total_cents": str(source_invoice_total_cents),
         "source_total_excluding_tax_cents": str(source_total_excluding_tax_cents),
         "source_amount_remaining_cents": str(source_invoice_amount_remaining_cents),
@@ -3013,10 +3026,12 @@ def carry_forward_invoice_balance(invoice_id):
     try:
         invoice_item= stripe.InvoiceItem.create(
             customer=customer_id, 
+            subscription=candidate["subscription_id"],
             # amount_remaining = tax-inclusive old balance
             # carry forward approved pre-tax balance
             amount=carry_forward_amount_cents,
             currency="cad",
+            tax_behavior="exclusive",
             description=carry_forward_description, 
             metadata=metadata
         )
@@ -3137,13 +3152,246 @@ def audit_carry_forward():
     # return result
     # the same thing
 
+def classify_carry_forward_invoice(invoice):
+    today_toronto = datetime.now(TORONTO_TZ).date()
+
+    invoice_id = stripe_get(invoice, "id")
+    amount_remaining = stripe_get(invoice, "amount_remaining")
+    currency = stripe_get(invoice, "currency")
+
+    total = stripe_get(invoice, "total")
+    total_excluding_tax = stripe_get(invoice, "total_excluding_tax")
+    amount_paid = stripe_get(invoice, "amount_paid", 0)
+    pre_payment_credit_notes_amount = stripe_get(
+        invoice,
+        "pre_payment_credit_notes_amount",
+        0
+    )
+    post_payment_credit_notes_amount = stripe_get(
+        invoice,
+        "post_payment_credit_notes_amount",
+        0
+    )
+
+    customer = stripe_get(invoice, "customer")
+    parent = stripe_get(invoice, "parent")
+    subscription = stripe_get(invoice, "subscription")
+    due_date_ts = stripe_get(invoice, "due_date")
+    created_ts = stripe_get(invoice, "created")
+
+    if currency != "cad":
+        return None
+
+    if amount_remaining <= 0:
+        return None
+
+    if due_date_ts:
+        effective_due_date = datetime.fromtimestamp(
+            due_date_ts,
+            tz=timezone.utc
+        ).astimezone(TORONTO_TZ)
+    else:
+        effective_due_date = datetime.fromtimestamp(
+            created_ts,
+            tz=timezone.utc
+        ).astimezone(TORONTO_TZ) + timedelta(days=20)
+
+    raw_days = (today_toronto - effective_due_date.date()).days
+
+    if raw_days <= 0:
+        return None
+
+    days_overdue = raw_days
+
+    customer_id = (
+        stripe_get(customer, "id")
+        if not isinstance(customer, str)
+        else customer
+    )
+
+    # subscription_id = (
+    #     stripe_get(subscription, "id")
+    #     if not isinstance(subscription, str)
+    #     else subscription
+    # )
+
+    # parent_subscription_id = None
+
+    # if parent:
+    #     parent_subscription_details = stripe_get(
+    #         parent,
+    #         "subscription_details"
+    #     )
+
+    #     if parent_subscription_details:
+    #         parent_subscription_id = stripe_get(
+    #             parent_subscription_details,
+    #             "subscription"
+    #         )
+
+    # if not subscription and parent_subscription_id:
+    #     subscription = stripe.Subscription.retrieve(
+    #         parent_subscription_id
+    #     )
+    #     subscription_id = stripe_get(subscription, "id")
+
+    # if not subscription:
+    #     for status in ["active", "past_due"]:
+    #         customer_subscriptions = stripe.Subscription.list(
+    #             customer=customer_id,
+    #             status=status,
+    #             limit=1
+    #         )
+
+    #         if customer_subscriptions.data:
+    #             subscription = customer_subscriptions.data[0]
+    #             subscription_id = stripe_get(subscription, "id")
+    #             break
+
+    subscription, subscription_lookup_source = resolve_invoice_subscription(invoice, customer_id)
+
+    subscription_id = stripe_get(subscription, "id") if subscription else None
+
+    next_invoice_date = None
+    days_until_next_invoice = None
+
+    if subscription and not isinstance(subscription, str):
+        subscription_items = stripe_get(
+            stripe_get(subscription, "items", {}),
+            "data",
+            []
+        )
+
+        current_period_end_ts = None
+
+        if subscription_items:
+            current_period_end_ts = stripe_get(
+                subscription_items[0],
+                "current_period_end"
+            )
+
+        billing_cycle_anchor_ts = stripe_get(
+            subscription,
+            "billing_cycle_anchor"
+        )
+
+        if current_period_end_ts:
+            next_invoice_dt = datetime.fromtimestamp(
+                current_period_end_ts,
+                tz=timezone.utc
+            )
+            next_invoice_date = next_invoice_dt.astimezone(
+                TORONTO_TZ
+            ).date()
+
+        elif billing_cycle_anchor_ts:
+            next_invoice_date = get_next_monthly_billing_date_from_anchor(
+                billing_cycle_anchor_ts,
+                today_toronto
+            )
+
+        if next_invoice_date:
+            days_until_next_invoice = (
+                next_invoice_date - today_toronto
+            ).days
+
+    already_exists = carry_forward_already_exists(
+        customer_id,
+        invoice_id
+    )
+
+    fully_unpaid = (
+        amount_remaining == total
+        and amount_paid == 0
+    )
+
+    has_no_credit_notes = (
+        pre_payment_credit_notes_amount == 0
+        and post_payment_credit_notes_amount == 0
+    )
+
+    has_safe_tax_exclusive_amount = (
+        total_excluding_tax is not None
+        and total_excluding_tax > 0
+    )
+
+    safe_accounting_structure = (
+        fully_unpaid
+        and has_no_credit_notes
+        and has_safe_tax_exclusive_amount
+    )
+
+    eligible_to_apply = (
+        not already_exists
+        and days_until_next_invoice == 1
+        and safe_accounting_structure
+    )
+
+    if already_exists:
+        skip_reason = "carry forward already exists"
+    elif subscription is None:
+        skip_reason = "next invoice date cannot be determined automatically"
+    elif isinstance(subscription, str):
+        skip_reason = "subscription was not expanded"
+    elif days_until_next_invoice is None:
+        skip_reason = "next invoice date unavailable"
+    elif amount_remaining != total:
+        skip_reason = "manual review: amount_remaining does not equal invoice total"
+    elif amount_paid != 0:
+        skip_reason = "manual review: invoice has a payment applied"
+    elif not has_no_credit_notes:
+        skip_reason = "manual review: invoice contains credit-note activity"
+    elif not has_safe_tax_exclusive_amount:
+        skip_reason = "manual review: total_excluding_tax is missing or invalid"
+    elif days_until_next_invoice != 1:
+        skip_reason = (
+            "next invoice is not tomorrow; "
+            f"days_until_next_invoice={days_until_next_invoice}"
+        )
+    else:
+        skip_reason = None
+
+    return {
+        "invoice_id": invoice_id,
+        "customer_id": customer_id,
+        "subscription_id": subscription_id,
+        "subscription_lookup_source": subscription_lookup_source,
+        "next_invoice_date": next_invoice_date.isoformat() if next_invoice_date else None,
+        "days_until_next_invoice": days_until_next_invoice,
+        "amount_remaining": cents_to_money(amount_remaining),
+        "amount_remaining_cents": amount_remaining,
+        "effective_due_date": effective_due_date.date().isoformat(),
+        "days_overdue": days_overdue,
+        "eligible_to_apply": eligible_to_apply,
+        "skip_reason": skip_reason,
+        "source_total_cents": total,
+        "source_total": cents_to_money(total),
+        "source_total_excluding_tax_cents": total_excluding_tax,
+        "source_total_excluding_tax": (
+            cents_to_money(total_excluding_tax)
+            if total_excluding_tax is not None else None
+        ),
+        "source_amount_paid_cents": amount_paid,
+        "source_amount_paid": cents_to_money(amount_paid),
+        "fully_unpaid": fully_unpaid,
+        "has_no_credit_notes": has_no_credit_notes,
+        "safe_accounting_structure": safe_accounting_structure,
+        "proposed_carry_forward_amount_cents": (
+            total_excluding_tax
+            if safe_accounting_structure
+            else None
+        ),
+        "proposed_carry_forward_amount": (
+            cents_to_money(total_excluding_tax)
+            if safe_accounting_structure
+            else None
+        ),
+    }
+
 def find_carry_forward_candidates():
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
     candidates = []
-
-    now= datetime.now(timezone.utc)
-    today_toronto= datetime.now(TORONTO_TZ).date()
 
     invoices = stripe.Invoice.list(
         status="open",
@@ -3152,213 +3400,269 @@ def find_carry_forward_candidates():
     )
 
     for invoice in invoices.auto_paging_iter():
-        invoice_id= stripe_get(invoice, "id")
-        amount_remaining= stripe_get(invoice, "amount_remaining")
-        currency= stripe_get(invoice, "currency")
+        candidate = classify_carry_forward_invoice(invoice)
 
-        # include/exlude tax revise
-        total = stripe_get(invoice, "total")
-        total_excluding_tax = stripe_get(invoice, "total_excluding_tax")
-        amount_paid = stripe_get(invoice, "amount_paid", 0)
-        pre_payment_credit_notes_amount = stripe_get(invoice, "pre_payment_credit_notes_amount", 0)
-        post_payment_credit_notes_amount = stripe_get(invoice, "post_payment_credit_notes_amount", 0)
-
-        customer= stripe_get(invoice, "customer")
-        parent = stripe_get(invoice, "parent")
-        subscription = stripe_get(invoice, "subscription")
-        due_date_ts= stripe_get(invoice, "due_date")
-        created_ts= stripe_get(invoice, "created")
-
-        if currency != "cad":
-            continue
-
-        if amount_remaining <= 0:
-            continue
-
-        if due_date_ts:
-            effective_due_date = datetime.fromtimestamp(due_date_ts, tz=timezone.utc).astimezone(TORONTO_TZ)
-        else:
-            effective_due_date = datetime.fromtimestamp(created_ts, tz=timezone.utc).astimezone(TORONTO_TZ) + timedelta(days=20)
-
-        raw_days = (today_toronto - effective_due_date.date()).days
-        # testing
-        # raw_days = 10
-
-        if raw_days <=0:
-            continue
-
-        days_overdue= raw_days
-
-        # if condition:
-        #     use A
-        # else:
-        #     use B
-
-        # A if condition else B
-        customer_id= stripe_get(customer, "id") if not isinstance(customer, str) else customer
-
-        # carry forward 1 day before the next invoice is generated
-        subscription_id = stripe_get(subscription, "id") if not isinstance(subscription, str) else subscription
-
-        parent_subscription_id = None
-
-        if parent:
-            parent_subscription_details = stripe_get(parent, "subscription_details")
-
-            if parent_subscription_details:
-                parent_subscription_id = stripe_get(parent_subscription_details, "subscription")
-
-        if not subscription and parent_subscription_id:
-            subscription = stripe.Subscription.retrieve(parent_subscription_id)
-            subscription_id = stripe_get(subscription, "id")
-
-        if not subscription:
-            for status in ["active", "past_due"]:
-                customer_subscriptions = stripe.Subscription.list(
-                    customer=customer_id,
-                    status=status,
-                    limit=1
-                )
-
-                if customer_subscriptions.data:
-                    subscription = customer_subscriptions.data[0]
-                    subscription_id = stripe_get(subscription, "id")
-                    break
-
-        next_invoice_date = None
-        days_until_next_invoice = None
-
-        if subscription and not isinstance(subscription, str):
-            current_period_end_ts = stripe_get(subscription, "current_period_end")
-            billing_cycle_anchor_ts = stripe_get(subscription, "billing_cycle_anchor")
-
-            if current_period_end_ts:
-                next_invoice_dt = datetime.fromtimestamp(current_period_end_ts, tz=timezone.utc)
-                next_invoice_date = next_invoice_dt.astimezone(TORONTO_TZ).date()
-
-            elif billing_cycle_anchor_ts:
-                next_invoice_date = get_next_monthly_billing_date_from_anchor(
-                    billing_cycle_anchor_ts,
-                    today_toronto
-                )
-
-            if next_invoice_date:
-                days_until_next_invoice = (next_invoice_date - today_toronto).days
-
-        already_exists = carry_forward_already_exists(customer_id, invoice_id)
-
-        # without tax carry forward
-        fully_unpaid = (
-            amount_remaining == total
-            and amount_paid == 0
-        )
-
-        has_no_credit_notes = (
-            pre_payment_credit_notes_amount == 0
-            and post_payment_credit_notes_amount == 0
-        )
-
-        has_safe_tax_exclusive_amount = (
-            total_excluding_tax is not None
-            and total_excluding_tax > 0
-        )
-
-        safe_accounting_structure = (
-            fully_unpaid
-            and has_no_credit_notes
-            and has_safe_tax_exclusive_amount
-        )
-
-        eligible_to_apply = (
-            not already_exists
-            and days_until_next_invoice == 1
-            and safe_accounting_structure
-        )
-
-        # for special case: invoice is going to be generated the same day but later time to generate invoice
-        # eligible_to_apply = (
-        #     not already_exists
-        #     and days_until_next_invoice in [0, 1]
-        # )
-
-        if already_exists:
-            skip_reason = "carry forward already exists"
-        elif subscription is None:
-            skip_reason = "next invoice date cannot be determined automatically"
-        elif isinstance(subscription, str):
-            skip_reason = "subscription was not expanded"
-        elif days_until_next_invoice is None:
-            skip_reason = "next invoice date unavailable"
-
-        # Only automate completely unpaid invoices.
-        elif amount_remaining != total:
-            skip_reason = "manual review: amount_remaining does not equal invoice total"
-        # without tax carry forward
-        elif amount_paid != 0:
-            skip_reason = "manual review: invoice has a payment applied"
-        elif not has_no_credit_notes:
-            skip_reason = "manual review: invoice contains credit-note activity"
-        elif not has_safe_tax_exclusive_amount:
-            skip_reason = "manual review: total_excluding_tax is missing or invalid"
-
-        elif days_until_next_invoice != 1:
-            skip_reason = f"next invoice is not tomorrow; days_until_next_invoice={days_until_next_invoice}"
-        # for special case: invoice is going to be generated the same day but later time to generate invoice
-        # elif days_until_next_invoice not in [0, 1]:
-        #     skip_reason = f"next invoice is not today or tomorrow; days_until_next_invoice={days_until_next_invoice}"
-        else:
-            skip_reason = None
-
-        candidates.append({
-            "invoice_id": invoice_id,
-            "customer_id": customer_id,
-            "subscription_id": subscription_id,
-            "next_invoice_date": next_invoice_date.isoformat() if next_invoice_date else None,
-            "days_until_next_invoice": days_until_next_invoice,
-            "amount_remaining": cents_to_money(amount_remaining),
-            "amount_remaining_cents": amount_remaining,
-            "effective_due_date": effective_due_date.date().isoformat(),
-            "days_overdue": days_overdue,
-            "eligible_to_apply": eligible_to_apply,
-            "skip_reason": skip_reason,
-            # without tax carry forward
-            "source_total_cents": total,
-            "source_total": cents_to_money(total),
-            "source_total_excluding_tax_cents": total_excluding_tax,
-            "source_total_excluding_tax": (
-                cents_to_money(total_excluding_tax) if total_excluding_tax is not None else None
-            ),
-            "source_amount_paid_cents": amount_paid,
-            "source_amount_paid": cents_to_money(amount_paid),
-            "fully_unpaid": fully_unpaid,
-            "has_no_credit_notes": has_no_credit_notes,
-            "safe_accounting_structure": safe_accounting_structure,
-            "proposed_carry_forward_amount_cents": total_excluding_tax if safe_accounting_structure else None,
-            "proposed_carry_forward_amount": (
-                cents_to_money(total_excluding_tax) if safe_accounting_structure else None
-            ),
-        })
+        if candidate:
+            candidates.append(candidate)
 
     return {
         "summary": {
             "candidate_count": len(candidates),
-            "eligible_count": sum(1 for c in candidates if c["eligible_to_apply"]),
-            "skipped_count": sum(1 for c in candidates if not c["eligible_to_apply"]),
-            "next_invoice_tomorrow_count": sum(1 for c in candidates if c["days_until_next_invoice"] == 1),
-            "with_next_invoice_date_count": sum(1 for c in candidates if c["next_invoice_date"] is not None),
-            "missing_next_invoice_date_count": sum(1 for c in candidates if c["next_invoice_date"] is None),
+            "eligible_count": sum(
+                1 for candidate in candidates
+                if candidate["eligible_to_apply"]
+            ),
+            "skipped_count": sum(
+                1 for candidate in candidates
+                if not candidate["eligible_to_apply"]
+            ),
+            "next_invoice_tomorrow_count": sum(
+                1 for candidate in candidates
+                if candidate["days_until_next_invoice"] == 1
+            ),
+            "with_next_invoice_date_count": sum(
+                1 for candidate in candidates
+                if candidate["next_invoice_date"] is not None
+            ),
+            "missing_next_invoice_date_count": sum(
+                1 for candidate in candidates
+                if candidate["next_invoice_date"] is None
+            ),
         },
         "candidates": candidates
     }
 
+# def find_carry_forward_candidates():
+    # stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    # candidates = []
+
+    # now= datetime.now(timezone.utc)
+    # today_toronto= datetime.now(TORONTO_TZ).date()
+
+    # invoices = stripe.Invoice.list(
+    #     status="open",
+    #     limit=100,
+    #     expand=["data.customer", "data.subscription"]
+    # )
+
+    # for invoice in invoices.auto_paging_iter():
+    #     invoice_id= stripe_get(invoice, "id")
+    #     amount_remaining= stripe_get(invoice, "amount_remaining")
+    #     currency= stripe_get(invoice, "currency")
+
+    #     # include/exlude tax revise
+    #     total = stripe_get(invoice, "total")
+    #     total_excluding_tax = stripe_get(invoice, "total_excluding_tax")
+    #     amount_paid = stripe_get(invoice, "amount_paid", 0)
+    #     pre_payment_credit_notes_amount = stripe_get(invoice, "pre_payment_credit_notes_amount", 0)
+    #     post_payment_credit_notes_amount = stripe_get(invoice, "post_payment_credit_notes_amount", 0)
+
+    #     customer= stripe_get(invoice, "customer")
+    #     parent = stripe_get(invoice, "parent")
+    #     subscription = stripe_get(invoice, "subscription")
+    #     due_date_ts= stripe_get(invoice, "due_date")
+    #     created_ts= stripe_get(invoice, "created")
+
+    #     if currency != "cad":
+    #         continue
+
+    #     if amount_remaining <= 0:
+    #         continue
+
+    #     if due_date_ts:
+    #         effective_due_date = datetime.fromtimestamp(due_date_ts, tz=timezone.utc).astimezone(TORONTO_TZ)
+    #     else:
+    #         effective_due_date = datetime.fromtimestamp(created_ts, tz=timezone.utc).astimezone(TORONTO_TZ) + timedelta(days=20)
+
+    #     raw_days = (today_toronto - effective_due_date.date()).days
+    #     # testing
+    #     # raw_days = 10
+
+    #     if raw_days <=0:
+    #         continue
+
+    #     days_overdue= raw_days
+
+    #     # if condition:
+    #     #     use A
+    #     # else:
+    #     #     use B
+
+    #     # A if condition else B
+    #     customer_id= stripe_get(customer, "id") if not isinstance(customer, str) else customer
+
+    #     # carry forward 1 day before the next invoice is generated
+    #     subscription_id = stripe_get(subscription, "id") if not isinstance(subscription, str) else subscription
+
+    #     parent_subscription_id = None
+
+    #     if parent:
+    #         parent_subscription_details = stripe_get(parent, "subscription_details")
+
+    #         if parent_subscription_details:
+    #             parent_subscription_id = stripe_get(parent_subscription_details, "subscription")
+
+    #     if not subscription and parent_subscription_id:
+    #         subscription = stripe.Subscription.retrieve(parent_subscription_id)
+    #         subscription_id = stripe_get(subscription, "id")
+
+    #     if not subscription:
+    #         for status in ["active", "past_due"]:
+    #             customer_subscriptions = stripe.Subscription.list(
+    #                 customer=customer_id,
+    #                 status=status,
+    #                 limit=1
+    #             )
+
+    #             if customer_subscriptions.data:
+    #                 subscription = customer_subscriptions.data[0]
+    #                 subscription_id = stripe_get(subscription, "id")
+    #                 break
+
+    #     next_invoice_date = None
+    #     days_until_next_invoice = None
+
+    #     if subscription and not isinstance(subscription, str):
+    #         current_period_end_ts = stripe_get(subscription, "current_period_end")
+    #         billing_cycle_anchor_ts = stripe_get(subscription, "billing_cycle_anchor")
+
+    #         if current_period_end_ts:
+    #             next_invoice_dt = datetime.fromtimestamp(current_period_end_ts, tz=timezone.utc)
+    #             next_invoice_date = next_invoice_dt.astimezone(TORONTO_TZ).date()
+
+    #         elif billing_cycle_anchor_ts:
+    #             next_invoice_date = get_next_monthly_billing_date_from_anchor(
+    #                 billing_cycle_anchor_ts,
+    #                 today_toronto
+    #             )
+
+    #         if next_invoice_date:
+    #             days_until_next_invoice = (next_invoice_date - today_toronto).days
+
+    #     already_exists = carry_forward_already_exists(customer_id, invoice_id)
+
+    #     # without tax carry forward
+    #     fully_unpaid = (
+    #         amount_remaining == total
+    #         and amount_paid == 0
+    #     )
+
+    #     has_no_credit_notes = (
+    #         pre_payment_credit_notes_amount == 0
+    #         and post_payment_credit_notes_amount == 0
+    #     )
+
+    #     has_safe_tax_exclusive_amount = (
+    #         total_excluding_tax is not None
+    #         and total_excluding_tax > 0
+    #     )
+
+    #     safe_accounting_structure = (
+    #         fully_unpaid
+    #         and has_no_credit_notes
+    #         and has_safe_tax_exclusive_amount
+    #     )
+
+    #     eligible_to_apply = (
+    #         not already_exists
+    #         and days_until_next_invoice == 1
+    #         and safe_accounting_structure
+    #     )
+
+    #     # for special case: invoice is going to be generated the same day but later time to generate invoice
+    #     # eligible_to_apply = (
+    #     #     not already_exists
+    #     #     and days_until_next_invoice in [0, 1]
+    #     # )
+
+    #     if already_exists:
+    #         skip_reason = "carry forward already exists"
+    #     elif subscription is None:
+    #         skip_reason = "next invoice date cannot be determined automatically"
+    #     elif isinstance(subscription, str):
+    #         skip_reason = "subscription was not expanded"
+    #     elif days_until_next_invoice is None:
+    #         skip_reason = "next invoice date unavailable"
+
+    #     # Only automate completely unpaid invoices.
+    #     elif amount_remaining != total:
+    #         skip_reason = "manual review: amount_remaining does not equal invoice total"
+    #     # without tax carry forward
+    #     elif amount_paid != 0:
+    #         skip_reason = "manual review: invoice has a payment applied"
+    #     elif not has_no_credit_notes:
+    #         skip_reason = "manual review: invoice contains credit-note activity"
+    #     elif not has_safe_tax_exclusive_amount:
+    #         skip_reason = "manual review: total_excluding_tax is missing or invalid"
+
+    #     elif days_until_next_invoice != 1:
+    #         skip_reason = f"next invoice is not tomorrow; days_until_next_invoice={days_until_next_invoice}"
+    #     # for special case: invoice is going to be generated the same day but later time to generate invoice
+    #     # elif days_until_next_invoice not in [0, 1]:
+    #     #     skip_reason = f"next invoice is not today or tomorrow; days_until_next_invoice={days_until_next_invoice}"
+    #     else:
+    #         skip_reason = None
+
+    #     candidates.append({
+    #         "invoice_id": invoice_id,
+    #         "customer_id": customer_id,
+    #         "subscription_id": subscription_id,
+    #         "next_invoice_date": next_invoice_date.isoformat() if next_invoice_date else None,
+    #         "days_until_next_invoice": days_until_next_invoice,
+    #         "amount_remaining": cents_to_money(amount_remaining),
+    #         "amount_remaining_cents": amount_remaining,
+    #         "effective_due_date": effective_due_date.date().isoformat(),
+    #         "days_overdue": days_overdue,
+    #         "eligible_to_apply": eligible_to_apply,
+    #         "skip_reason": skip_reason,
+    #         # without tax carry forward
+    #         "source_total_cents": total,
+    #         "source_total": cents_to_money(total),
+    #         "source_total_excluding_tax_cents": total_excluding_tax,
+    #         "source_total_excluding_tax": (
+    #             cents_to_money(total_excluding_tax) if total_excluding_tax is not None else None
+    #         ),
+    #         "source_amount_paid_cents": amount_paid,
+    #         "source_amount_paid": cents_to_money(amount_paid),
+    #         "fully_unpaid": fully_unpaid,
+    #         "has_no_credit_notes": has_no_credit_notes,
+    #         "safe_accounting_structure": safe_accounting_structure,
+    #         "proposed_carry_forward_amount_cents": total_excluding_tax if safe_accounting_structure else None,
+    #         "proposed_carry_forward_amount": (
+    #             cents_to_money(total_excluding_tax) if safe_accounting_structure else None
+    #         ),
+    #     })
+
+    # return {
+    #     "summary": {
+    #         "candidate_count": len(candidates),
+    #         "eligible_count": sum(1 for c in candidates if c["eligible_to_apply"]),
+    #         "skipped_count": sum(1 for c in candidates if not c["eligible_to_apply"]),
+    #         "next_invoice_tomorrow_count": sum(1 for c in candidates if c["days_until_next_invoice"] == 1),
+    #         "with_next_invoice_date_count": sum(1 for c in candidates if c["next_invoice_date"] is not None),
+    #         "missing_next_invoice_date_count": sum(1 for c in candidates if c["next_invoice_date"] is None),
+    #     },
+    #     "candidates": candidates
+    # }
+
 def get_carry_forward_candidate_by_invoice_id(invoice_id):
-    audit_result = find_carry_forward_candidates()
+    # audit_result = find_carry_forward_candidates()
 
-    for candidate in audit_result["candidates"]:
-        if candidate["invoice_id"] == invoice_id:
-            return candidate
+    # for candidate in audit_result["candidates"]:
+    #     if candidate["invoice_id"] == invoice_id:
+    #         return candidate
 
-    return None
+    # return None
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    invoice = stripe.Invoice.retrieve(
+        invoice_id,
+        expand=["customer", "subscription"]
+    )
+
+    return classify_carry_forward_invoice(invoice)
 
 # debug-subscription
 @main.route("/admin/debug-subscription/<subscription_id>")
@@ -10875,4 +11179,397 @@ def apply_expired_inspection_fees_all():
             "error": "max_apply cannot be greater than 1000."
         }, 400
 
-    
+# create-carry-forward-tax-test-data
+@main.route("/admin/create-carry-forward-tax-test-data", methods=["POST"])
+def create_carry_forward_tax_test_data():
+    """
+    Create a complete carry-forward test fixture in Stripe test mode.
+
+    Creates:
+    - Test Clock starting 25 days in the past
+    - Fake Ontario customer attached to the Test Clock
+    - Product and prices with exclusive tax behavior
+    - Monthly subscription using Stripe automatic tax
+    - Next subscription invoice date set to tomorrow
+    - Fully unpaid source invoice:
+        pre-tax = 10673 cents
+        Stripe-calculated HST = approximately 1387 cents
+        total = approximately 12060 cents
+    - Advances the Test Clock to the current time
+
+    This route never supports LIVE mode.
+    """
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    confirm = request.form.get("confirm")
+    mode = request.form.get("mode")
+
+    if confirm != "CREATE_TEST_DATA":
+        return {
+            "error": "Confirmation required. Submit confirm=CREATE_TEST_DATA."
+        }, 400
+
+    if mode != "test":
+        return {
+            "error": "This route only supports mode=test."
+        }, 400
+
+    stripe_secret_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    if not stripe_secret_key.startswith("sk_test_"):
+        return {
+            "error": "Refusing to create test data because the Stripe key is not a test key."
+        }, 400
+
+    now_toronto = datetime.now(TORONTO_TZ).replace(microsecond=0)
+    now_utc = now_toronto.astimezone(timezone.utc)
+
+    test_clock_start = now_utc - timedelta(days=25)
+    next_invoice_time = now_toronto + timedelta(days=1)
+    next_invoice_utc = next_invoice_time.astimezone(timezone.utc)
+
+    test_clock = None
+    customer = None
+    product = None
+    recurring_price = None
+    source_price = None
+    subscription = None
+    source_invoice = None
+    source_invoice_item = None
+
+    try:
+        test_clock = stripe.test_helpers.TestClock.create(
+            frozen_time=int(test_clock_start.timestamp()),
+            name="Carry Forward Tax Test"
+        )
+
+        customer = stripe.Customer.create(
+            name="Carry Forward Test Customer",
+            email="carry-forward-test@example.com",
+            description="TEST CUSTOMER - DO NOT USE",
+            address={
+                "line1": "100 Queen Street West",
+                "city": "Toronto",
+                "state": "ON",
+                "postal_code": "M5H 2N2",
+                "country": "CA",
+            },
+            test_clock=test_clock.id,
+            metadata={
+                "test_type": "carry_forward_pre_tax_v1"
+            }
+        )
+
+        product = stripe.Product.create(
+            name="Test Monthly Geothermal Service",
+            tax_code="txcd_20030000",
+            metadata={
+                "test_type": "carry_forward_pre_tax_v1"
+            }
+        )
+
+        recurring_price = stripe.Price.create(
+            product=product.id,
+            unit_amount=10673,
+            currency="cad",
+            recurring={
+                "interval": "month"
+            },
+            tax_behavior="exclusive",
+            metadata={
+                "test_type": "carry_forward_pre_tax_v1",
+                "price_type": "recurring"
+            }
+        )
+
+        source_price = stripe.Price.create(
+            product=product.id,
+            unit_amount=10673,
+            currency="cad",
+            tax_behavior="exclusive",
+            metadata={
+                "test_type": "carry_forward_pre_tax_v1",
+                "price_type": "source_invoice"
+            }
+        )
+
+        subscription = stripe.Subscription.create(
+            customer=customer.id,
+            collection_method="send_invoice",
+            days_until_due=20,
+            items=[
+                {
+                    "price": recurring_price.id,
+                    "quantity": 1
+                }
+            ],
+            billing_cycle_anchor=int(next_invoice_utc.timestamp()),
+            proration_behavior="none",
+            automatic_tax={
+                "enabled": True
+            },
+            metadata={
+                "test_type": "carry_forward_pre_tax_v1"
+            }
+        )
+
+        subscription_items = stripe.SubscriptionItem.list(
+            subscription=subscription.id,
+            limit=100
+        )
+
+        monthly_service_item_id = None
+
+        for item in subscription_items.auto_paging_iter():
+            monthly_service_item_id = stripe_get(item, "id")
+
+            stripe.SubscriptionItem.modify(
+                monthly_service_item_id,
+                metadata={
+                    "item_type": "monthly_service_fee",
+                    "test_type": "carry_forward_pre_tax_v1"
+                }
+            )
+
+        source_invoice = stripe.Invoice.create(
+            customer=customer.id,
+            collection_method="send_invoice",
+            days_until_due=1,
+            automatic_tax={
+                "enabled": True
+            },
+            auto_advance=False,
+            description="Synthetic overdue invoice for carry-forward testing",
+            metadata={
+                "test_type": "carry_forward_pre_tax_v1",
+                "purpose": "source_overdue_invoice"
+            }
+        )
+
+        source_invoice_item = stripe.InvoiceItem.create(
+            customer=customer.id,
+            invoice=source_invoice.id,
+            pricing={
+                "price": source_price.id
+            },
+            quantity=1,
+            description="Test monthly geothermal service",
+            metadata={
+                "item_type": "monthly_service_fee",
+                "test_type": "carry_forward_pre_tax_v1"
+            }
+        )
+
+        finalized_invoice = stripe.Invoice.finalize_invoice(
+            source_invoice.id,
+            auto_advance=False
+        )
+
+        stripe.test_helpers.TestClock.advance(
+            test_clock.id,
+            frozen_time=int(now_utc.timestamp())
+        )
+
+        final_clock = None
+        final_clock_status = None
+
+        for _ in range(60):
+            final_clock = stripe.test_helpers.TestClock.retrieve(
+                test_clock.id
+            )
+
+            final_clock_status = stripe_get(final_clock, "status")
+
+            if final_clock_status == "ready":
+                break
+
+            time.sleep(1)
+
+        if final_clock_status != "ready":
+            return {
+                "status": "partial_failure",
+                "reason": "Test Clock did not become ready within 60 seconds.",
+                "test_clock_id": test_clock.id,
+                "test_clock_status": final_clock_status,
+                "customer_id": customer.id,
+                "subscription_id": subscription.id,
+                "source_invoice_id": finalized_invoice.id,
+            }, 500
+
+        final_subscription = stripe.Subscription.retrieve(
+            subscription.id
+        )
+
+        final_invoice = stripe.Invoice.retrieve(
+            finalized_invoice.id
+        )
+
+        source_total = stripe_get(final_invoice, "total")
+
+        source_total_excluding_tax = stripe_get(final_invoice, "total_excluding_tax")
+
+        source_amount_remaining = stripe_get(final_invoice, "amount_remaining")
+
+        source_amount_paid = stripe_get(final_invoice, "amount_paid", 0)
+
+        source_status = stripe_get(final_invoice, "status")
+
+        source_due_date_ts = stripe_get(final_invoice, "due_date")
+
+        subscription_items = stripe_get(stripe_get(final_subscription, "items", {}), "data", [])
+
+        current_period_end_ts = None
+
+        if subscription_items:
+            current_period_end_ts = stripe_get(subscription_items[0], "current_period_end")
+
+        next_invoice_date = None
+        days_until_next_invoice = None
+
+        if current_period_end_ts:
+            next_invoice_date = datetime.fromtimestamp(
+                current_period_end_ts,
+                tz=timezone.utc
+            ).astimezone(TORONTO_TZ).date()
+
+            test_clock_today = datetime.fromtimestamp(
+                stripe_get(final_clock, "frozen_time"),
+                tz=timezone.utc
+            ).astimezone(TORONTO_TZ).date()
+
+            days_until_next_invoice = (
+                next_invoice_date - test_clock_today
+            ).days
+
+        automatic_tax = stripe_get(
+            final_invoice,
+            "automatic_tax",
+            {}
+        ) or {}
+
+        total_taxes = stripe_get(
+            final_invoice,
+            "total_taxes",
+            []
+        ) or []
+
+        calculated_tax = sum(
+            stripe_get(tax, "amount", 0)
+            for tax in total_taxes
+        )
+
+        return {
+            "status": "test_data_created",
+            "mode": mode,
+            "test_clock_id": test_clock.id,
+            "test_clock_status": final_clock_status,
+            "customer_id": customer.id,
+            "product_id": product.id,
+            "recurring_price_id": recurring_price.id,
+            "source_price_id": source_price.id,
+            "subscription_id": final_subscription.id,
+            "subscription_status": stripe_get(
+                final_subscription,
+                "status"
+            ),
+            "monthly_service_item_id": monthly_service_item_id,
+            "next_invoice_date": (
+                next_invoice_date.isoformat()
+                if next_invoice_date
+                else None
+            ),
+            "days_until_next_invoice": days_until_next_invoice,
+            "source_invoice_id": final_invoice.id,
+            "source_invoice_number": stripe_get(
+                final_invoice,
+                "number"
+            ),
+            "source_invoice_item_id": source_invoice_item.id,
+            "source_invoice_status": source_status,
+            "source_due_date_ts": source_due_date_ts,
+            "source_amount_paid_cents": source_amount_paid,
+            "source_amount_remaining_cents": source_amount_remaining,
+            "source_total_excluding_tax_cents": source_total_excluding_tax,
+            "source_tax_cents": calculated_tax,
+            "source_total_cents": source_total,
+            "automatic_tax_enabled": stripe_get(
+                automatic_tax,
+                "enabled",
+                False
+            ),
+            "automatic_tax_status": stripe_get(
+                automatic_tax,
+                "status"
+            ),
+            "verification": {
+                "invoice_is_open": source_status == "open",
+                "invoice_is_fully_unpaid": (
+                    source_amount_paid == 0
+                    and source_amount_remaining == source_total
+                ),
+                "pre_tax_amount_is_10673": (
+                    source_total_excluding_tax == 10673
+                ),
+                "tax_amount_is_1387": calculated_tax == 1387,
+                "total_amount_is_12060": source_total == 12060,
+                "next_invoice_is_tomorrow": (
+                    days_until_next_invoice == 1
+                ),
+            }
+        }
+
+    except stripe.error.StripeError as error:
+        return {
+            "status": "failed",
+            "reason": "Stripe rejected the test-data setup.",
+            "test_clock_id": test_clock.id if test_clock else None,
+            "customer_id": customer.id if customer else None,
+            "subscription_id": subscription.id if subscription else None,
+            "source_invoice_id": source_invoice.id if source_invoice else None,
+            "error": str(error),
+        }, 500
+
+    except Exception as error:
+        return {
+            "status": "failed",
+            "reason": "Unexpected test-data setup failure.",
+            "test_clock_id": test_clock.id if test_clock else None,
+            "customer_id": customer.id if customer else None,
+            "subscription_id": subscription.id if subscription else None,
+            "source_invoice_id": source_invoice.id if source_invoice else None,
+            "error": str(error),
+        }, 500
+
+@main.route("/admin/preview-carry-forward-one/<invoice_id>")
+def preview_carry_forward_one(invoice_id):
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    try:
+        candidate = get_carry_forward_candidate_by_invoice_id(invoice_id)
+
+        if candidate is None:
+            return {
+                "status": "not_candidate",
+                "invoice_id": invoice_id,
+                "reason": "Invoice did not pass the basic candidate filters."
+            }, 400
+
+        return {
+            "status": "success",
+            "candidate": candidate
+        }
+
+    except stripe.error.InvalidRequestError as error:
+        return {
+            "status": "failed",
+            "invoice_id": invoice_id,
+            "error": str(error)
+        }, 400
+
+    except stripe.error.StripeError as error:
+        return {
+            "status": "failed",
+            "invoice_id": invoice_id,
+            "error": str(error)
+        }, 500
