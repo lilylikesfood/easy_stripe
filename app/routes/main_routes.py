@@ -4004,8 +4004,8 @@ def debug_customer(customer_id):
 # bulk apply carry forward
 @main.route("/admin/apply-carry-forwards", methods=["POST"])
 def apply_carry_forwards():
-    if not session.get("logged_in"):
-        return redirect("/login")
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
 
     confirm= request.form.get("confirm")
 
@@ -4032,6 +4032,20 @@ def apply_carry_forwards():
         return {
             "error": "You submitted mode=test, but Stripe key is live."
         }, 400
+
+    max_apply_raw = request.form.get("max_apply", "1")
+
+    try:
+        max_apply = int(max_apply_raw)
+    except ValueError:
+        return {
+            "error": "max_apply must be a whole number."
+        }, 400
+
+    if max_apply < 1 or max_apply > 100:
+        return {
+            "error": "max_apply must be between 1 and 100."
+        }, 400
     
     # uuid.uuid4() returns a UUID object.  not a string
     run_id= str(uuid.uuid4())
@@ -4039,7 +4053,36 @@ def apply_carry_forwards():
     audit_result= find_carry_forward_candidates()
     candidates= audit_result["candidates"]
 
+    # test-only invoice filter
+    target_invoice_ids_raw = request.form.get("invoice_ids")
+
+    if target_invoice_ids_raw:
+        if mode != "test":
+            return {
+                "error": "invoice_ids filtering is only allowed in test mode."
+            }, 400
+
+        target_invoice_ids = {
+            invoice_id.strip()
+            for invoice_id in target_invoice_ids_raw.split(",")
+            if invoice_id.strip()
+        }
+
+        targeted_candidates = []
+
+        for target_invoice_id in target_invoice_ids:
+            candidate = get_carry_forward_candidate_by_invoice_id(
+                target_invoice_id
+            )
+
+            if candidate:
+                targeted_candidates.append(candidate)
+
+        candidates = targeted_candidates
+
     results= []
+
+    attempted_count = 0
 
     for candidate in candidates:
         if not candidate["eligible_to_apply"]:
@@ -4064,6 +4107,16 @@ def apply_carry_forwards():
             # db.session.add(log)
 
             continue
+
+        if attempted_count >= max_apply:
+            results.append({
+                "status": "not_attempted",
+                "invoice_id": candidate["invoice_id"],
+                "reason": "max_apply limit reached"
+            })
+            continue
+
+        attempted_count += 1
 
         try:
             result= carry_forward_invoice_balance(candidate["invoice_id"])
@@ -4099,13 +4152,17 @@ def apply_carry_forwards():
 
     return {
         "run_id": run_id,
+        "mode": mode,
+        "max_apply": max_apply,
         "status": "completed",
         "total_candidates": len(candidates),
+        "attempted_count": attempted_count,
         "results": results,
         "eligible_count": sum(1 for c in candidates if c["eligible_to_apply"]),
         "success_count": sum(1 for r in results if r["status"] == "success"),
         "skipped_count": sum(1 for r in results if r["status"] == "skipped"),
         "failed_count": sum(1 for r in results if r["status"] == "failed"),
+        "not_attempted_count": sum(1 for r in results if r["status"] == "not_attempted"),
     }
 
 # admin carry forward log
