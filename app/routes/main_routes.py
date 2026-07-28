@@ -1995,8 +1995,25 @@ def debug_invoice_item(invoice_item_id):
 
     invoice_item= stripe.InvoiceItem.retrieve(invoice_item_id)
 
-    return invoice_item._to_dict_recursive()
+    price_id = stripe_get(
+        invoice_item,
+        "pricing.price_details.price"
+    )
 
+    product_id = stripe_get(
+        invoice_item,
+        "pricing.price_details.product"
+    )
+
+    price = stripe.Price.retrieve(price_id)
+
+    product = stripe.Product.retrieve(product_id)
+
+    return {
+        "invoice_item": invoice_item._to_dict_recursive(),
+        "price_tax_behavior": stripe_get(price, "tax_behavior"),
+        "product_tax_code": stripe_get(product, "tax_code"),
+    }
 # get latest invoice item for invoice
 LATE_FEE_INTERVAL_DAYS = 30
 
@@ -2411,23 +2428,33 @@ def get_previous_late_fee_total_cents(customer_id, source_invoice_id):
 
 # Compounding late fee calculation:
 # New late fee = 1.5% of
-# (current overdue balance + all previous late fees
+# (pre-tax overdue invoice amount + all previous late fees
 # for the same source invoice)
 def calculate_compounding_late_fee_cents(invoice):
-    customer_id= stripe_get(invoice, "customer")
+    customer= stripe_get(invoice, "customer")
     source_invoice_id= stripe_get(invoice, "id")
-    original_remaining_amount_cents= stripe_get(invoice, "amount_remaining")
+    pretax_overdue_amount_cents = stripe_get(invoice, "total_excluding_tax")
 
-    if original_remaining_amount_cents is None:
-        raise Exception("Invoice is missing amount_remaining")
+    if isinstance(customer, str):
+        customer_id = customer
+    else:
+        customer_id = stripe_get(customer, "id")
+
     if customer_id is None:
         raise Exception("Invoice is missing customer_id")
     if source_invoice_id is None:
         raise Exception("Invoice is missing source_invoice_id")
+    if pretax_overdue_amount_cents is None:
+        raise Exception("Invoice is missing total_excluding_tax")
 
+    if pretax_overdue_amount_cents <= 0:
+        raise Exception(
+            "Invoice has no positive pre-tax overdue amount"
+        )
+    
     previous_late_fee_total_cents= get_previous_late_fee_total_cents(customer_id, source_invoice_id)
 
-    base_cents= original_remaining_amount_cents + previous_late_fee_total_cents
+    base_cents= pretax_overdue_amount_cents + previous_late_fee_total_cents
 
     late_fee_cents = int(round(base_cents * 0.015))
 
@@ -2510,6 +2537,22 @@ def apply_late_fee_to_invoice(invoice_id):
     # calculate days overdue
     days_overdue = (now_toronto.date() - effective_due_date.date()).days
     # days_overdue = 10
+
+    # It only affects invoices created specifically for this test
+    # invoice_metadata = stripe_get(invoice, "metadata", {})
+
+    # is_test_key = (
+    #     current_app.config["STRIPE_SECRET_KEY"]
+    #     .startswith("sk_test_")
+    # )
+
+    # force_overdue_for_test = (
+    #     is_test_key
+    #     and stripe_get(invoice_metadata, "force_overdue_for_test") == "true"
+    # )
+
+    # if force_overdue_for_test:
+    #     days_overdue = 1
     
     if days_overdue <= 0:
         return {
@@ -2534,18 +2577,79 @@ def apply_late_fee_to_invoice(invoice_id):
             "late_fee_month": late_fee_month,
         }
 
+    # idempotency check
+    # Normally, block another late fee within 30 days.
+    # For a specifically marked Stripe test invoice, allow a second fee
+    # so we can verify compounding.
+
+    # invoice_metadata = stripe_get(invoice, "metadata", {})
+
+    # stripe_key = current_app.config["STRIPE_SECRET_KEY"] or ""
+
+    # allow_compounding_test = (
+    #     stripe_key.startswith("sk_test_")
+    #     and stripe_get(invoice_metadata, "allow_compounding_test") == "true"
+    # )
+
+    # if (
+    #     has_recent_late_fee(customer_id, invoice_id)
+    #     and not allow_compounding_test
+    # ):
+    #     return {
+    #         "status": "skipped",
+    #         "reason": "Late fee already applied within last 30 days.",
+    #         "invoice_id": invoice_id,
+    #         "invoice_number": invoice_number,
+    #         "customer_id": customer_id,
+    #         "late_fee_month": late_fee_month,
+    #     }
+
     # calculate late fee
     late_fee_cents, base_cents = calculate_compounding_late_fee_cents(invoice)
+
+    # resolve the subscription that should receive the late-fee item
+    subscription, subscription_lookup_source = resolve_invoice_subscription(invoice, customer_id)
+
+    if subscription is None:
+        return {
+            "status": "skipped",
+            "reason": (
+                "Could not safely resolve exactly one billable subscription for this invoice."
+            ),
+            "invoice_id": invoice_id,
+            "invoice_number": invoice_number,
+            "customer_id": customer_id,
+            "late_fee_month": late_fee_month,
+            "subscription_lookup_source": subscription_lookup_source,
+        }
+
+    subscription_id = stripe_get(subscription, "id")
+
+    if not subscription_id:
+        return {
+            "status": "skipped",
+            "reason": "Resolved subscription is missing its ID.",
+            "invoice_id": invoice_id,
+            "invoice_number": invoice_number,
+            "customer_id": customer_id,
+            "late_fee_month": late_fee_month,
+            "subscription_lookup_source": subscription_lookup_source,
+        }
 
     # debug print
     print("INVOICE PERIOD:", invoice_period)
 
-    # create Stripe invoice item
+    # create the non-taxable Stripe invoice item
     invoice_item= stripe.InvoiceItem.create(
         customer=customer_id,
+        subscription=subscription_id,
         amount=late_fee_cents,
         discountable=False,
         currency="cad",
+        # Make it non-taxable
+        tax_code="txcd_00000000",
+        # simply means the entered amount is treated as the amount before any tax calculation
+        tax_behavior="exclusive",
         description=f"Late payment charge (1.5%) - invoice {invoice_number} - {invoice_period}",
         metadata={
             "type" : "late_fee",
@@ -2553,7 +2657,10 @@ def apply_late_fee_to_invoice(invoice_id):
             "source_invoice_number": invoice_number,
             "late_fee_month" : late_fee_month,
             "compounding": "true",
-            "late_fee_base_cents": str(base_cents)
+            "late_fee_base_cents": str(base_cents),
+            "subscription_id": subscription_id,
+            "subscription_lookup_source": subscription_lookup_source,
+            "accounting_rule_version": "pretax_nontaxable_compounding_v1",
             }
     )
 
@@ -2569,7 +2676,12 @@ def apply_late_fee_to_invoice(invoice_id):
         "late_fee_cents": late_fee_cents,
         "late_fee_base": cents_to_money(base_cents),
         "late_fee_base_cents": base_cents,
-        "invoice_item_id": invoice_item.id
+        "invoice_item_id": invoice_item.id,
+        "subscription_id": subscription_id,
+        "subscription_lookup_source": subscription_lookup_source,
+        "tax_code": "txcd_00000000",
+        "tax_behavior": "exclusive",
+        "accounting_rule_version": "pretax_nontaxable_compounding_v1",
     }
 
 # invoices often store the subscription under invoice.parent.subscription_details.subscription
@@ -3751,8 +3863,8 @@ def debug_invoice_accounting(invoice_id):
     This route does not create, modify, void, pay, or finalize anything.
     """
 
-    if not session.get("logged_in"):
-        return redirect("/login")
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
 
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
@@ -11630,3 +11742,223 @@ def preview_carry_forward_one(invoice_id):
             "invoice_id": invoice_id,
             "error": str(error)
         }, 500
+
+# create-late-fee-test-data
+@main.route("/admin/create-late-fee-test-data", methods=["POST"])
+def create_late_fee_test_data():
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    stripe_key = stripe.api_key or ""
+
+    if not stripe_key.startswith("sk_test_"):
+        return {
+            "status": "blocked",
+            "reason": (
+                "This test-data route requires a Stripe test key."
+            ),
+        }, 400
+
+    now_utc = datetime.now(timezone.utc)
+    future_due_date_utc = now_utc + timedelta(days=1)
+
+    # ---------------------------------------------------------
+    # 1. Create an isolated Stripe test customer
+    # ---------------------------------------------------------
+    customer = stripe.Customer.create(
+        name="Late Fee Test Customer",
+        email="late-fee-test@example.com",
+        description="Late fee test customer",
+        address={
+            "line1": "123 Test Street",
+            "city": "Toronto",
+            "state": "ON",
+            "postal_code": "M5V 1A1",
+            "country": "CA",
+        },
+        metadata={
+            "test_type": "late_fee",
+            "created_by": "create_late_fee_test_data",
+        },
+    )
+
+    # ---------------------------------------------------------
+    # 2. Create a temporary recurring price
+    # ---------------------------------------------------------
+    product = stripe.Product.create(
+        name="Late Fee Test Monthly Service",
+        metadata={
+            "test_type": "late_fee",
+        },
+    )
+
+    price = stripe.Price.create(
+        product=product.id,
+        currency="cad",
+        unit_amount=10000,
+        recurring={
+            "interval": "month",
+        },
+        metadata={
+            "item_type": "monthly_service_fee",
+            "test_type": "late_fee",
+        },
+    )
+
+    # ---------------------------------------------------------
+    # 3. Create an active manual-payment subscription
+    # ---------------------------------------------------------
+    subscription = stripe.Subscription.create(
+        customer=customer.id,
+        items=[
+            {
+                "price": price.id,
+            }
+        ],
+        collection_method="send_invoice",
+        days_until_due=30,
+        metadata={
+            "test_type": "late_fee",
+            "billing_rule_version": "late_fee_test_v1",
+        },
+    )
+
+    # ---------------------------------------------------------
+    # 4. Create a test 13% HST rate
+    # ---------------------------------------------------------
+    tax_rate = stripe.TaxRate.create(
+        display_name="HST",
+        description="Ontario HST test rate",
+        jurisdiction="CA - ON",
+        percentage=13.0,
+        inclusive=False,
+        metadata={
+            "test_type": "late_fee",
+        },
+    )
+
+    # ---------------------------------------------------------
+    # 5. Create a separate invoice tied to the subscription
+    #    with a due date of yesterday
+    # ---------------------------------------------------------
+    invoice = stripe.Invoice.create(
+        customer=customer.id,
+        subscription=subscription.id,
+        collection_method="send_invoice",
+        due_date=int(future_due_date_utc.timestamp()),
+        auto_advance=False,
+        description="Overdue invoice for late-fee testing",
+        metadata={
+            "test_type": "late_fee",
+            "force_overdue_for_test": "true",
+            "allow_compounding_test": "true",
+            "expected_pretax_cents": "10000",
+            "expected_tax_cents": "1300",
+            "expected_total_cents": "11300",
+        },
+    )
+
+    # ---------------------------------------------------------
+    # 6. Add one taxable $100 monthly-service line
+    # ---------------------------------------------------------
+    invoice_item = stripe.InvoiceItem.create(
+        customer=customer.id,
+        invoice=invoice.id,
+        subscription=subscription.id,
+        amount=10000,
+        currency="cad",
+        discountable=False,
+        tax_rates=[tax_rate.id],
+        description="Test monthly service fee",
+        metadata={
+            "item_type": "monthly_service_fee",
+            "test_type": "late_fee",
+        },
+    )
+
+    # ---------------------------------------------------------
+    # 7. Finalize the invoice so it becomes open
+    # ---------------------------------------------------------
+    finalized_invoice = stripe.Invoice.finalize_invoice(
+        invoice.id,
+        auto_advance=False,
+    )
+
+    return {
+        "status": "success",
+        "customer_id": customer.id,
+        "product_id": product.id,
+        "price_id": price.id,
+        "subscription_id": subscription.id,
+        "tax_rate_id": tax_rate.id,
+        "invoice_id": finalized_invoice.id,
+        "invoice_number": stripe_get(
+            finalized_invoice,
+            "number"
+        ),
+        "invoice_status": stripe_get(
+            finalized_invoice,
+            "status"
+        ),
+        "collection_method": stripe_get(
+            finalized_invoice,
+            "collection_method"
+        ),
+        "due_date": stripe_get(
+            finalized_invoice,
+            "due_date"
+        ),
+        "total_excluding_tax": stripe_get(
+            finalized_invoice,
+            "total_excluding_tax"
+        ),
+        "tax_cents": (
+            stripe_get(finalized_invoice, "total", 0)
+            - stripe_get(
+                finalized_invoice,
+                "total_excluding_tax",
+                0
+            )
+        ),
+        "total": stripe_get(
+            finalized_invoice,
+            "total"
+        ),
+        "amount_remaining": stripe_get(
+            finalized_invoice,
+            "amount_remaining"
+        ),
+        "invoice_item_id": invoice_item.id,
+        "expected_late_fee_base_cents": 10000,
+        "expected_first_late_fee_cents": 150,
+    }
+
+# enable-late-fee-compounding-test
+@main.route(
+    "/admin/enable-late-fee-compounding-test/<invoice_id>", methods=["POST"])
+def enable_late_fee_compounding_test(invoice_id):
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    stripe_key = stripe.api_key or ""
+
+    if not stripe_key.startswith("sk_test_"):
+        return {
+            "status": "blocked",
+            "reason": "This route requires a Stripe test key.",
+        }, 400
+
+    invoice = stripe.Invoice.modify(
+        invoice_id,
+        metadata={
+            "force_overdue_for_test": "true",
+            "allow_compounding_test": "true",
+        },
+    )
+
+    invoice_metadata = stripe_get(invoice, "metadata", {})
+
+    return {
+    "status": "success",
+    "invoice_id": invoice.id,
+    "force_overdue_for_test": stripe_get(invoice_metadata, "force_overdue_for_test"),
+    "allow_compounding_test": stripe_get(invoice_metadata, "allow_compounding_test"),
+}
