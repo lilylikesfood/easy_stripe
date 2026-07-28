@@ -24,6 +24,9 @@ class CarryForwardLog(db.Model):
     source_invoice_created = db.Column(db.DateTime, nullable=True)
     source_invoice_due_date = db.Column(db.DateTime, nullable=True)
     source_invoice_total_cents = db.Column(db.Integer, nullable=True)
+    # original invoice total before tax
+    source_invoice_total_excluding_tax_cents = db.Column(db.Integer, nullable=True)
+    # remaining unpaid amount including tax
     source_invoice_amount_remaining_cents = db.Column(db.Integer, nullable=True)
 
     # status proof

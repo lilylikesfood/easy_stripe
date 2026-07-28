@@ -1995,25 +1995,34 @@ def debug_invoice_item(invoice_item_id):
 
     invoice_item= stripe.InvoiceItem.retrieve(invoice_item_id)
 
-    price_id = stripe_get(
-        invoice_item,
-        "pricing.price_details.price"
+    pricing = stripe_get(invoice_item, "pricing", {}) or {}
+
+    price_details = stripe_get(pricing, "price_details", {}) or {}
+
+    price_id = stripe_get(price_details, "price")
+
+    product_id = stripe_get(price_details, "product")
+
+    price = (
+        stripe.Price.retrieve(price_id) if price_id else None
     )
 
-    product_id = stripe_get(
-        invoice_item,
-        "pricing.price_details.product"
+    product = (
+        stripe.Product.retrieve(product_id) if product_id  else None
     )
-
-    price = stripe.Price.retrieve(price_id)
-
-    product = stripe.Product.retrieve(product_id)
 
     return {
         "invoice_item": invoice_item._to_dict_recursive(),
-        "price_tax_behavior": stripe_get(price, "tax_behavior"),
-        "product_tax_code": stripe_get(product, "tax_code"),
+        "price_id": price_id,
+        "product_id": product_id,
+        "price_tax_behavior": (
+            stripe_get(price, "tax_behavior") if price else None
+        ),
+        "product_tax_code": (
+            stripe_get(product, "tax_code") if product else None
+        ),
     }
+
 # get latest invoice item for invoice
 LATE_FEE_INTERVAL_DAYS = 30
 
@@ -2092,7 +2101,12 @@ def create_carry_forward_log_from_result(run_id, result):
         customer_id=result.get("customer_id"),
         invoice_item_id=result.get("invoice_item_id"),
 
-        amount_cents=result.get("amount_remaining_cents"),
+        amount_cents=(
+            result.get("carried_forward_amount_cents")
+            or result.get("intended_carry_forward_amount_cents")
+            or result.get("amount_remaining_cents")
+            or 0
+        ),        
         carried_forward_amount_cents=result.get("carried_forward_amount_cents"),
 
         status=result.get("status"),
@@ -2106,6 +2120,7 @@ def create_carry_forward_log_from_result(run_id, result):
         source_invoice_created=stripe_timestamp_to_utc_datetime(result.get("source_invoice_created_ts")),
         source_invoice_due_date=stripe_timestamp_to_utc_datetime(result.get("source_invoice_due_date_ts")),
         source_invoice_total_cents=result.get("source_invoice_total_cents"),
+        source_invoice_total_excluding_tax_cents=result.get("source_total_excluding_tax_cents"),
         source_invoice_amount_remaining_cents=result.get("source_invoice_amount_remaining_cents"),
 
         new_invoice_id=result.get("new_invoice_id"),
@@ -2229,7 +2244,12 @@ def find_late_fee_candidates():
             invoice_id,
         )
 
-        if not already_applied:
+        can_apply = (
+            not already_applied
+            and subscription_id is not None
+        )
+
+        if can_apply:
             total_late_fee_cents += late_fee_cents
 
         late_fee_candidates.append({
@@ -2243,8 +2263,15 @@ def find_late_fee_candidates():
             "effective_due_date": effective_due_date.date().isoformat(),
             "days_overdue": days_overdue,
             "late_fee_month": late_fee_month,
-            "eligible_to_apply": not already_applied,
-            "skip_reason": "late fee already applied within last 30 days" if already_applied else None,
+            "eligible_to_apply": can_apply,
+            "skip_reason": (
+                "late fee already applied within last 30 days" if already_applied 
+                else (
+                    f"Could not safely resolve a billable subscription: "
+                    f"{subscription_lookup_source}"
+                    if subscription_id is None else None
+                )
+            ),
             "late_fee_rate": "1.5%",
             "late_fee_base": cents_to_money(base_cents),
             "late_fee_base_cents": base_cents,
@@ -2395,8 +2422,8 @@ def debug_schedule_next_date(subscription_id):
 # If we ran today,who would receive a late fee and how much?
 @main.route("/admin/audit-late-fees")
 def audit_late_fees():
-    if not session.get("logged_in"):
-        return redirect("/login")
+    # if not session.get("logged_in"):
+    #     return redirect("/login")
     
     return find_late_fee_candidates()
     # def get_name():
@@ -2888,7 +2915,7 @@ def apply_late_fees():
     # commit once after the loop 
     db.session.commit()
 
-    skipped_count= sum(1 for c in candidates if not c["eligible_to_apply"])
+    skipped_count= sum(1 for result in results if result["status"] == "skipped")
 
     redirect_to_dashboard= request.form.get("redirect_to_dashboard")
 
@@ -2986,19 +3013,44 @@ def carry_forward_invoice_balance(invoice_id):
 
     carry_forward_description = f"Previous unpaid balance - invoice {invoice_number}"
 
+    base_result = {
+        "invoice_id": invoice_id,
+        "source_invoice_number": invoice_number,
+        "customer_id": customer_id,
+        "amount_remaining_cents": amount_remaining,
+        "source_invoice_created_ts": source_invoice_created_ts,
+        "source_invoice_due_date_ts": source_invoice_due_date_ts,
+        "source_invoice_total_cents": source_invoice_total_cents,
+        "source_invoice_amount_remaining_cents": source_invoice_amount_remaining_cents,
+    }
+
     if invoice_status != "open":
         return {
             "status": "skipped",
             "reason": "Invoice is not open",
             "invoice_id": invoice_id,
-            "invoice_status": invoice_status
+            "source_invoice_number": invoice_number,
+            "customer_id": customer_id,
+            "invoice_status": invoice_status,
+            "amount_remaining_cents": amount_remaining,
+            "source_invoice_created_ts": source_invoice_created_ts,
+            "source_invoice_due_date_ts": source_invoice_due_date_ts,
+            "source_invoice_total_cents": source_invoice_total_cents,
+            "source_invoice_amount_remaining_cents": source_invoice_amount_remaining_cents,
         }
     
     if amount_remaining <= 0:
         return {
             "status": "skipped", 
             "reason": "Invoice has no remaining balance",
-            "invoice_id": invoice_id
+            "invoice_id": invoice_id,
+            "source_invoice_number": invoice_number,
+            "customer_id": customer_id,
+            "amount_remaining_cents": amount_remaining,
+            "source_invoice_created_ts": source_invoice_created_ts,
+            "source_invoice_due_date_ts": source_invoice_due_date_ts,
+            "source_invoice_total_cents": source_invoice_total_cents,
+            "source_invoice_amount_remaining_cents": source_invoice_amount_remaining_cents,
         }
     
     if currency != "cad":
@@ -3006,7 +3058,14 @@ def carry_forward_invoice_balance(invoice_id):
             "status": "skipped",
             "reason": "Invoice currency is not CAD",
             "invoice_id": invoice_id,
-            "currency": currency
+            "source_invoice_number": invoice_number,
+            "customer_id": customer_id,
+            "amount_remaining_cents": amount_remaining,
+            "currency": currency,
+            "source_invoice_created_ts": source_invoice_created_ts,
+            "source_invoice_due_date_ts": source_invoice_due_date_ts,
+            "source_invoice_total_cents": source_invoice_total_cents,
+            "source_invoice_amount_remaining_cents": source_invoice_amount_remaining_cents,
         }
     
     if not customer_id:
@@ -3018,34 +3077,34 @@ def carry_forward_invoice_balance(invoice_id):
     
     if carry_forward_already_exists(customer_id, invoice_id):
         return {
+            **base_result,
             "status": "skipped",
             "reason": "Carry forward already exists",
-            "invoice_id": invoice_id
         }
     
     candidate = get_carry_forward_candidate_by_invoice_id(invoice_id)
 
     if not candidate:
         return {
+            **base_result,
             "status": "skipped",
             "reason": "Invoice is not currently a carry-forward candidate",
-            "invoice_id": invoice_id
         }
 
     if not candidate["eligible_to_apply"]:
         return {
+            **base_result,
             "status": "skipped",
             "reason": candidate["skip_reason"],
-            "invoice_id": invoice_id,
             "days_until_next_invoice": candidate.get("days_until_next_invoice"),
             "next_invoice_date": candidate.get("next_invoice_date")
         }
 
     if not candidate.get("subscription_id"):
         return {
+            **base_result,
             "status": "skipped",
             "reason": "Target subscription could not be determined safely",
-            "invoice_id": invoice_id,
             "subscription_lookup_source": candidate.get(
                 "subscription_lookup_source"
             )
@@ -3057,27 +3116,27 @@ def carry_forward_invoice_balance(invoice_id):
 
     if source_total_excluding_tax_cents is None:
         return {
+            **base_result,
             "status": "skipped",
             "reason": "Source total_excluding_tax is unavailable",
-            "invoice_id": invoice_id,
             "source_total_excluding_tax_cents": None,
             "proposed_carry_forward_amount_cents": carry_forward_amount_cents,
         }
 
     if carry_forward_amount_cents is None:
         return {
+            **base_result,
             "status": "skipped", 
             "reason": "Proposed carry-forward amount is unavailable",
-            "invoice_id": invoice_id,
             "source_total_excluding_tax_cents": source_total_excluding_tax_cents,
             "proposed_carry_forward_amount_cents": None,
             }
     
     if carry_forward_amount_cents != source_total_excluding_tax_cents:
         return {
+            **base_result,
             "status": "skipped",
             "reason": "Proposed carry-forward amount does not match source total_excluding_tax",
-            "invoice_id": invoice_id,
             "source_total_excluding_tax_cents": source_total_excluding_tax_cents,
             "proposed_carry_forward_amount_cents": carry_forward_amount_cents,
             "manual_action_required": True,
@@ -3102,11 +3161,9 @@ def carry_forward_invoice_balance(invoice_id):
 
     except Exception as e:
         return {
+            **base_result,
             "status": "partial_failure",
             "reason": "Source invoice void or verification failed",
-            "invoice_id": invoice_id,
-            "source_invoice_number": invoice_number,
-            "customer_id": customer_id,
             "old_invoice_status_before": old_invoice_status_before,
             "old_invoice_status_after": None,
             "source_invoice_void_status_uncertain": True,
@@ -3121,12 +3178,9 @@ def carry_forward_invoice_balance(invoice_id):
 
     if old_invoice_status_after != "void":
         return {
+            **base_result,
             "status": "failed",
             "reason": "Invoice was not voided, so carry-forward item was not created",
-            "invoice_id": invoice_id,
-            "source_invoice_number": invoice_number,
-            "customer_id": customer_id,
-            "amount_remaining_cents": amount_remaining,
             "old_invoice_status_before": old_invoice_status_before,
             "old_invoice_status_after": old_invoice_status_after,
             "source_invoice_total_cents": source_invoice_total_cents,
@@ -3143,6 +3197,7 @@ def carry_forward_invoice_balance(invoice_id):
             # carry forward approved pre-tax balance
             amount=carry_forward_amount_cents,
             currency="cad",
+            discountable=False,
             tax_behavior="exclusive",
             description=carry_forward_description, 
             metadata=metadata
@@ -3150,9 +3205,9 @@ def carry_forward_invoice_balance(invoice_id):
 
     except Exception as e:
         return {
+            **base_result,
             "status": "partial_failure",
             "reason": "Source invoice was voided but carry-forward item creation failed",
-            "invoice_id": invoice_id,
             "source_invoice_number": invoice_number,
             "customer_id": customer_id,
             "old_invoice_status_before": old_invoice_status_before,
@@ -3173,9 +3228,9 @@ def carry_forward_invoice_balance(invoice_id):
 
     if created_amount != carry_forward_amount_cents:
         return {
+            **base_result,
             "status": "partial_failure",
             "reason": "Carry-forward item was created with an unexpected amount",
-            "invoice_id": invoice_id,
             "source_invoice_number": invoice_number,
             "customer_id": customer_id,
             "invoice_item_id": stripe_get(invoice_item, "id"),
@@ -3245,10 +3300,17 @@ def carry_forward_one(invoice_id):
 
     run_id = str(uuid.uuid4())
 
-    log = create_carry_forward_log_from_result(run_id, result)
+    if result.get("customer_id"):
+        log = create_carry_forward_log_from_result(run_id, result)
 
-    db.session.add(log)
-    db.session.commit()
+        db.session.add(log)
+        db.session.commit()
+
+    else:
+        result["database_log_created"] = False
+        result["database_log_skip_reason"] = (
+            "Result has no customer_id, but CarryForwardLog.customer_id is required."
+        )
 
     return result
 
@@ -4274,6 +4336,7 @@ def apply_carry_forwards():
         "success_count": sum(1 for r in results if r["status"] == "success"),
         "skipped_count": sum(1 for r in results if r["status"] == "skipped"),
         "failed_count": sum(1 for r in results if r["status"] == "failed"),
+        "partial_failure_count": sum(1 for r in results if r["status"] == "partial_failure"),
         "not_attempted_count": sum(1 for r in results if r["status"] == "not_attempted"),
     }
 
@@ -4317,10 +4380,11 @@ def accounting_carry_forward_report_csv():
         "Customer ID",
         "Source Invoice ID",
         "Source Invoice Number",
-        "Source Invoice Total",
+        "Source Invoice Total Including Tax",
+        "Source Invoice Total Excluding Tax",
         "Source Invoice Amount Remaining",
         "Carried Forward Amount",
-        "Difference Check",
+        "Pre-Tax Difference Check",
         "Status Before",
         "Status After",
         "Invoice Item ID",
@@ -4337,9 +4401,10 @@ def accounting_carry_forward_report_csv():
             row["source_invoice_id"],
             row["source_invoice_number"],
             f"{row['source_invoice_total']:.2f}",
+            f"{row['source_invoice_total_excluding_tax']:.2f}" if row["source_invoice_total_excluding_tax"] is not None else "",
             f"{row['source_invoice_amount_remaining']:.2f}",
             f"{row['carried_forward_amount']:.2f}",
-            f"{row['difference_check']:.2f}",
+            f"{row['difference_check']:.2f}" if row["difference_check"] is not None else "",
             row["status_before"],
             row["status_after"],
             row["invoice_item_id"],
@@ -4387,9 +4452,18 @@ def get_accounting_carry_forward_report_data():
         source_invoice_number = log.source_invoice_number or log.invoice_id
         status_before = log.old_invoice_status_before or "unknown"
         status_after = log.old_invoice_status_after or log.old_invoice_status
-        is_legacy = log.carried_forward_amount_cents is None
+        is_legacy = (
+            log.source_invoice_total_excluding_tax_cents is None
+            or log.carried_forward_amount_cents is None
+        )
 
-        difference_check_cents= (log.source_invoice_amount_remaining_cents or 0) - amount_cents
+        source_total_excluding_tax_cents = log.source_invoice_total_excluding_tax_cents
+
+        if source_total_excluding_tax_cents is not None:
+            difference_check_cents = (source_total_excluding_tax_cents - amount_cents)
+        else:
+            # Old logs created before the pre-tax column existed
+            difference_check_cents = None
 
         rows.append({
             "carry_forward_date": format_toronto(created_at) if created_at else None,
@@ -4401,6 +4475,11 @@ def get_accounting_carry_forward_report_data():
             "source_invoice_due_date": format_toronto(log.source_invoice_due_date) if log.source_invoice_due_date else None,
             "source_invoice_total_cents": log.source_invoice_total_cents,
             "source_invoice_total": cents_to_money(log.source_invoice_total_cents or 0),
+            "source_invoice_total_excluding_tax_cents": source_total_excluding_tax_cents,
+            "source_invoice_total_excluding_tax": (
+                cents_to_money(source_total_excluding_tax_cents)
+                if source_total_excluding_tax_cents is not None else None
+            ),
             "source_invoice_amount_remaining_cents": log.source_invoice_amount_remaining_cents,
             "source_invoice_amount_remaining": cents_to_money(log.source_invoice_amount_remaining_cents or 0),
             "carried_forward_amount_cents": amount_cents,
@@ -4408,7 +4487,7 @@ def get_accounting_carry_forward_report_data():
             "status_before": status_before,
             "status_after": status_after,
             "difference_check_cents": difference_check_cents,
-            "difference_check": cents_to_money(difference_check_cents),
+            "difference_check": cents_to_money(difference_check_cents) if difference_check_cents is not None else None,
             "invoice_item_id": log.invoice_item_id,
             "new_invoice_id": log.new_invoice_id,
             "new_invoice_number": log.new_invoice_number,
@@ -4521,6 +4600,7 @@ def run_overdue_billing():
             log = LateFeeLog(
                 run_id=run_id,
                 invoice_id=candidate["invoice_id"],
+                invoice_number=candidate.get("invoice_number"),
                 customer_id=candidate["customer_id"],
                 invoice_item_id=None,
                 late_fee_month=candidate["late_fee_month"],
@@ -4542,13 +4622,14 @@ def run_overdue_billing():
             log = LateFeeLog(
                 run_id=run_id,
                 invoice_id=result.get("invoice_id"),
-                customer_id=candidate["customer_id"],
+                invoice_number=result.get("invoice_number"),
+                customer_id=result.get("customer_id"),
                 invoice_item_id=result.get("invoice_item_id"),
                 late_fee_month=result.get("late_fee_month"),
                 amount_cents=result.get("late_fee_cents"),
                 status=result.get("status"),
                 reason=result.get("reason"),
-                error=None,
+                error=result.get("error"),
                 created_at=datetime.now(timezone.utc)
             )
 
@@ -4564,6 +4645,7 @@ def run_overdue_billing():
             log = LateFeeLog(
                 run_id=run_id,
                 invoice_id=candidate["invoice_id"],
+                invoice_number=candidate.get("invoice_number"),
                 customer_id=candidate["customer_id"],
                 invoice_item_id=None,
                 late_fee_month=candidate["late_fee_month"],
@@ -4659,6 +4741,7 @@ def run_overdue_billing():
             "success_count": sum(1 for r in carry_forward_results if r["status"] == "success"),
             "skipped_count": sum(1 for r in carry_forward_results if r["status"] == "skipped"),
             "failed_count": sum(1 for r in carry_forward_results if r["status"] == "failed"),
+            "partial_failure_count": sum(1 for result in carry_forward_results if result["status"] == "partial_failure"),
             "results": carry_forward_results,
         },
     }
