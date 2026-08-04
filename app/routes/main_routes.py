@@ -12045,3 +12045,134 @@ def enable_late_fee_compounding_test(invoice_id):
     "force_overdue_for_test": stripe_get(invoice_metadata, "force_overdue_for_test"),
     "allow_compounding_test": stripe_get(invoice_metadata, "allow_compounding_test"),
 }
+
+# ------------------------------------------------------customize email sender
+FIRST_REMINDER_DAY = 1
+SECOND_REMINDER_DAY = 14
+THIRD_REMINDER_DAY = 28
+FINAL_NOTICE_DAY = 42
+
+# preview payment reminders
+@main.route("/admin/preview-payment-reminders", methods=["GET"])
+def preview_payment_reminders():
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    invoices = stripe.Invoice.list(
+        status="open",
+        limit=100,
+    )
+
+    today = datetime.now(timezone.utc).date()
+
+    results = []
+
+    for invoice in invoices.auto_paging_iter():
+
+        invoice_id = stripe_get(invoice, "id")
+        invoice_number = stripe_get(invoice, "number")
+        customer_id = stripe_get(invoice, "customer")
+        collection_method = stripe_get(invoice, "collection_method")
+        status = stripe_get(invoice, "status")
+        due_date_ts = stripe_get(invoice, "due_date")
+        amount_remaining_cents = stripe_get(invoice, "amount_remaining") or 0
+        created_at_ts = stripe_get(invoice, "created")
+        created_at_dt = stripe_timestamp_to_utc_datetime(created_at_ts)
+
+        customer_email = stripe_get(invoice, "customer_email")
+
+        eligible = None
+        skip_reason = None
+        reminder_stage = None
+
+        if due_date_ts:
+            due_date_dt = stripe_timestamp_to_utc_datetime(due_date_ts)
+            stripe_due_date = due_date_dt.date()
+            effective_due_date = stripe_due_date
+
+        else:
+            stripe_due_date = None
+            effective_due_date = (created_at_dt + relativedelta(days=20)).date()
+
+        days_overdue = (today - effective_due_date).days
+
+        if amount_remaining_cents <= 0:
+            eligible = False
+            skip_reason = "no_amount_remaining"
+        
+        elif days_overdue <= 0:
+            eligible = False
+            skip_reason = "not_overdue"
+
+        elif not customer_email:
+            eligible = False
+            skip_reason = "missing_customer_email"
+
+        else:
+            eligible = True
+            skip_reason = None
+
+        if eligible:
+            if days_overdue >= FINAL_NOTICE_DAY:
+                reminder_stage = "final_notice"
+            elif days_overdue >= THIRD_REMINDER_DAY:
+                reminder_stage = "third_reminder"
+            elif days_overdue >= SECOND_REMINDER_DAY:
+                reminder_stage = "second_reminder"
+            else:
+                reminder_stage = "first_reminder"
+
+        result = {
+            "invoice_id": invoice_id,
+            "invoice_number": invoice_number,
+            "customer_id": customer_id,
+            "customer_email": customer_email,
+            "collection_method": collection_method,
+            "status": status,
+            "stripe_due_date": stripe_due_date.isoformat() if stripe_due_date else None,
+            "effective_due_date": effective_due_date.isoformat(),
+            "days_overdue": days_overdue,
+            "amount_remaining_cents": amount_remaining_cents,
+            "reminder_stage": reminder_stage,
+            "eligible": eligible,
+            "skip_reason": skip_reason,
+        }
+    
+        results.append(result)
+
+    return {
+        "results": results,
+        "checked_count": len(results),
+    }
+
+# run it once for investigation, not as part of normal reminder workflow cuz paid could potentially contain thousands of invoices
+@main.route("/admin/debug-invoice-status-counts", methods=["GET"])
+def debug_invoice_status_counts():
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    statuses = [
+        "draft",
+        "open",
+        "paid",
+        "void",
+        "uncollectible",
+    ]
+
+    counts = {}
+
+    for status in statuses:
+        invoices = stripe.Invoice.list(
+            status=status,
+            limit=100,
+        )
+
+        count = 0
+
+        for invoice in invoices.auto_paging_iter():
+            count += 1
+
+        counts[status] = count
+
+    return {
+        "invoice_status_counts": counts,
+        "total_invoices": sum(counts.values()),
+    }
