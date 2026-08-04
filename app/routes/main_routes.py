@@ -12060,29 +12060,53 @@ def preview_payment_reminders():
     invoices = stripe.Invoice.list(
         status="open",
         limit=100,
+        expand=["data.customer"]
     )
 
     today = datetime.now(timezone.utc).date()
 
     results = []
 
+    summary= {
+        "checked": 0,
+        "eligible": 0,
+        "not_eligible": 0,
+
+        "first_reminder": 0,
+        "second_reminder": 0,
+        "third_reminder": 0,
+        "final_notice": 0,
+
+        "not_overdue": 0,
+        "missing_customer_email":0,
+        "no_amount_remaining":0,
+    }
+
     for invoice in invoices.auto_paging_iter():
 
+        # Retrieve invoice information
         invoice_id = stripe_get(invoice, "id")
         invoice_number = stripe_get(invoice, "number")
-        customer_id = stripe_get(invoice, "customer")
+        hosted_invoice_url = stripe_get(invoice, "hosted_invoice_url")
+
+        customer = stripe_get(invoice, "customer")
+        customer_id = stripe_get(customer, "id")
         collection_method = stripe_get(invoice, "collection_method")
         status = stripe_get(invoice, "status")
         due_date_ts = stripe_get(invoice, "due_date")
         amount_remaining_cents = stripe_get(invoice, "amount_remaining") or 0
+        amount_remaining = cents_to_money(amount_remaining_cents) if amount_remaining_cents else None
         created_at_ts = stripe_get(invoice, "created")
         created_at_dt = stripe_timestamp_to_utc_datetime(created_at_ts)
 
-        customer_email = stripe_get(invoice, "customer_email")
+        customer_email = stripe_get(customer, "email")
+        customer_name =stripe_get(customer, "name")
 
         eligible = None
         skip_reason = None
         reminder_stage = None
+
+        summary["checked"] += 1
 
         if due_date_ts:
             due_date_dt = stripe_timestamp_to_utc_datetime(due_date_ts)
@@ -12095,36 +12119,69 @@ def preview_payment_reminders():
 
         days_overdue = (today - effective_due_date).days
 
+        # Determine eligibility
         if amount_remaining_cents <= 0:
             eligible = False
             skip_reason = "no_amount_remaining"
+            # should seperate business logic from reporting
+            # summary["no_amount_remaining"] += 1
         
         elif days_overdue <= 0:
             eligible = False
             skip_reason = "not_overdue"
+            # should seperate business logic from reporting
+            # summary["not_overdue"] += 1
 
         elif not customer_email:
             eligible = False
             skip_reason = "missing_customer_email"
+            # should seperate business logic from reporting
+            # summary["missing_customer_email"] += 1
 
         else:
             eligible = True
             skip_reason = None
 
+        # Update summary statistics
+        if eligible:
+            summary["eligible"] += 1
+        else:
+            summary["not_eligible"] += 1
+
+        if skip_reason:
+            summary[skip_reason] += 1
+
         if eligible:
             if days_overdue >= FINAL_NOTICE_DAY:
                 reminder_stage = "final_notice"
+                # should seperate business logic from reporting
+                # summary["final_notice"] += 1
+
             elif days_overdue >= THIRD_REMINDER_DAY:
                 reminder_stage = "third_reminder"
+                # should seperate business logic from reporting
+                # summary["third_reminder"] += 1
+
             elif days_overdue >= SECOND_REMINDER_DAY:
                 reminder_stage = "second_reminder"
+                # should seperate business logic from reporting
+                # summary["second_reminder"] += 1
+
             else:
                 reminder_stage = "first_reminder"
+                # should seperate business logic from reporting
+                # summary["first_reminder"] += 1
 
+        if reminder_stage:
+            summary[reminder_stage] += 1
+
+        # Build preview result
         result = {
             "invoice_id": invoice_id,
             "invoice_number": invoice_number,
+            "hosted_invoice_url": hosted_invoice_url if hosted_invoice_url else None,
             "customer_id": customer_id,
+            "customer_name": customer_name,
             "customer_email": customer_email,
             "collection_method": collection_method,
             "status": status,
@@ -12132,6 +12189,7 @@ def preview_payment_reminders():
             "effective_due_date": effective_due_date.isoformat(),
             "days_overdue": days_overdue,
             "amount_remaining_cents": amount_remaining_cents,
+            "amount_remaining": amount_remaining,
             "reminder_stage": reminder_stage,
             "eligible": eligible,
             "skip_reason": skip_reason,
@@ -12139,9 +12197,21 @@ def preview_payment_reminders():
     
         results.append(result)
 
+    # Sort invoices by overdue days descending so the most overdue invoices appear first
+    # given a result, return its days overdue
+    # result → result["days_overdue"]
+    # lambda result:
+    #     take this result
+    #     return result["days_overdue"]
+
+    # For each item, calculate something
+    # item -> calculated value
+    sorted_list = sorted(results, key=lambda result: result["days_overdue"], reverse=True)
+    # For every item in the results list, temporarily call it result, then use that result's days_overdue value for sorting
+
     return {
-        "results": results,
-        "checked_count": len(results),
+        "results": sorted_list,
+        "summary": summary,
     }
 
 # run it once for investigation, not as part of normal reminder workflow cuz paid could potentially contain thousands of invoices
