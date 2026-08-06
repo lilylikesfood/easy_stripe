@@ -44,6 +44,13 @@ import time
 
 main = Blueprint("main", __name__)
 
+# If that condition is true, we return True immediately — meaning "treat this person as logged in."
+# Otherwise, fall back to the login 
+def logged_in_or_dev():
+    if os.getenv("ALLOW_ADMIN_WITHOUT_LOGIN") == "true":
+        return True
+    
+    return session.get("logged_in", False)
 
 @main.route("/")
 def home():
@@ -2234,10 +2241,35 @@ def find_late_fee_candidates():
 
         days_overdue= raw_days
 
-        late_fee_cents, base_cents = calculate_compounding_late_fee_cents(invoice)                  
-        
         invoice_id= stripe_get(invoice, "id")
         invoice_number = stripe_get(invoice, "number")
+
+        try: 
+            late_fee_cents, base_cents = calculate_compounding_late_fee_cents(invoice)
+        except Exception as e:
+            late_fee_candidates.append({
+                "customer_id": customer_id,
+                "customer_name": customer_name,
+                "customer_email": customer_email,
+                "invoice_id": invoice_id,
+                "invoice_number": invoice_number,
+                "eligible_to_apply": False,
+                "skip_reason": f"late fee calculation failed: {e}",
+                "late_fee_rate": "1.5%",
+                "late_fee_base": None,
+                "late_fee_base_cents": None,
+                "late_fee": None,
+                "late_fee_cents": None,
+                "invoice_url": stripe_get(invoice, "hosted_invoice_url"),
+                "days_overdue": days_overdue,
+                "effective_due_date": effective_due_date.date().isoformat(),
+                "collection_method": stripe_get(invoice, "collection_method"),
+                "amount_remaining": cents_to_money(amount_remaining),
+                "reason": "calculation_error",
+                "subscription_id": subscription_id,
+            }) 
+
+            continue
 
         already_applied= has_recent_late_fee(
             customer_id,
@@ -2422,8 +2454,8 @@ def debug_schedule_next_date(subscription_id):
 # If we ran today,who would receive a late fee and how much?
 @main.route("/admin/audit-late-fees")
 def audit_late_fees():
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not logged_in_or_dev():
+        return redirect("/login")
     
     return find_late_fee_candidates()
     # def get_name():
@@ -2446,9 +2478,22 @@ def get_previous_late_fee_total_cents(customer_id, source_invoice_id):
     for invoice_item in invoice_items.auto_paging_iter():
         metadata= stripe_get(invoice_item, "metadata", {})
 
+        # if (
+        #     stripe_get(metadata, "type") == "late_fee" 
+        #     and stripe_get(metadata, "source_invoice_id") == source_invoice_id):
+        #     total_cents += stripe_get(invoice_item, "amount", 0)
+
+        if stripe_get(metadata, "type") == "late_fee":
+            print(
+                invoice_item["id"],
+                stripe_get(metadata, "source_invoice_id"),
+                invoice_item["amount"]
+            )
+
         if (
-            stripe_get(metadata, "type") == "late_fee" 
-            and stripe_get(metadata, "source_invoice_id") == source_invoice_id):
+            stripe_get(metadata, "type") == "late_fee"
+            and stripe_get(metadata, "source_invoice_id") == source_invoice_id
+        ):
             total_cents += stripe_get(invoice_item, "amount", 0)
 
     return total_cents
@@ -2484,6 +2529,14 @@ def calculate_compounding_late_fee_cents(invoice):
     base_cents= pretax_overdue_amount_cents + previous_late_fee_total_cents
 
     late_fee_cents = int(round(base_cents * 0.015))
+
+    print("===================================")
+    print("Invoice:", source_invoice_id)
+
+    print("Pretax:", pretax_overdue_amount_cents)
+
+    print("Previous late fee total:", previous_late_fee_total_cents)
+    print("===============================")
 
     return late_fee_cents, base_cents
 
@@ -2542,6 +2595,18 @@ def apply_late_fee_to_invoice(invoice_id):
             "customer_id": customer_id,
             "late_fee_month": late_fee_month,
             "invoice_status": invoice_status
+        }
+
+    # Currency validation
+    invoice_currency = stripe_get(invoice, "currency")
+    if invoice_currency != "cad":
+        return {
+            "status": "skipped",
+            "reason": f"Invoice currency is {invoice_currency}, not CAD.",
+            "invoice_id": invoice_id,
+            "invoice_number": invoice_number,
+            "customer_id": customer_id,
+            "late_fee_month": late_fee_month,
         }
 
     # validate amount remaining
@@ -2751,8 +2816,8 @@ def resolve_invoice_subscription(invoice, customer_id):
 # apply late fee for one person before apply to all
 @main.route("/admin/apply-late-fee-one/<invoice_id>", methods=["POST"])
 def apply_late_fee_one(invoice_id):
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not logged_in_or_dev():
+        return redirect("/login")
     
     confirm= request.form.get("confirm")
 
@@ -2780,8 +2845,17 @@ def apply_late_fee_one(invoice_id):
             "error": "You submitted mode=test, but Stripe key is live."
         }, 400
     
-    result= apply_late_fee_to_invoice(invoice_id)
     run_id= str(uuid.uuid4())
+
+    try:
+        result= apply_late_fee_to_invoice(invoice_id)
+
+    except Exception as e:
+        result = {
+            "status": "failed",
+            "invoice_id": invoice_id,
+            "error": str(e),
+        }
 
     log= LateFeeLog(
         run_id= run_id,
@@ -3267,8 +3341,8 @@ def carry_forward_invoice_balance(invoice_id):
 
 @main.route("/admin/carry-forward-one/<invoice_id>", methods=["POST"])
 def carry_forward_one(invoice_id):
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not logged_in_or_dev():
+        return redirect("/login")
 
     confirm = request.form.get("confirm")
 
@@ -3925,8 +3999,8 @@ def debug_invoice_accounting(invoice_id):
     This route does not create, modify, void, pay, or finalize anything.
     """
 
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not logged_in_or_dev():
+        return redirect("/login")
 
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
@@ -4178,8 +4252,8 @@ def debug_customer(customer_id):
 # bulk apply carry forward
 @main.route("/admin/apply-carry-forwards", methods=["POST"])
 def apply_carry_forwards():
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not logged_in_or_dev():
+        return redirect("/login")
 
     confirm= request.form.get("confirm")
 
@@ -4552,8 +4626,8 @@ def billing_increase_logs():
 # combine the overdue processes into a single automated workflow
 @main.route("/admin/run-overdue-billing", methods=["POST"])
 def run_overdue_billing():
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not logged_in_or_dev():
+        return redirect("/login")
 
     confirm = request.form.get("confirm")
 
@@ -5786,8 +5860,8 @@ def preview_inspection_metadata_apply():
 # apply metadata for inspection fee
 @main.route("/admin/apply-inspection-metadata", methods=["POST"])
 def apply_inspection_metadata():
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not logged_in_or_dev():
+        return redirect("/login")
 
     confirm = request.form.get("confirm")
 
@@ -6233,8 +6307,8 @@ def preview_missing_inspection_metadata_apply():
 # repair only active/past_due/unpaid subscriptions that are still missing metadata
 @main.route("/admin/apply-missing-inspection-metadata", methods=["POST"])
 def apply_missing_inspection_metadata():
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not logged_in_or_dev():
+        return redirect("/login")
 
     confirm = request.form.get("confirm")
 
@@ -6704,8 +6778,8 @@ def audit_inspection_fee_items():
     This route does not modify Stripe.
     """
 
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not logged_in_or_dev():
+        return redirect("/login")
 
     subscription_statuses = [
         "active",
@@ -8555,8 +8629,8 @@ def preview_subscription_item_metadata():
     - belong to unknown Products
     """
 
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not logged_in_or_dev():
+        return redirect("/login")
 
     collection = (
         collect_subscription_item_metadata_candidates()
@@ -8620,8 +8694,8 @@ def apply_subscription_item_metadata():
     - Writes a complete CSV log.
     """
 
-    # if not session.get("logged_in"):
-    #     return redirect("/login")
+    if not logged_in_or_dev():
+        return redirect("/login")
 
     confirm = request.form.get(
         "confirm"
@@ -11136,6 +11210,9 @@ def apply_expired_inspection_fee_internal(subscription_id, mode):
 # apply-expired-inspection-fee-one subscription
 @main.route("/admin/apply-expired-inspection-fee-one/<subscription_id>", methods=["POST"])
 def apply_expired_inspection_fee_one(subscription_id): 
+    if not logged_in_or_dev():
+        return redirect("/login")
+
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
     confirm = request.form.get("confirm")
@@ -11373,6 +11450,9 @@ def create_expired_inspection_fee_test_subscription():
 # bulk apply to remove expire inspection fee
 @main.route("/admin/apply-expired-inspection-fees-all", methods=["POST"])
 def apply_expired_inspection_fees_all():
+    if not logged_in_or_dev():
+        return redirect("/login")
+
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
     confirm = request.form.get("confirm")
@@ -12016,8 +12096,7 @@ def create_late_fee_test_data():
     }
 
 # enable-late-fee-compounding-test
-@main.route(
-    "/admin/enable-late-fee-compounding-test/<invoice_id>", methods=["POST"])
+@main.route("/admin/enable-late-fee-compounding-test/<invoice_id>", methods=["POST"])
 def enable_late_fee_compounding_test(invoice_id):
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
