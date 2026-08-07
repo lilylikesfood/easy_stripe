@@ -329,7 +329,7 @@
                         - 
                     {% endif %}
                 </td>
-                <td>${{"%.2f"| format(log.amount_cents / 100) }}</td>
+                <td>${{"%.2f"| format((log.amount_cents or 0) / 100) }}</td>
             </tr>
             {% endfor %}
 

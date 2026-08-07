@@ -19,3 +19,5 @@ class LateFeeLog(db.Model):
     error= db.Column(db.Text, nullable=True)
 
     created_at= db.Column(db.DateTime, nullable=False)
+
+    livemode = db.Column(db.Boolean, nullable=True)

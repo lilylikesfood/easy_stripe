@@ -39,3 +39,5 @@ class BillingIncreaseLog(db.Model):
         db.DateTime,
         default=lambda: datetime.now(timezone.utc)
     )
+
+    livemode = db.Column(db.Boolean, nullable=True)

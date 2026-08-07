@@ -52,6 +52,9 @@ def logged_in_or_dev():
     
     return session.get("logged_in", False)
 
+def is_live_mode():
+    return current_app.config["STRIPE_SECRET_KEY"].startswith("sk_live_")
+
 @main.route("/")
 def home():
     return {
@@ -741,6 +744,7 @@ def repair_all_schedule_rollbacks():
                                 new_amount=current_info["amount"],
                                 phase_start=phase["start_date"],
                                 phase_end=phase["end_date"],
+                                livemode=is_live_mode(),
                             )
 
                             db.session.add(log)
@@ -791,6 +795,7 @@ def repair_all_schedule_rollbacks():
                 status="failed",
                 reason="schedule repair failed",
                 error_message=str(e),
+                livemode= is_live_mode(),
             )
 
             db.session.add(log)
@@ -1347,6 +1352,7 @@ def run_increase_missing_billable():
                     reason=str(e),
                     started_at=started_at,
                     finished_at=datetime.now(timezone.utc),
+                    livemode=is_live_mode(),
                 )
 
                 db.session.add(log)
@@ -2137,6 +2143,7 @@ def create_carry_forward_log_from_result(run_id, result):
 
         reason=result.get("reason"),
         error=result.get("error"),
+        livemode=is_live_mode(),
     )
 
     return log
@@ -2256,10 +2263,10 @@ def find_late_fee_candidates():
                 "eligible_to_apply": False,
                 "skip_reason": f"late fee calculation failed: {e}",
                 "late_fee_rate": "1.5%",
-                "late_fee_base": None,
-                "late_fee_base_cents": None,
-                "late_fee": None,
-                "late_fee_cents": None,
+                "late_fee_base": 0,
+                "late_fee_base_cents": 0,
+                "late_fee": 0,
+                "late_fee_cents": 0,
                 "invoice_url": stripe_get(invoice, "hosted_invoice_url"),
                 "days_overdue": days_overdue,
                 "effective_due_date": effective_due_date.date().isoformat(),
@@ -2864,11 +2871,12 @@ def apply_late_fee_one(invoice_id):
         customer_id=result.get("customer_id"),
         invoice_item_id=result.get("invoice_item_id"),
         late_fee_month=result.get("late_fee_month"),
-        amount_cents=result.get("late_fee_cents"),
+        amount_cents=result.get("late_fee_cents", 0),
         status=result.get("status"),
         reason=result.get("reason"),
         error=result.get("error"),
-        created_at=datetime.now(timezone.utc)
+        created_at=datetime.now(timezone.utc),
+        livemode=is_live_mode(),
     )
 
     db.session.add(log)
@@ -2879,7 +2887,7 @@ def apply_late_fee_one(invoice_id):
 # Apply late fee to everyone
 @main.route("/admin/apply-late-fees", methods=["POST"])
 def apply_late_fees():
-    if not session.get("logged_in"):
+    if not logged_in_or_dev():
         return redirect("/login")
     
     confirm = request.form.get("confirm")
@@ -2935,7 +2943,8 @@ def apply_late_fees():
                 status= "skipped",
                 reason= candidate.get("skip_reason"),
                 error= None,
-                created_at= datetime.now(timezone.utc)
+                created_at= datetime.now(timezone.utc),
+                livemode=is_live_mode(),
             )
 
             db.session.add(log)
@@ -2953,11 +2962,12 @@ def apply_late_fees():
                 customer_id= result.get("customer_id"),
                 invoice_item_id= result.get("invoice_item_id"),
                 late_fee_month= candidate["late_fee_month"],
-                amount_cents= result.get("late_fee_cents"),
+                amount_cents= result.get("late_fee_cents", 0),
                 status= result.get("status"),
                 reason= result.get("reason"),
                 error= None,
-                created_at= datetime.now(timezone.utc)
+                created_at= datetime.now(timezone.utc),
+                livemode=is_live_mode(),
             )
 
             db.session.add(log)
@@ -2981,7 +2991,8 @@ def apply_late_fees():
                 status= "failed",
                 reason= None,
                 error= str(e),
-                created_at= datetime.now(timezone.utc)
+                created_at= datetime.now(timezone.utc),
+                livemode=is_live_mode(),
             )
 
             db.session.add(log)
@@ -4392,6 +4403,7 @@ def apply_carry_forwards():
                     old_invoice_status = None,
                     reason= None,
                     error= str(e),
+                    livemode=is_live_mode(),
                 )
             
             db.session.add(log)
@@ -4682,7 +4694,8 @@ def run_overdue_billing():
                 status="skipped",
                 reason=candidate.get("skip_reason"),
                 error=None,
-                created_at=datetime.now(timezone.utc)
+                created_at=datetime.now(timezone.utc),
+                livemode=is_live_mode(),
             )
 
             db.session.add(log)
@@ -4700,11 +4713,12 @@ def run_overdue_billing():
                 customer_id=result.get("customer_id"),
                 invoice_item_id=result.get("invoice_item_id"),
                 late_fee_month=result.get("late_fee_month"),
-                amount_cents=result.get("late_fee_cents"),
+                amount_cents=result.get("late_fee_cents", 0),
                 status=result.get("status"),
                 reason=result.get("reason"),
                 error=result.get("error"),
-                created_at=datetime.now(timezone.utc)
+                created_at=datetime.now(timezone.utc),
+                livemode=is_live_mode(),
             )
 
             db.session.add(log)
@@ -4727,7 +4741,8 @@ def run_overdue_billing():
                 status="failed",
                 reason=None,
                 error=str(e),
-                created_at=datetime.now(timezone.utc)
+                created_at=datetime.now(timezone.utc),
+                livemode=is_live_mode(),
             )
 
             db.session.add(log)
@@ -4789,6 +4804,7 @@ def run_overdue_billing():
                 old_invoice_status=None,
                 reason=None,
                 error=str(e),
+                livemode=is_live_mode(),
             )
             db.session.add(log)
 
@@ -11510,6 +11526,103 @@ def apply_expired_inspection_fees_all():
         return {
             "error": "max_apply cannot be greater than 1000."
         }, 400
+
+    # ---------------------------------------------------------
+    # Gather fresh candidates using the exact same classification
+    # rules as the preview route, so "what apply will touch" always
+    # matches "what preview showed."
+    # ---------------------------------------------------------
+    run_id = str(uuid.uuid4())
+
+    today = datetime.now(timezone.utc).date()
+
+    billable_statuses = [
+        "active",
+        "past_due",
+        "unpaid",
+    ]
+
+    candidates = []
+
+    for status in billable_statuses:
+        subscriptions = stripe.Subscription.list(
+            status=status,
+            limit=100,
+            expand=["data.customer"],
+        )
+
+        for subscription in subscriptions.auto_paging_iter():
+            customer = stripe_get(subscription, "customer")
+            customer_description = stripe_get(customer, "description", "")
+
+            candidate = classify_expired_inspection_fee_subscription(
+                subscription=subscription,
+                customer_description=customer_description,
+                today=today,
+            )
+
+            if (
+                candidate["classification"] == "would_remove_inspection_fee"
+                and candidate["safe_to_apply"] is True
+            ):
+                candidates.append(candidate)
+
+    # ---------------------------------------------------------
+    # Apply, respecting max_apply as a batch-size safety limit
+    # ---------------------------------------------------------
+
+    results = []
+
+    attempted_count = 0
+    success_count = 0
+    failed_count = 0
+    not_attempted_count = 0
+
+    for candidate in candidates:
+        if attempted_count >= max_apply:
+            not_attempted_count += 1
+            results.append({
+                "subscription_id": candidate["subscription_id"],
+                "status": "not_attempted",
+                "reason": "max_apply limit reached",
+            })
+            continue
+
+        attempted_count += 1
+
+        try:
+            result = apply_expired_inspection_fee_internal(
+                candidate["subscription_id"],
+                mode,
+            )
+            results.append(result)
+
+            if result.get("success"):
+                success_count += 1
+            else:
+                failed_count += 1
+
+        except Exception as e:
+            failed_count += 1
+            results.append({
+                "subscription_id": candidate["subscription_id"],
+                "success": False,
+                "status": "failed",
+                "error": str(e),
+            })
+
+    return {
+        "run_id": run_id,
+        "mode": mode,
+        "status": "completed",
+        "max_apply": max_apply,
+        "total_candidates": len(candidates),
+        "attempted_count": attempted_count,
+        "success_count": success_count,
+        "failed_count": failed_count,
+        "not_attempted_count": not_attempted_count,
+        "results": results,
+    }
 
 # create-carry-forward-tax-test-data
 @main.route("/admin/create-carry-forward-tax-test-data", methods=["POST"])

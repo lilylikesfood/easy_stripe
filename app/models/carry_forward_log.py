@@ -42,3 +42,5 @@ class CarryForwardLog(db.Model):
 
     # description shown in Stripe
     carry_forward_description = db.Column(db.String(255), nullable=True)
+
+    livemode = db.Column(db.Boolean, nullable=True)
