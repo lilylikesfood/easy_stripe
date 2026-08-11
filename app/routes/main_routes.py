@@ -3402,7 +3402,7 @@ def carry_forward_one(invoice_id):
 # Who would be carried forward if we ran today?
 @main.route("/admin/audit-carry-forward")
 def audit_carry_forward():
-    if not session.get("logged_in"):
+    if not logged_in_or_dev():
         return redirect("/login")
     
     return find_carry_forward_candidates()
