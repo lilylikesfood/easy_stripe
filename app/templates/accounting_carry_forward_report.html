@@ -116,7 +116,7 @@
                 <td class="amount">${{ "%.2f"|format(row.carried_forward_amount) }}</td>
                 <td class="amount">
                     {% if row.difference_check != 0 %}
-                    <strong style="color: red;">${{ "%.2f"|format(row.difference_check) }}</strong>
+                    <strong style="color: red;">${{ "%.2f"|format(row.difference_check) if row.difference_check is not none else "N/A" }}</strong>
                     {% else%}
                         ${{ "%.2f"|format(row.difference_check) }}
                     {% endif %}
