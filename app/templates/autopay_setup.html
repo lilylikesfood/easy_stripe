@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Autopay Setup</title>
+
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
+</head>
+<body>
+    <h1>Autopay Setup</h1>
+
+    <form method="post" action="/admin/create-autopay-checkout-session">
+        <label>Price ID: </label>
+        <input type="text" name="price_id" placeholder="price_..." required>
+        
+        <label>Customer ID: </label>
+        <input type="text" name="customer_id">
+
+        <button type="submit" class="button">Submit</button>
+    </form>
+
+
+</body>
+</html>

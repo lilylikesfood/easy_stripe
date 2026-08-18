@@ -12438,3 +12438,64 @@ def debug_invoice_status_counts():
         "invoice_status_counts": counts,
         "total_invoices": sum(counts.values()),
     }
+
+# ------------------------------------autopay testing--------------------------------------------------
+@main.route("/admin/create-autopay-checkout-session", methods=["POST"])
+def create_autopay_checkout_session():
+    if not logged_in_or_dev():
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    customer_id = request.form.get("customer_id")
+    price_id = request.form.get("price_id")
+
+    if not price_id:
+        return {"error": "price_id is required"}, 400
+
+    session_params = {
+        "mode": "subscription",
+        "line_items": [
+            {
+                "price": price_id,
+                "quantity": 1,
+            }
+        ],
+        "payment_method_collection": "always",
+        "success_url": "http://localhost:5000/admin/checkout-success?session_id={CHECKOUT_SESSION_ID}",
+        "cancel_url": "http://localhost:5000/admin/checkout-cancel",
+    }
+
+    if customer_id:
+        session_params["customer"] = customer_id
+
+    checkout_session = stripe.checkout.Session.create(**session_params)
+
+    return render_template("autopay_link_ready.html", checkout_url=checkout_session.url)
+
+@main.route("/admin/checkout-success")
+def checkout_success():
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    session_id = request.args.get("session_id")
+
+    if not session_id:
+        return {"error": "Missing session_id"}, 400
+
+    checkout_session = stripe.checkout.Session.retrieve(session_id)
+
+    return {
+        "status": "checkout_complete",
+        "checkout_session_id": checkout_session.id,
+        "customer_id": checkout_session.customer,
+        "subscription_id": checkout_session.subscription,
+        "payment_status": checkout_session.payment_status,
+    }
+
+# autopay html
+@main.route("/admin/autopay-setup")
+def autopay_setup():
+    if not logged_in_or_dev():
+        return redirect("/login")
+
+    return render_template("autopay_setup.html")

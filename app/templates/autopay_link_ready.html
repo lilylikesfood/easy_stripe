@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Payment link ready</title>
+
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
+</head>
+<body>
+    <h1>Payment link ready</h1>
+
+    <div class="card-box">
+        <a href="{{ checkout_url }}" id="checkout-link">{{checkout_url[0:80]}}...</a>
+        <button onclick="copyLink(this)" class="button">Copy Link</button>
+    </div>
+
+    <div>
+        <a href="/admin/autopay-setup" class="link-secondary">Back to autopay setup</a>
+    </div>
+
+<!-- right before </body> — so the page's HTML loads first before the script tries to interact with it -->
+<script>
+    function copyLink(button){
+        const link= document.getElementById("checkout-link")
+
+        const theUrlString = link.href
+
+        navigator.clipboard.writeText(theUrlString)
+
+        button.textContent = "Copied!"
+
+        setTimeout(function(){
+            button.textContent = "Copy Link"
+        }, 3000);
+    }
+</script>
+</body>
+</html>
