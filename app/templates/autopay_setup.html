@@ -11,8 +11,11 @@
     <h1>Autopay Setup</h1>
 
     <form method="post" action="/admin/create-autopay-checkout-session">
-        <label>Price ID: </label>
-        <input type="text" name="price_id" placeholder="price_..." required>
+        <label>Monthly Price ID: </label>
+        <input type="text" name="monthly_price_id" placeholder="price_..." required>
+
+        <label>Inspection Price ID: </label>
+        <input type="text" name="inspection_price_id" placeholder="price_..." required>
         
         <label>Customer ID: </label>
         <input type="text" name="customer_id">

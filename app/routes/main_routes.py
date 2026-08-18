@@ -12448,22 +12448,33 @@ def create_autopay_checkout_session():
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
     customer_id = request.form.get("customer_id")
-    price_id = request.form.get("price_id")
+    monthly_price_id = request.form.get("monthly_price_id")
+    inspection_price_id = request.form.get("inspection_price_id")
 
-    if not price_id:
-        return {"error": "price_id is required"}, 400
+    if not monthly_price_id:
+        return {"error": "monthly_price_id is required"}, 400
+
+    if not inspection_price_id:
+            return {"error": "inspection_price_id is required"}, 400
 
     session_params = {
         "mode": "subscription",
         "line_items": [
             {
-                "price": price_id,
+                "price": monthly_price_id,
+                "quantity": 1,
+            },
+            {
+                "price": inspection_price_id,
                 "quantity": 1,
             }
         ],
         "payment_method_collection": "always",
         "success_url": "http://localhost:5000/admin/checkout-success?session_id={CHECKOUT_SESSION_ID}",
         "cancel_url": "http://localhost:5000/admin/checkout-cancel",
+        "automatic_tax":{
+            "enabled": True,
+        }
     }
 
     if customer_id:
@@ -12483,6 +12494,29 @@ def checkout_success():
         return {"error": "Missing session_id"}, 400
 
     checkout_session = stripe.checkout.Session.retrieve(session_id)
+
+    today= datetime.now(timezone.utc).date()
+    expected_inspection_end_dt = today + relativedelta(years=3)
+    expected_contract_end_dt = today + relativedelta(years=50)
+
+    contract_start_dt = today
+    inspection_start_dt = today
+
+    metadata_to_merge = {
+        "contract_start_date": contract_start_dt.isoformat(),
+        "contract_end_date": expected_contract_end_dt.isoformat(),
+        "contract_term_years": "50",
+        "inspection_fee_start_date": inspection_start_dt.isoformat(),
+        "inspection_fee_end_date": expected_inspection_end_dt.isoformat(),
+        "inspection_fee_years": "3",
+        "inspection_fee_status": "active",
+        "billing_rule_version": "1",
+    }
+
+    stripe.Subscription.modify(
+        checkout_session.subscription, 
+        metadata=metadata_to_merge,
+    )
 
     return {
         "status": "checkout_complete",
