@@ -12533,3 +12533,642 @@ def autopay_setup():
         return redirect("/login")
 
     return render_template("autopay_setup.html")
+
+# -------------------------------------------------------50 year contract end---------------------------
+# Classification of contract end (50-year mark)
+def classify_contract_end_subscription(subscription, today):
+    """
+    Read-only classifier. Scans subscription metadata for contract_end_date
+    and determines whether the 50-year contract term has been reached.
+
+    Does NOT modify Stripe. Mirrors classify_expired_inspection_fee_subscription.
+    """
+    billable_statuses = {
+        "active",
+        "past_due",
+        "unpaid"
+    }
+
+    metadata = stripe_metadata_to_dict(stripe_get(subscription, "metadata", {}) or {})
+
+    contract_end_date_raw = metadata.get("contract_end_date")
+    contract_start_date_raw = metadata.get("contract_start_date")
+    contract_term_years = metadata.get("contract_term_years")
+
+    status = stripe_get(subscription, "status")
+    subscription_id = stripe_get(subscription, "id")
+
+    customer = stripe_get(subscription, "customer")
+
+    if isinstance(customer, str):
+        customer_id = customer
+    else:
+        customer_id = stripe_get(customer, "id")
+
+    schedule = stripe_get(subscription, "schedule")
+    cancel_at = stripe_get(subscription, "cancel_at")
+    cancel_at_period_end = stripe_get(subscription, "cancel_at_period_end")
+
+    if schedule is None or isinstance(schedule, str):
+        schedule_id = schedule
+    else:
+        schedule_id = stripe_get(schedule, "id")
+
+    # count monthly service items (same item_type convention you already use)
+    monthly_service_items = []
+    other_items = []
+
+    subscription_items = stripe_get(subscription, "items", {}) or {}
+    item_data = stripe_get(subscription_items, "data", []) or []
+
+    for item in item_data:
+        item_metadata = stripe_metadata_to_dict(stripe_get(item, "metadata", {}) or {})
+        item_type = item_metadata.get("item_type")
+
+        if item_type == "monthly_service_fee":
+            monthly_service_items.append(item)
+        else:
+            other_items.append(item)
+
+    result = {
+        "subscription_id": subscription_id,
+        "customer_id": customer_id,
+        "subscription_status": status,
+        "contract_start_date": contract_start_date_raw,
+        "contract_end_date": contract_end_date_raw,
+        "contract_term_years": contract_term_years,
+        "monthly_service_item_count": len(monthly_service_items),
+        "other_item_count": len(other_items),
+        "classification": None,
+        "safe_to_apply": False,
+        "reason": None,
+        "schedule_id": schedule_id,
+        "cancel_at": cancel_at,
+        "cancel_at_period_end": cancel_at_period_end,
+        "monthly_service_item_id": None,
+    }
+
+    if status not in billable_statuses:
+        result["classification"] = "manual_review"
+        result["reason"] = f"Subscription status is not billable: {status}"
+        return result
+
+    if schedule_id:
+        result["classification"] = "manual_review"
+        result["reason"] = f"Attached schedule exists: {schedule_id}"
+        return result
+
+    if cancel_at is not None or cancel_at_period_end is True:
+        result["classification"] = "manual_review"
+        result["reason"] = "Subscription already has a Stripe-side end mechanism set."
+        return result
+
+    if not contract_end_date_raw:
+        result["classification"] = "manual_review"
+        result["reason"] = "contract_end_date is missing."
+        return result
+
+    try:
+        contract_end_date = date.fromisoformat(contract_end_date_raw)
+    except (TypeError, ValueError):
+        result["classification"] = "manual_review"
+        result["reason"] = f"Invalid contract_end_date: {contract_end_date_raw}"
+        return result
+
+    result["contract_end_date"] = contract_end_date.isoformat()
+
+    if today < contract_end_date:
+        result["classification"] = "not_due_yet"
+        result["reason"] = f"Contract does not end until {contract_end_date.isoformat()}"
+        return result
+
+    # Past contract_end_date — now validate item shape before flagging safe
+    if len(monthly_service_items) != 1:
+        result["classification"] = "manual_review"
+        result["reason"] = f"Expected exactly 1 monthly service item, but found {len(monthly_service_items)}."
+        return result
+
+    if len(other_items) != 0:
+        result["classification"] = "manual_review"
+        result["reason"] = f"Expected 0 unrecognized subscription items, but found {len(other_items)}."
+        return result
+
+    monthly_service_item = monthly_service_items[0]
+    result["monthly_service_item_id"] = stripe_get(monthly_service_item, "id")
+
+    result["classification"] = "would_end_contract"
+    result["safe_to_apply"] = True
+    result["reason"] = "Contract has reached its 50-year end date and is eligible for termination."
+
+    return result
+
+
+# Preview route — read-only, scans metadata across all billable subscriptions
+@main.route("/admin/preview-contract-end-50yr")
+def preview_contract_end_50yr():
+    if not logged_in_or_dev():
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    target_subscription_id = request.args.get("subscription_id")
+    today = datetime.now(timezone.utc).date()
+
+    billable_statuses = ["active", "past_due", "unpaid"]
+
+    results = []
+
+    classification_counts = {
+        "would_end_contract": 0,
+        "not_due_yet": 0,
+        "manual_review": 0,
+    }
+
+    if target_subscription_id:
+        subscription = stripe.Subscription.retrieve(target_subscription_id)
+
+        result = classify_contract_end_subscription(
+            subscription=subscription,
+            today=today,
+        )
+
+        results.append(result)
+
+        classification = result["classification"]
+        classification_counts[classification] = classification_counts.get(classification, 0) + 1
+
+    else:
+        for status in billable_statuses:
+            subscriptions = stripe.Subscription.list(
+                status=status,
+                limit=100,
+            )
+
+            for subscription in subscriptions.auto_paging_iter():
+                result = classify_contract_end_subscription(
+                    subscription=subscription,
+                    today=today,
+                )
+
+                results.append(result)
+
+                classification = result["classification"]
+                classification_counts[classification] = classification_counts.get(classification, 0) + 1
+
+    safe_to_apply_count = sum(1 for result in results if result["safe_to_apply"] is True)
+
+    return {
+        "read_only": True,
+        "target_subscription_id": target_subscription_id,
+        "today": today.isoformat(),
+        "checked_count": len(results),
+        "safe_to_apply_count": safe_to_apply_count,
+        "classification_counts": classification_counts,
+        "results": results,
+    }
+
+# apply_contract_end_50yr_internal
+def apply_contract_end_50yr_internal(subscription_id, mode):
+    """
+    Cancel a subscription that has reached its 50-year contract_end_date.
+
+    Ownership transfers to the client at this point — we stop billing
+    entirely. This cancels the whole Stripe subscription (not just an item).
+    """
+    allowed_modes = {"test", "live"}
+
+    if not subscription_id:
+        return {
+            "subscription_id": subscription_id,
+            "mode": mode,
+            "success": False,
+            "action": "not_applied",
+            "stage": "input_validation",
+            "reason": "Subscription ID is required.",
+        }
+
+    if mode not in allowed_modes:
+        return {
+            "subscription_id": subscription_id,
+            "mode": mode,
+            "success": False,
+            "action": "not_applied",
+            "stage": "input_validation",
+            "reason": f"Unsupported mode: {mode!r}",
+        }
+
+    try:
+        subscription = stripe.Subscription.retrieve(subscription_id)
+    except stripe.error.StripeError as exc:
+        return {
+            "subscription_id": subscription_id,
+            "mode": mode,
+            "success": False,
+            "action": "not_applied",
+            "stage": "subscription_retrieval",
+            "reason": str(exc),
+        }
+
+    today = datetime.now(timezone.utc).date()
+
+    classification_result = classify_contract_end_subscription(
+        subscription=subscription,
+        today=today,
+    )
+
+    if (
+        classification_result["classification"] != "would_end_contract"
+        or classification_result["safe_to_apply"] is not True
+    ):
+        return {
+            "subscription_id": subscription_id,
+            "customer_id": classification_result["customer_id"],
+            "mode": mode,
+            "success": False,
+            "action": "not_applied",
+            "stage": "pre_write_validation",
+            "reason": classification_result["reason"],
+            "classification": classification_result["classification"],
+            "safe_to_apply": classification_result["safe_to_apply"],
+            "before": classification_result,
+        }
+
+    # -----------------------------------------------------------
+    # Cancel the subscription
+    # -----------------------------------------------------------
+    try:
+        canceled_subscription = stripe.Subscription.cancel(
+            subscription_id,
+            prorate=False,
+        )
+
+    except stripe.error.StripeError as exc:
+        return {
+            "subscription_id": subscription_id,
+            "customer_id": classification_result["customer_id"],
+            "mode": mode,
+            "success": False,
+            "action": "not_applied",
+            "stage": "subscription_cancellation",
+            "before": classification_result,
+            "reason": str(exc),
+            "writes": {
+                "subscription_canceled": False,
+                "metadata_updated": False,
+            },
+        }
+
+    canceled_status = stripe_get(canceled_subscription, "status")
+
+    if canceled_status != "canceled":
+        return {
+            "subscription_id": subscription_id,
+            "customer_id": classification_result["customer_id"],
+            "mode": mode,
+            "success": False,
+            "action": "not_applied",
+            "stage": "subscription_cancellation",
+            "reason": f"Stripe did not confirm cancellation. Status: {canceled_status!r}",
+            "before": classification_result,
+            "writes": {
+                "subscription_canceled": False,
+                "metadata_updated": False,
+            },
+        }
+
+    # -----------------------------------------------------------
+    # Update metadata to record that contract has ended
+    # -----------------------------------------------------------
+    try:
+        stripe.Subscription.modify(
+            subscription_id,
+            metadata={
+                "contract_status": "ended",
+                "contract_end_reason": "50_year_term_completed_ownership_transferred",
+            },
+        )
+
+    except stripe.error.StripeError as exc:
+        return {
+            "subscription_id": subscription_id,
+            "customer_id": classification_result["customer_id"],
+            "mode": mode,
+            "success": False,
+            "action": "partial_failure",
+            "stage": "metadata_update",
+            "reason": str(exc),
+            "before": classification_result,
+            "writes": {
+                "subscription_canceled": True,
+                "metadata_updated": False,
+            },
+            "requires_metadata_repair": True,
+        }
+
+    # -----------------------------------------------------------
+    # Retrieve and verify final state
+    # -----------------------------------------------------------
+    try:
+        final_subscription = stripe.Subscription.retrieve(subscription_id)
+
+    except stripe.error.StripeError as exc:
+        return {
+            "subscription_id": subscription_id,
+            "customer_id": classification_result["customer_id"],
+            "mode": mode,
+            "success": False,
+            "action": "verification_failed",
+            "stage": "post_write_retrieval",
+            "reason": str(exc),
+            "before": classification_result,
+            "writes": {
+                "subscription_canceled": True,
+                "metadata_updated": True,
+            },
+            "requires_manual_review": True,
+        }
+
+    final_status = stripe_get(final_subscription, "status")
+    final_metadata = stripe_metadata_to_dict(stripe_get(final_subscription, "metadata", {}) or {})
+    final_contract_status = final_metadata.get("contract_status")
+
+    subscription_is_canceled = final_status == "canceled"
+    contract_status_is_ended = final_contract_status == "ended"
+
+    verification_passed = all([
+        subscription_is_canceled,
+        contract_status_is_ended,
+    ])
+
+    verification = {
+        "subscription_is_canceled": subscription_is_canceled,
+        "contract_status_is_ended": contract_status_is_ended,
+    }
+
+    after = {
+        "subscription_status": final_status,
+        "contract_status": final_contract_status,
+    }
+
+    if not verification_passed:
+        return {
+            "subscription_id": subscription_id,
+            "customer_id": classification_result["customer_id"],
+            "mode": mode,
+            "success": False,
+            "action": "verification_failed",
+            "stage": "final_verification",
+            "reason": "Cancellation completed, but final state did not pass verification.",
+            "before": classification_result,
+            "after": after,
+            "writes": {
+                "subscription_canceled": True,
+                "metadata_updated": True,
+            },
+            "verification": verification,
+            "verification_passed": False,
+            "requires_manual_review": True,
+        }
+
+    return {
+        "subscription_id": subscription_id,
+        "customer_id": classification_result["customer_id"],
+        "mode": mode,
+        "success": True,
+        "action": "contract_ended_subscription_canceled",
+        "stage": "completed",
+        "reason": "50-year contract term completed. Subscription canceled, ownership transferred to client.",
+        "before": classification_result,
+        "after": after,
+        "writes": {
+            "subscription_canceled": True,
+            "metadata_updated": True,
+        },
+        "verification": verification,
+        "verification_passed": True,
+        "requires_manual_review": False,
+    }
+
+
+# apply-contract-end-50yr-one
+@main.route("/admin/apply-contract-end-50yr-one/<subscription_id>", methods=["POST"])
+def apply_contract_end_50yr_one(subscription_id):
+    if not logged_in_or_dev():
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    confirm = request.form.get("confirm")
+    mode = request.form.get("mode")
+
+    allowed_modes = {"test", "live"}
+
+    if confirm != "APPLY":
+        return {"error": "Confirmation required. Submit confirm=APPLY."}, 400
+
+    if mode not in allowed_modes:
+        return {"error": "Mode required. Submit mode=test or mode=live."}, 400
+
+    is_live_key = current_app.config["STRIPE_SECRET_KEY"].startswith("sk_live_")
+
+    if mode == "live" and not is_live_key:
+        return {"error": "You submitted mode=live, but Stripe key is not live."}, 400
+
+    if mode == "test" and is_live_key:
+        return {"error": "You submitted mode=test, but Stripe key is live."}, 400
+
+    result = apply_contract_end_50yr_internal(subscription_id, mode)
+
+    return result
+
+
+# bulk apply
+@main.route("/admin/apply-contract-end-50yr-all", methods=["POST"])
+def apply_contract_end_50yr_all():
+    if not logged_in_or_dev():
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    confirm = request.form.get("confirm")
+
+    if confirm != "APPLY":
+        return {"error": "Confirmation required. Submit confirm=APPLY."}, 400
+
+    mode = request.form.get("mode")
+
+    if mode not in ["test", "live"]:
+        return {"error": "Mode required. Submit mode=test or mode=live."}, 400
+
+    is_live_key = current_app.config["STRIPE_SECRET_KEY"].startswith("sk_live_")
+
+    if mode == "live" and not is_live_key:
+        return {"error": "You submitted mode=live, but Stripe key is not live."}, 400
+
+    if mode == "test" and is_live_key:
+        return {"error": "You submitted mode=test, but Stripe key is live."}, 400
+
+    max_apply_raw = request.form.get("max_apply")
+
+    if not max_apply_raw:
+        return {"error": "max_apply is required. For example, submit max_apply=5."}, 400
+
+    try:
+        max_apply = int(max_apply_raw)
+    except ValueError:
+        return {"error": "max_apply must be a whole number."}, 400
+
+    if max_apply < 1 or max_apply > 1000:
+        return {"error": "max_apply must be between 1 and 1000."}, 400
+
+    run_id = str(uuid.uuid4())
+    today = datetime.now(timezone.utc).date()
+
+    billable_statuses = ["active", "past_due", "unpaid"]
+
+    candidates = []
+
+    for status in billable_statuses:
+        subscriptions = stripe.Subscription.list(
+            status=status,
+            limit=100,
+        )
+
+        for subscription in subscriptions.auto_paging_iter():
+            candidate = classify_contract_end_subscription(
+                subscription=subscription,
+                today=today,
+            )
+
+            if (
+                candidate["classification"] == "would_end_contract"
+                and candidate["safe_to_apply"] is True
+            ):
+                candidates.append(candidate)
+
+    results = []
+    attempted_count = 0
+    success_count = 0
+    failed_count = 0
+    not_attempted_count = 0
+
+    for candidate in candidates:
+        if attempted_count >= max_apply:
+            not_attempted_count += 1
+            results.append({
+                "subscription_id": candidate["subscription_id"],
+                "status": "not_attempted",
+                "reason": "max_apply limit reached",
+            })
+            continue
+
+        attempted_count += 1
+
+        try:
+            result = apply_contract_end_50yr_internal(
+                candidate["subscription_id"],
+                mode,
+            )
+            results.append(result)
+
+            if result.get("success"):
+                success_count += 1
+            else:
+                failed_count += 1
+
+        except Exception as e:
+            failed_count += 1
+            results.append({
+                "subscription_id": candidate["subscription_id"],
+                "success": False,
+                "status": "failed",
+                "error": str(e),
+            })
+
+    return {
+        "run_id": run_id,
+        "mode": mode,
+        "status": "completed",
+        "max_apply": max_apply,
+        "total_candidates": len(candidates),
+        "attempted_count": attempted_count,
+        "success_count": success_count,
+        "failed_count": failed_count,
+        "not_attempted_count": not_attempted_count,
+        "results": results,
+    }
+
+# fake subscription that end date is already in the past so i can test
+@main.route("/admin/create-contract-end-50yr-test-subscription", methods=["POST"])
+def create_contract_end_50yr_test_subscription():
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    confirm = request.form.get("confirm")
+    mode = request.form.get("mode")
+
+    if confirm != "CREATE_TEST_DATA":
+        return {"error": "Confirmation required. Submit confirm=CREATE_TEST_DATA."}, 400
+
+    if mode != "test":
+        return {"error": "This route only supports mode=test."}, 400
+
+    is_live_key = current_app.config["STRIPE_SECRET_KEY"].startswith("sk_live_")
+
+    if is_live_key:
+        return {"error": "Refusing to create test data because the configured Stripe key is live."}, 400
+
+    today = datetime.now(timezone.utc).date()
+
+    # contract "started" 50 years + 1 day ago, so it's already past end date
+    contract_start_date = today - relativedelta(years=50, days=1)
+    contract_end_date = today - timedelta(days=1)
+
+    customer = stripe.Customer.create(
+        name="Contract End Test Customer",
+        email="contract-end-test@example.com",
+        description="TEST CUSTOMER - 50 YEAR CONTRACT",
+    )
+
+    product = stripe.Product.create(
+        name="Test Monthly Geothermal Service (Contract End)",
+        metadata={"increaseable": "true"},
+    )
+
+    price = stripe.Price.create(
+        product=product.id,
+        unit_amount=10000,
+        currency="cad",
+        recurring={"interval": "month"},
+    )
+
+    subscription = stripe.Subscription.create(
+        customer=customer.id,
+        collection_method="send_invoice",
+        days_until_due=20,
+        items=[{"price": price.id, "quantity": 1}],
+        metadata={
+            "contract_start_date": contract_start_date.isoformat(),
+            "contract_end_date": contract_end_date.isoformat(),
+            "contract_term_years": "50",
+        },
+    )
+
+    subscription_items = stripe.SubscriptionItem.list(subscription=subscription.id, limit=100)
+
+    monthly_service_item_id = None
+
+    for item in subscription_items.auto_paging_iter():
+        monthly_service_item_id = stripe_get(item, "id")
+
+        stripe.SubscriptionItem.modify(
+            monthly_service_item_id,
+            metadata={"item_type": "monthly_service_fee"},
+        )
+
+    return {
+        "status": "test_subscription_created",
+        "customer_id": customer.id,
+        "subscription_id": subscription.id,
+        "monthly_service_item_id": monthly_service_item_id,
+        "contract_end_date": contract_end_date.isoformat(),
+    }
