@@ -12479,6 +12479,9 @@ def create_autopay_checkout_session():
 
     if customer_id:
         session_params["customer"] = customer_id
+        session_params["customer_update"] = {
+            "address": "auto"
+        }
 
     checkout_session = stripe.checkout.Session.create(**session_params)
 
@@ -13172,3 +13175,75 @@ def create_contract_end_50yr_test_subscription():
         "monthly_service_item_id": monthly_service_item_id,
         "contract_end_date": contract_end_date.isoformat(),
     }
+
+# -------------------------------autopay with prefilled customer info-----------------
+@main.route("/admin/create-autopay-customer", methods=["POST"])
+def create_autopay_customer():
+    if not logged_in_or_dev():
+        return redirect("/login")
+
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    name= request.form.get("name")
+    email= request.form.get("email")
+    phone= request.form.get("phone")
+    language= request.form.get("language")
+    invoice_prefix= request.form.get("invoice_prefix")
+    description= request.form.get("description")
+
+    if invoice_prefix:
+        invoice_prefix = invoice_prefix.upper()
+
+    if not name:
+        return {"error": "name is required. "}, 400
+
+    if not email:
+            return {"error": "email is required. "}, 400
+
+    if not invoice_prefix:
+            return {"error": "invoice_prefix is required. "}, 400
+
+    address_line1= request.form.get("address_line1")
+    address_city= request.form.get("address_city")
+    address_state= request.form.get("address_state")
+    address_postal_code= request.form.get("address_postal_code")
+    address_country= request.form.get("address_country")
+
+    address = {
+        "line1": address_line1, 
+        "city": address_city, 
+        "state": address_state, 
+        "postal_code": address_postal_code, 
+        "country": address_country,
+    }
+
+    try:
+        customer = stripe.Customer.create(
+            name=name,
+            email=email,
+            description=description,
+            address=address,
+            phone=phone,
+            preferred_locales=[language],
+            invoice_prefix=invoice_prefix,
+        )
+
+    except Exception as e:
+        return {
+            "status": "failed",
+            "error": str(e),
+        }, 400
+
+    return {
+        "status": "customer_created",
+        "customer_id": customer.id,
+        "name": customer.name,
+        "email": customer.email,
+    }
+
+@main.route("/admin/create-autopay-customer-page")
+def create_autopay_customer_page():
+    if not logged_in_or_dev():
+        return redirect("/login")
+
+    return render_template("create_autopay_customer.html")

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Create Autopay Customer</title>
+
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
+</head>
+<body>
+    <h1>Customer Autopay Setup</h1>
+
+    <div class="card-box">
+
+        <form method="post" action="/admin/create-autopay-customer">
+            <h3>Customer Information </h3>
+
+            <div class="form-row">
+                <label>Name: </label>
+                <input type="text" name="name" placeholder="name(required)" required>
+            </div>
+
+            <div class="form-row">
+                <label>Email: </label>
+                <input type="text" name="email" placeholder="Email(required)" required>
+            </div>
+                
+            <div class="form-row">
+                <label>Invoice Prefix: </label>
+                <input type="text" name="invoice_prefix" placeholder="Invoice Prefix(required)" required>
+            </div>
+
+            <div class="form-row">
+                <label>Description: </label>
+                <input type="text" name="description" placeholder="Description">
+            </div>
+
+            <div class="form-row">
+                <label>Phone: </label>
+                <input type="text" name="phone" placeholder="phone">
+            </div>
+
+            <div class="form-row">
+                <label>Language: </label>
+                <select name="language">
+                    <option value="en-CA">English (Canada)</option>
+                    <option value="fr-CA">French (Canada)</option>
+                </select>
+            </div>
+
+            <h3>Address</h3>
+
+            <div class="form-row">
+                <label>Address Line1: </label>
+                <input type="text" name="address_line1" placeholder="address_line1">
+            </div>
+
+            <div class="form-row">
+                <label>Address City: </label>
+                <input type="text" name="address_city" placeholder="address_city" >
+            </div>
+
+            <div class="form-row">
+                <label>Address State: </label>
+                <select name="address_state">
+                    <option value="ON">Ontario</option>
+                    <option value="QC">Quebec</option>
+                    <option value="BC">British Columbia</option>
+                    <option value="AB">Alberta</option>
+                </select>
+            </div>
+
+            <div class="form-row">
+                <label>Address Postal Code: </label>
+                <input type="text" name="address_postal_code" placeholder="address_postal_code" >
+            </div>
+
+            <div class="form-row">
+                <label>Address Country: </label>
+                <select name="address_country">
+                    <option value="CA">Canada</option>
+                    <option value="US">United States</option>
+                </select>
+            </div>
+
+            <button type="submit" class="button">Submit</button>
+        </form>
+    </div>
+
+</body>
+</html>
