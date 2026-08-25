@@ -13303,3 +13303,102 @@ def create_autopay_customer_page():
         return redirect("/login")
 
     return render_template("create_autopay_customer.html")
+
+# carry_forward_dashboard
+def get_carry_forward_dashboard_data():
+    audit_result = find_carry_forward_candidates()
+
+    # Total dollar amount currently eligible to carry forward
+    total_eligible_amount = sum(
+        candidate["proposed_carry_forward_amount"] or 0
+        for candidate in audit_result["candidates"]
+        if candidate["eligible_to_apply"]
+    )
+
+    run_logs = []
+
+    latest_log = CarryForwardLog.query.order_by(
+        CarryForwardLog.created_at.desc()
+    ).first()
+
+    if latest_log:
+        run_id = latest_log.run_id
+
+        run_logs = CarryForwardLog.query.filter_by(
+            run_id=run_id
+        ).all()
+
+    total_amount_cents = 0
+
+    for log in run_logs:
+        if log.status == "success":
+            total_amount_cents += log.amount_cents or 0
+
+    last_run_time = None
+    last_run_time_toronto = None
+    ran_today = False
+
+    success_count = sum(1 for r in run_logs if r.status == "success")
+    failed_count = sum(1 for r in run_logs if r.status == "failed")
+    skipped_count = sum(1 for r in run_logs if r.status == "skipped")
+
+    if latest_log:
+        last_run_time = latest_log.created_at
+
+        if last_run_time.tzinfo is None:
+            last_run_time = last_run_time.replace(tzinfo=timezone.utc)
+
+        last_run_time_toronto = last_run_time.astimezone(TORONTO_TZ)
+
+        now_toronto = datetime.now(TORONTO_TZ).date()
+
+        if last_run_time_toronto.date() == now_toronto:
+            ran_today = True
+        else:
+            ran_today = False
+
+    recent_logs = []
+
+    for log in run_logs:
+        created_at = log.created_at
+
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+
+        created_at_toronto = created_at.astimezone(TORONTO_TZ)
+
+        recent_logs.append({
+            "created_at": created_at_toronto.strftime("%Y-%m-%d %I:%M %p"),
+            "status": log.status,
+            "invoice_id": log.invoice_id,
+            "invoice_number": log.source_invoice_number or log.invoice_id,
+            "invoice_item_id": log.invoice_item_id,
+            "amount": f"${cents_to_money(log.amount_cents):.2f}",
+            "reason_or_error": log.reason or log.error or "-"
+        })
+
+    return {
+        "audit": audit_result,
+        "total_eligible_amount": f"${total_eligible_amount:.2f}",
+        "today_status": {
+            "ran_today": ran_today,
+            "last_run_time": last_run_time_toronto.strftime("%Y-%m-%d %I:%M %p") if last_run_time_toronto else None,
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "skipped_count": skipped_count,
+            "total_amount": f"${cents_to_money(total_amount_cents):.2f}",
+        },
+        "recent_logs": recent_logs,
+    }
+
+@main.route("/admin/carry-forward-dashboard")
+def carry_forward_dashboard():
+    if not session.get("logged_in"):
+        return redirect("/login")
+
+    data = get_carry_forward_dashboard_data()
+
+    return render_template(
+        "carry_forward_dashboard.html",
+        data=data
+    )

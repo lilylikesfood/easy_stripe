@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Carry Forward Dashboard</title>
+
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
+</head>
+<body>
+    <h1>Carry Forward Dashboard</h1>
+
+    <h2>Carry Forward Status</h2>
+    {% if data.audit.summary.eligible_count > 0 and not data.today_status.ran_today %}
+        <p><strong>Action Needed:</strong> ⚠️ Yes — carry forwards are waiting to be applied.</p>
+    {% elif data.audit.summary.eligible_count == 0 and data.today_status.ran_today %}
+        <p><strong>Action Needed:</strong> No — carry forwards already ran today.</p>
+    {% elif data.audit.summary.eligible_count == 0 %}
+        <p><strong>Action Needed:</strong> No — no eligible carry forwards right now.</p>
+    {% else %}
+        <p><strong>Action Needed:</strong> Review needed.</p>
+    {% endif %}
+
+    <hr>
+
+    <h2>Current Audit</h2>
+    <p>Carry forwards run today:
+        {% if data.today_status.ran_today %}
+            Yes
+        {% else %}
+            No
+        {% endif %}</p>
+    <p>Invoices waiting for carry forward: {{ data.audit.summary.eligible_count }}</p>
+    <p>Total amount if run now: {{ data.total_eligible_amount }}</p>
+
+    <hr>
+
+    <h2>Run Carry Forwards</h2>
+    {% if data.audit.summary.eligible_count > 0 %}
+        <p>{{ data.audit.summary.eligible_count }} invoices are eligible right now.</p>
+
+        <form method="POST" action="/admin/apply-carry-forwards">
+            <input type="hidden" name="confirm" value="APPLY">
+            <input type="hidden" name="mode" value="live">
+            <input type="hidden" name="max_apply" value="100">
+
+            <button type="submit" onclick="return confirm('Apply LIVE carry forwards now?');">Apply LIVE Carry Forwards</button>
+        </form>
+    {% else %}
+        <p>No carry forwards to apply right now.</p>
+    {% endif %}
+
+    <hr>
+
+    <h2>Last Run Summary</h2>
+    <p>Last run: {{ data.today_status.last_run_time }}</p>
+    <p>Carry forwards applied: {{ data.today_status.success_count }}</p>
+    <p>Failed: {{ data.today_status.failed_count }}</p>
+    <p>Skipped: {{ data.today_status.skipped_count }}</p>
+    <p>Total applied: {{ data.today_status.total_amount }}</p>
+
+    <h3>Recent Log Details</h3>
+    <table border="1">
+        <thead>
+            <tr>
+                <th>Time</th>
+                <th>Status</th>
+                <th>Invoice</th>
+                <th>Invoice Item</th>
+                <th>Amount</th>
+                <th>Reason / Error</th>
+            </tr>
+        </thead>
+
+        <tbody>
+            {% for log in data.recent_logs %}
+            <tr>
+                <td>{{ log.created_at }}</td>
+                <td>
+                    {% if log.status == "success" %}
+                        <span class="badge-success">
+                            SUCCESS
+                        </span>
+
+                    {% elif log.status == "skipped" %}
+                        <span class="badge-skipped">
+                            SKIPPED
+                        </span>
+
+                    {% else %}
+                        <span class="badge-failed">
+                            FAILED
+                        </span>
+                    {% endif %}
+                </td>
+                <td>{{ log.invoice_number }}</td>
+                <td>{{ log.invoice_item_id or "-" }}</td>
+                <td>{{ log.amount }}</td>
+                <td>{{ log.reason_or_error or "-" }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+
+    </table>
+
+</body>
+</html>
