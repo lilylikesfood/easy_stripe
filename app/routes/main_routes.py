@@ -12445,6 +12445,7 @@ def create_autopay_checkout_session():
             return {"error": "inspection_price_id is required"}, 400
 
     session_params = {
+        # Tells Stripe: "This checkout page should set up a recurring subscription, not a one-time purchase."
         "mode": "subscription",
         "line_items": [
             {
@@ -12456,12 +12457,18 @@ def create_autopay_checkout_session():
                 "quantity": 1,
             }
         ],
+        # Tells Stripe: "Always ask the customer for a payment method during checkout"
         "payment_method_collection": "always",
         "success_url": "http://localhost:5000/admin/checkout-success?session_id={CHECKOUT_SESSION_ID}",
         "cancel_url": "http://localhost:5000/admin/checkout-cancel",
         "automatic_tax":{
             "enabled": True,
-        }
+        },
+        # Remember which price is which, so checkout_success can tag subscription items correctly without guessing
+        "metadata": {
+            "monthly_price_id": monthly_price_id,
+            "inspection_price_id": inspection_price_id,
+        },
     }
 
     if customer_id:
@@ -12478,6 +12485,7 @@ def create_autopay_checkout_session():
 def checkout_success():
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
+    # request.args is Flask's way of reading whatever came after the ? in the URL — the query parameters
     session_id = request.args.get("session_id")
 
     if not session_id:
@@ -12508,12 +12516,73 @@ def checkout_success():
         metadata=metadata_to_merge,
     )
 
+    # -----------------------------------------------------------
+    # Tag each subscription item using the price->type mapping we stored on the Checkout Session at creation time. 
+    # This works correctly regardless of which Products/Prices were used, with no hardcoded IDs and no metadata guessing.
+    # -----------------------------------------------------------
+    session_metadata= stripe_get(checkout_session, "metadata", {}) or {}
+
+    known_monthly_price_id = stripe_get(session_metadata, "monthly_price_id")
+    known_inspection_price_id = stripe_get(session_metadata, "inspection_price_id")
+
+    subscription_items = stripe.SubscriptionItem.list(
+        subscription=checkout_session.subscription,
+        limit=100,
+    )
+
+    item_tagging_results = []
+
+    for item in subscription_items.auto_paging_iter():
+        subscription_item_id = stripe_get(item, "id")
+
+        price = stripe_get(item, "price", {}) or {}
+        price_id = stripe_get(price, "id")
+
+        if price_id == known_monthly_price_id:
+            intended_item_type = "monthly_service_fee"
+        elif price_id == known_inspection_price_id:
+            intended_item_type = "inspection_fee"
+        else: 
+            intended_item_type = None
+
+        if intended_item_type is None:
+            item_tagging_results.append({
+                "subscription_item_id": subscription_item_id,
+                "price_id": price_id,
+                "status": "unrecognized_price_not_tagged",
+            })
+            continue
+
+        try:
+            stripe.SubscriptionItem.modify(
+                subscription_item_id,
+                metadata={
+                    "item_type": intended_item_type,
+                },
+            )
+
+            item_tagging_results.append({
+                "subscription_item_id": subscription_item_id,
+                "price_id": price_id,
+                "item_type": intended_item_type,
+                "status": "tagged",
+            })
+
+        except Exception as e:
+            item_tagging_results.append({
+                "subscription_item_id": subscription_item_id,
+                "price_id": price_id,
+                "status": "tagging_failed",
+                "error":str(e),
+            })
+
     return {
         "status": "checkout_complete",
         "checkout_session_id": checkout_session.id,
         "customer_id": checkout_session.customer,
         "subscription_id": checkout_session.subscription,
         "payment_status": checkout_session.payment_status,
+        "item_tagging_results": item_tagging_results,
     }
 
 # autopay html
