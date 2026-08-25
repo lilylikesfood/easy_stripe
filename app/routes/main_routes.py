@@ -4894,19 +4894,6 @@ def debug_invoice():
 
     return invoice._to_dict_recursive()
 
-# create a papge for late fee implementation
-@main.route("/admin/late-fee-control")
-def late_fee_control():
-    if not session.get("logged_in"):
-        return redirect("/login")
-    
-    audit_result= find_late_fee_candidates()
-
-    return render_template(
-        "late_fee_control.html",
-        audit= audit_result
-    )
-
 # get_late_fee_dashboard_data
 def get_late_fee_dashboard_data():
     audit_result = find_late_fee_candidates()
