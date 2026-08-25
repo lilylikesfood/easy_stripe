@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
 </head>
 <body>
+    {% include 'partials/nav.html' %}
+
     <h1>Carry Forward Logs</h1>
 
     <p>Total logs: {{ total_logs }}</p>

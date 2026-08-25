@@ -1,0 +1,64 @@
+<style>
+    .sbaa-nav {
+        background: #111827;
+        padding: 12px 20px;
+        margin-bottom: 25px;
+        border-radius: 8px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+        font-family: Arial, sans-serif;
+    }
+
+    .sbaa-nav a {
+        color: #d1d5db;
+        text-decoration: none;
+        padding: 8px 12px;
+        border-radius: 6px;
+        font-size: 14px;
+        font-weight: bold;
+        white-space: nowrap;
+    }
+
+    .sbaa-nav a:hover {
+        background: #1f2937;
+        color: white;
+    }
+
+    .sbaa-nav a.active {
+        background: #2563eb;
+        color: white;
+    }
+
+    .sbaa-nav .sbaa-nav-divider {
+        width: 1px;
+        height: 20px;
+        background: #374151;
+        margin: 0 4px;
+    }
+</style>
+
+<nav class="sbaa-nav">
+    <a href="/billing-dashboard" class="{{ 'active' if request.path == '/billing-dashboard' else '' }}">Billing Dashboard</a>
+
+    <div class="sbaa-nav-divider"></div>
+
+    <a href="/admin/late-fee-dashboard" class="{{ 'active' if request.path == '/admin/late-fee-dashboard' else '' }}">Late Fee Dashboard</a>
+    <a href="/admin/late-fee-logs" class="{{ 'active' if request.path == '/admin/late-fee-logs' else '' }}">Late Fee Logs</a>
+
+    <div class="sbaa-nav-divider"></div>
+
+    <a href="/admin/carry-forward-dashboard" class="{{ 'active' if request.path == '/admin/carry-forward-dashboard' else '' }}">Carry Forward Dashboard</a>
+    <a href="/admin/carry-forward-logs" class="{{ 'active' if request.path == '/admin/carry-forward-logs' else '' }}">Carry Forward Logs</a>
+    <a href="/admin/accounting-carry-forward-report-page" class="{{ 'active' if request.path == '/admin/accounting-carry-forward-report-page' else '' }}">Carry Forward Report</a>
+
+    <div class="sbaa-nav-divider"></div>
+
+    <a href="/admin/billing-increase-logs" class="{{ 'active' if request.path == '/admin/billing-increase-logs' else '' }}">Annual Increase Logs</a>
+
+    <div class="sbaa-nav-divider"></div>
+
+    <a href="/admin/autopay-setup" class="{{ 'active' if request.path == '/admin/autopay-setup' else '' }}">Autopay Setup</a>
+    <a href="/admin/create-autopay-customer-page" class="{{ 'active' if request.path == '/admin/create-autopay-customer-page' else '' }}">New Autopay Customer</a>
+</nav>

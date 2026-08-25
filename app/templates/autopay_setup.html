@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
 </head>
 <body>
+    {% include 'partials/nav.html' %}
+
     <h1>Autopay Setup</h1>
 
     <form method="post" action="/admin/create-autopay-checkout-session">
