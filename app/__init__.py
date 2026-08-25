@@ -34,11 +34,11 @@ def create_app():
     init_stripe(app.config["STRIPE_SECRET_KEY"])  
 
     # imports AFTER app exists
-    # from app.scheduler.scheduler import start_scheduler
+    from app.scheduler.scheduler import start_scheduler
     from app.routes.main_routes import main
 
     app.register_blueprint(main)
 
-    # start_scheduler(app)
+    start_scheduler(app)
 
     return app

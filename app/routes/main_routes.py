@@ -2490,13 +2490,6 @@ def get_previous_late_fee_total_cents(customer_id, source_invoice_id):
         #     and stripe_get(metadata, "source_invoice_id") == source_invoice_id):
         #     total_cents += stripe_get(invoice_item, "amount", 0)
 
-        if stripe_get(metadata, "type") == "late_fee":
-            print(
-                invoice_item["id"],
-                stripe_get(metadata, "source_invoice_id"),
-                invoice_item["amount"]
-            )
-
         if (
             stripe_get(metadata, "type") == "late_fee"
             and stripe_get(metadata, "source_invoice_id") == source_invoice_id
@@ -2537,13 +2530,7 @@ def calculate_compounding_late_fee_cents(invoice):
 
     late_fee_cents = int(round(base_cents * 0.015))
 
-    print("===================================")
-    print("Invoice:", source_invoice_id)
-
-    print("Pretax:", pretax_overdue_amount_cents)
-
-    print("Previous late fee total:", previous_late_fee_total_cents)
-    print("===============================")
+    print(f"Late fee calculated for invoice {source_invoice_id}: pretax={pretax_overdue_amount_cents}, previous_fees={previous_late_fee_total_cents}, new_fee={late_fee_cents}")
 
     return late_fee_cents, base_cents
 
