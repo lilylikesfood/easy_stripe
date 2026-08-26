@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inspection Fee Removal Dashboard</title>
+
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
+</head>
+<body>
+    {% include 'partials/nav.html' %}
+
+    <h1>Inspection Fee Removal Dashboard</h1>
+
+    <h2>Status</h2>
+    {% if data.audit.eligible_count > 0 and not data.today_status.ran_today %}
+        <p><strong>Action Needed:</strong> ⚠️ Yes — inspection fees are waiting to be removed.</p>
+    {% elif data.audit.eligible_count == 0 and data.today_status.ran_today %}
+        <p><strong>Action Needed:</strong> No — removal already ran today.</p>
+    {% elif data.audit.eligible_count == 0 %}
+        <p><strong>Action Needed:</strong> No — no eligible inspection fees right now.</p>
+    {% else %}
+        <p><strong>Action Needed:</strong> Review needed.</p>
+    {% endif %}
+
+    <hr>
+
+    <h2>Current Audit</h2>
+    <p>Removal run today:
+        {% if data.today_status.ran_today %}
+            Yes
+        {% else %}
+            No
+        {% endif %}
+    </p>
+    <p>Subscriptions checked: {{ data.audit.checked_count }}</p>
+    <p>Eligible for removal right now: {{ data.audit.eligible_count }}</p>
+
+    <h3>Classification breakdown</h3>
+    <table border="1" cellpadding="8">
+        <thead>
+            <tr>
+                <th>Classification</th>
+                <th>Count</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for classification, count in data.audit.classification_counts.items() %}
+            <tr>
+                <td>{{ classification }}</td>
+                <td>{{ count }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <hr>
+
+    <h2>Run Removal</h2>
+    {% if data.audit.eligible_count > 0 %}
+        <p>{{ data.audit.eligible_count }} subscriptions are eligible right now.</p>
+
+        <form method="POST" action="/admin/apply-expired-inspection-fees-all">
+            <input type="hidden" name="confirm" value="APPLY">
+            <input type="hidden" name="mode" value="live">
+            <input type="hidden" name="max_apply" value="100">
+
+            <button type="submit" onclick="return confirm('Apply LIVE inspection fee removal now?');">Apply LIVE Removal</button>
+        </form>
+    {% else %}
+        <p>No inspection fees to remove right now.</p>
+    {% endif %}
+
+    <hr>
+
+    <h2>Last Run Summary</h2>
+    <p>Last run: {{ data.today_status.last_run_time or '-' }}</p>
+    <p>Removed: {{ data.today_status.success_count }}</p>
+    <p>Failed: {{ data.today_status.failed_count }}</p>
+
+    <h3>Recent Log Details</h3>
+    <table border="1">
+        <thead>
+            <tr>
+                <th>Time</th>
+                <th>Status</th>
+                <th>Subscription</th>
+                <th>Inspection Item</th>
+                <th>Reason / Error</th>
+            </tr>
+        </thead>
+
+        <tbody>
+            {% for log in data.recent_logs %}
+            <tr>
+                <td>{{ log.created_at }}</td>
+                <td>
+                    {% if log.status == "success" %}
+                        <span class="badge-success">SUCCESS</span>
+                    {% else %}
+                        <span class="badge-failed">FAILED</span>
+                    {% endif %}
+                </td>
+                <td>{{ log.subscription_id }}</td>
+                <td>{{ log.inspection_item_id or "-" }}</td>
+                <td>{{ log.reason_or_error }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+</body>
+</html>

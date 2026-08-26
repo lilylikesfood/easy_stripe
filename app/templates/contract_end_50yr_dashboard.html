@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>50-Year Contract End Dashboard</title>
+
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
+</head>
+<body>
+    {% include 'partials/nav.html' %}
+
+    <h1>50-Year Contract End Dashboard</h1>
+
+    <h2>Status</h2>
+    {% if data.audit.eligible_count > 0 and not data.today_status.ran_today %}
+        <p><strong>Action Needed:</strong> ⚠️ Yes — contracts are waiting to be ended.</p>
+    {% elif data.audit.eligible_count == 0 and data.today_status.ran_today %}
+        <p><strong>Action Needed:</strong> No — this already ran today.</p>
+    {% elif data.audit.eligible_count == 0 %}
+        <p><strong>Action Needed:</strong> No — no eligible contracts right now.</p>
+    {% else %}
+        <p><strong>Action Needed:</strong> Review needed.</p>
+    {% endif %}
+
+    <hr>
+
+    <h2>Current Audit</h2>
+    <p>Contract-end run today:
+        {% if data.today_status.ran_today %}
+            Yes
+        {% else %}
+            No
+        {% endif %}
+    </p>
+    <p>Subscriptions checked: {{ data.audit.checked_count }}</p>
+    <p>Eligible for contract-end right now: {{ data.audit.eligible_count }}</p>
+
+    <h3>Classification breakdown</h3>
+    <table border="1" cellpadding="8">
+        <thead>
+            <tr>
+                <th>Classification</th>
+                <th>Count</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for classification, count in data.audit.classification_counts.items() %}
+            <tr>
+                <td>{{ classification }}</td>
+                <td>{{ count }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <hr>
+
+    <h2>Run Contract End</h2>
+    {% if data.audit.eligible_count > 0 %}
+        <p>{{ data.audit.eligible_count }} subscriptions are eligible right now.</p>
+
+        <p style="color: #dc2626; font-weight: bold;">
+            This permanently cancels {{ data.audit.eligible_count }} Stripe subscription(s). This cannot be undone from this page.
+        </p>
+
+        <form method="POST" action="/admin/apply-contract-end-50yr-all" id="contract-end-form">
+            <input type="hidden" name="confirm" value="APPLY">
+            <input type="hidden" name="mode" value="live">
+            <input type="hidden" name="max_apply" value="100">
+
+            <div style="margin-bottom: 12px;">
+                <label for="confirm-phrase">
+                    Type <strong>END CONTRACTS</strong> to confirm:
+                </label>
+                <br>
+                <input
+                    type="text"
+                    id="confirm-phrase"
+                    autocomplete="off"
+                    style="padding: 8px; font-size: 14px; width: 220px; margin-top: 6px;"
+                >
+            </div>
+
+            <button type="submit" id="contract-end-submit-button" disabled>
+                Apply LIVE Contract End
+            </button>
+        </form>
+
+        <script>
+            const confirmPhraseInput = document.getElementById("confirm-phrase");
+            const submitButton = document.getElementById("contract-end-submit-button");
+            const requiredPhrase = "END CONTRACTS";
+
+            confirmPhraseInput.addEventListener("input", function () {
+                if (confirmPhraseInput.value === requiredPhrase) {
+                    submitButton.disabled = false;
+                } else {
+                    submitButton.disabled = true;
+                }
+            });
+
+            document.getElementById("contract-end-form").addEventListener("submit", function (event) {
+                if (confirmPhraseInput.value !== requiredPhrase) {
+                    event.preventDefault();
+                    alert("Please type the exact confirmation phrase.");
+                }
+            });
+        </script>
+    {% else %}
+        <p>No contracts to end right now.</p>
+    {% endif %}
+
+    <hr>
+
+    <h2>Last Run Summary</h2>
+    <p>Last run: {{ data.today_status.last_run_time or '-' }}</p>
+    <p>Ended: {{ data.today_status.success_count }}</p>
+    <p>Failed: {{ data.today_status.failed_count }}</p>
+
+    <h3>Recent Log Details</h3>
+    <table border="1">
+        <thead>
+            <tr>
+                <th>Time</th>
+                <th>Status</th>
+                <th>Subscription</th>
+                <th>Reason / Error</th>
+            </tr>
+        </thead>
+
+        <tbody>
+            {% for log in data.recent_logs %}
+            <tr>
+                <td>{{ log.created_at }}</td>
+                <td>
+                    {% if log.status == "success" %}
+                        <span class="badge-success">SUCCESS</span>
+                    {% else %}
+                        <span class="badge-failed">FAILED</span>
+                    {% endif %}
+                </td>
+                <td>{{ log.subscription_id }}</td>
+                <td>{{ log.reason_or_error }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+</body>
+</html>

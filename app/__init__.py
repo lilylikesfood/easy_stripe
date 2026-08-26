@@ -28,6 +28,8 @@ def create_app():
     from app.models.schedule_repair_log import ScheduleRepairLog
     from app.models.late_fee_log import LateFeeLog
     from app.models.carry_forward_log import CarryForwardLog
+    from app.models.inspection_fee_removal_log import InspectionFeeRemovalLog
+    from app.models.contract_end_50yr_log import ContractEnd50yrLog
 
     migrate.init_app(app, db)
 

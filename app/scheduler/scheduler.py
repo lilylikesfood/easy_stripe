@@ -26,6 +26,8 @@ job_lock= Lock()
 
 # Lock(): preventing two copies of the same job from running at once
 overdue_billing_job_lock = Lock()
+inspection_fee_removal_job_lock = Lock()
+contract_end_50yr_job_lock = Lock()
 
 # scheduler runs daily
 # logic runs only on June 1
@@ -157,6 +159,120 @@ def start_scheduler(app):
 
                 print(f"OVERDUE BILLING JOB FINISHED: {run_id}")
 
+    def inspection_fee_removal_job_wrapper():
+        with inspection_fee_removal_job_lock:
+            with app.app_context():
+                # Import here (inside the function), not at the top of
+                # the file, to avoid circular imports between
+                # scheduler.py and main_routes.py
+                from app.routes.main_routes import (
+                    find_expired_inspection_fee_candidates,
+                    apply_expired_inspection_fee_internal,
+                    create_inspection_fee_removal_log_from_result,
+                    is_live_mode,
+                )
+                from app.extensions import db
+
+                run_id = str(uuid.uuid4())
+
+                print(f"INSPECTION FEE REMOVAL JOB STARTED: {run_id}")
+
+                mode = "live" if is_live_mode() else "test"
+
+                audit_result = find_expired_inspection_fee_candidates()
+                candidates = [
+                    candidate
+                    for candidate in audit_result["candidates"]
+                    if candidate["safe_to_apply"] is True
+                ]
+
+                for candidate in candidates:
+                    try:
+                        result = apply_expired_inspection_fee_internal(
+                            candidate["subscription_id"],
+                            mode,
+                        )
+
+                        log = create_inspection_fee_removal_log_from_result(run_id, result)
+
+                        if log:
+                            db.session.add(log)
+
+                    except Exception as e:
+                        from app.models.inspection_fee_removal_log import InspectionFeeRemovalLog
+
+                        log = InspectionFeeRemovalLog(
+                            run_id=run_id,
+                            subscription_id=candidate["subscription_id"],
+                            customer_id=candidate.get("customer_id"),
+                            inspection_item_id=candidate.get("inspection_item_id"),
+                            status="failed",
+                            reason=None,
+                            error=str(e),
+                            created_at=datetime.now(timezone.utc),
+                            livemode=is_live_mode(),
+                        )
+                        db.session.add(log)
+
+                db.session.commit()
+
+                print(f"INSPECTION FEE REMOVAL JOB FINISHED: {run_id}")
+
+    def contract_end_50yr_job_wrapper():
+        with contract_end_50yr_job_lock:
+            with app.app_context():
+                from app.routes.main_routes import (
+                    find_contract_end_50yr_candidates,
+                    apply_contract_end_50yr_internal,
+                    create_contract_end_50yr_log_from_result,
+                    is_live_mode,
+                )
+                from app.extensions import db
+
+                run_id = str(uuid.uuid4())
+
+                print(f"CONTRACT END 50YR JOB STARTED: {run_id}")
+
+                mode = "live" if is_live_mode() else "test"
+
+                audit_result = find_contract_end_50yr_candidates()
+                candidates = [
+                    candidate
+                    for candidate in audit_result["candidates"]
+                    if candidate["safe_to_apply"] is True
+                ]
+
+                for candidate in candidates:
+                    try:
+                        result = apply_contract_end_50yr_internal(
+                            candidate["subscription_id"],
+                            mode,
+                        )
+
+                        log = create_contract_end_50yr_log_from_result(run_id, result)
+
+                        if log:
+                            db.session.add(log)
+
+                    except Exception as e:
+                        from app.models.contract_end_50yr_log import ContractEnd50yrLog
+
+                        log = ContractEnd50yrLog(
+                            run_id=run_id,
+                            subscription_id=candidate["subscription_id"],
+                            customer_id=candidate.get("customer_id"),
+                            status="failed",
+                            reason=None,
+                            error=str(e),
+                            created_at=datetime.now(timezone.utc),
+                            livemode=is_live_mode(),
+                        )
+                        db.session.add(log)
+
+                db.session.commit()
+
+                print(f"CONTRACT END 50YR JOB FINISHED: {run_id}")
+
     print("SCHEDULER PID:", os.getpid())
 
     # Annual 3% price increase — runs once a year
@@ -185,6 +301,30 @@ def start_scheduler(app):
         # trigger="interval",
         # seconds=20,
         id="overdue_billing_job",
+    )
+
+    # Daily inspection fee removal — runs every day at 1:00 AM
+    scheduler.add_job(
+        func=inspection_fee_removal_job_wrapper,
+        trigger="cron",
+        hour=1,
+        minute=0,
+        # testing
+        # trigger="interval",
+        # seconds=20,
+        id="inspection_fee_removal_job",
+    )
+
+    # Daily 50-year contract end — runs every day at 1:30 AM
+    scheduler.add_job(
+        func=contract_end_50yr_job_wrapper,
+        trigger="cron",
+        hour=1,
+        minute=30,
+        # testing
+        # trigger="interval",
+        # seconds=20,
+        id="contract_end_50yr_job",
     )
 
     print("REGISTERED JOBS:", scheduler.get_jobs())

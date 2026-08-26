@@ -42,6 +42,9 @@ import json
 
 import time
 
+from app.models.inspection_fee_removal_log import InspectionFeeRemovalLog
+from app.models.contract_end_50yr_log import ContractEnd50yrLog
+
 main = Blueprint("main", __name__)
 
 # If that condition is true, we return True immediately — meaning "treat this person as logged in."
@@ -11274,6 +11277,16 @@ def apply_expired_inspection_fee_one(subscription_id):
 
     result = apply_expired_inspection_fee_internal(subscription_id, mode)
 
+    run_id = str(uuid.uuid4())
+
+    log = create_inspection_fee_removal_log_from_result(run_id, result)
+
+    if log:
+        db.session.add(log)
+        db.session.commit()
+
+    result["run_id"] = run_id
+
     return result
 
 @main.route("/admin/create-expired-inspection-fee-test-subscription", methods=["POST"])
@@ -11608,6 +11621,11 @@ def apply_expired_inspection_fees_all():
             )
             results.append(result)
 
+            log = create_inspection_fee_removal_log_from_result(run_id, result)
+
+            if log:
+                db.session.add(log)
+
             if result.get("success"):
                 success_count += 1
             else:
@@ -11615,12 +11633,32 @@ def apply_expired_inspection_fees_all():
 
         except Exception as e:
             failed_count += 1
-            results.append({
+
+            error_result = {
                 "subscription_id": candidate["subscription_id"],
                 "success": False,
                 "status": "failed",
                 "error": str(e),
-            })
+            }
+
+            results.append(error_result)
+
+            log = InspectionFeeRemovalLog(
+                run_id=run_id,
+                subscription_id=candidate["subscription_id"],
+                customer_id=candidate.get("customer_id"),
+                inspection_item_id=candidate.get("inspection_item_id"),
+                status="failed",
+                reason=None,
+                error=str(e),
+                created_at=datetime.now(timezone.utc),
+                livemode=is_live_mode(),
+            )
+
+            db.session.add(log)
+            db.session.commit()
+
+    db.session.commit()
 
     return {
         "run_id": run_id,
@@ -13068,6 +13106,16 @@ def apply_contract_end_50yr_one(subscription_id):
 
     result = apply_contract_end_50yr_internal(subscription_id, mode)
 
+    run_id = str(uuid.uuid4())
+
+    log = create_contract_end_50yr_log_from_result(run_id, result)
+
+    if log:
+        db.session.add(log)
+        db.session.commit()
+
+    result["run_id"] = run_id
+
     return result
 
 
@@ -13160,6 +13208,11 @@ def apply_contract_end_50yr_all():
             )
             results.append(result)
 
+            log = create_contract_end_50yr_log_from_result(run_id, result)
+
+            if log:
+                db.session.add(log)
+
             if result.get("success"):
                 success_count += 1
             else:
@@ -13167,12 +13220,31 @@ def apply_contract_end_50yr_all():
 
         except Exception as e:
             failed_count += 1
-            results.append({
+
+            error_result = {
                 "subscription_id": candidate["subscription_id"],
                 "success": False,
                 "status": "failed",
                 "error": str(e),
-            })
+            }
+
+            results.append(error_result)
+
+            log = ContractEnd50yrLog(
+                run_id=run_id,
+                subscription_id=candidate["subscription_id"],
+                customer_id=candidate.get("customer_id"),
+                status="failed",
+                reason=None,
+                error=str(e),
+                created_at=datetime.now(timezone.utc),
+                livemode=is_live_mode(),
+            )
+
+            db.session.add(log)
+            db.session.commit()
+
+    db.session.commit()
 
     return {
         "run_id": run_id,
@@ -13430,5 +13502,338 @@ def carry_forward_dashboard():
 
     return render_template(
         "carry_forward_dashboard.html",
+        data=data
+    )
+
+# ------------------------------inepsction fee and monthly fee removal logging
+# Stages where nothing was actually attempted — classification/validation only.
+# These should never create a log row.
+INSPECTION_FEE_REMOVAL_NON_ATTEMPT_STAGES = {
+    "input_validation",
+    "subscription_retrieval",
+    "pre_write_validation",
+}
+
+def create_inspection_fee_removal_log_from_result(run_id, result):
+    """
+    Build an InspectionFeeRemovalLog row from a result dict returned by
+    apply_expired_inspection_fee_internal().
+
+    Returns None if the result represents a stage where nothing was
+    actually attempted (e.g. not_due_yet, not_applicable) — these should
+    not be logged.
+    """
+
+    stage = result.get("stage")
+
+    if stage in INSPECTION_FEE_REMOVAL_NON_ATTEMPT_STAGES:
+        return None
+
+    status = "success" if result.get("success") else "failed"
+
+    log = InspectionFeeRemovalLog(
+        run_id=run_id,
+
+        subscription_id=result.get("subscription_id"),
+        customer_id=result.get("customer_id"),
+        inspection_item_id=result.get("inspection_item_id"),
+
+        status=status,
+        reason=result.get("reason"),
+        error=result.get("error"),
+
+        created_at=datetime.now(timezone.utc),
+        livemode=is_live_mode(),
+    )
+
+    return log
+
+CONTRACT_END_50YR_NON_ATTEMPT_STAGES = {
+    "input_validation",
+    "subscription_retrieval",
+    "pre_write_validation",
+}
+
+def create_contract_end_50yr_log_from_result(run_id, result):
+    """
+    Build a ContractEnd50yrLog row from a result dict returned by
+    apply_contract_end_50yr_internal().
+
+    Returns None if nothing was actually attempted (e.g. not_due_yet,
+    manual_review) — these should not be logged.
+    """
+
+    stage = result.get("stage")
+
+    if stage in CONTRACT_END_50YR_NON_ATTEMPT_STAGES:
+        return None
+
+    status = "success" if result.get("success") else "failed"
+
+    log = ContractEnd50yrLog(
+        run_id=run_id,
+
+        subscription_id=result.get("subscription_id"),
+        customer_id=result.get("customer_id"),
+
+        status=status,
+        reason=result.get("reason"),
+        error=result.get("error"),
+
+        created_at=datetime.now(timezone.utc),
+        livemode=is_live_mode(),
+    )
+
+    return log
+
+def find_expired_inspection_fee_candidates():
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    today = datetime.now(timezone.utc).date()
+
+    billable_statuses = ["active", "past_due", "unpaid"]
+
+    candidates = []
+
+    classification_counts = {
+        "would_remove_inspection_fee": 0,
+        "not_due_yet": 0,
+        "not_applicable": 0,
+        "manual_review": 0,
+        "already_removed": 0,
+    }
+
+    for status in billable_statuses:
+        subscriptions = stripe.Subscription.list(
+            status=status,
+            limit=100,
+            expand=["data.customer"],
+        )
+
+        for subscription in subscriptions.auto_paging_iter():
+            customer = stripe_get(subscription, "customer")
+            customer_description = stripe_get(customer, "description", "")
+
+            result = classify_expired_inspection_fee_subscription(
+                subscription=subscription,
+                customer_description=customer_description,
+                today=today,
+            )
+
+            candidates.append(result)
+
+            classification = result["classification"]
+            classification_counts[classification] = (
+                classification_counts.get(classification, 0) + 1
+            )
+
+    eligible_count = sum(1 for c in candidates if c["safe_to_apply"] is True)
+
+    return {
+        "today": today.isoformat(),
+        "checked_count": len(candidates),
+        "eligible_count": eligible_count,
+        "classification_counts": classification_counts,
+        "candidates": candidates,
+    }
+
+def find_contract_end_50yr_candidates():
+    stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
+
+    today = datetime.now(timezone.utc).date()
+
+    billable_statuses = ["active", "past_due", "unpaid"]
+
+    candidates = []
+
+    classification_counts = {
+        "would_end_contract": 0,
+        "not_due_yet": 0,
+        "manual_review": 0,
+    }
+
+    for status in billable_statuses:
+        subscriptions = stripe.Subscription.list(
+            status=status,
+            limit=100,
+        )
+
+        for subscription in subscriptions.auto_paging_iter():
+            result = classify_contract_end_subscription(
+                subscription=subscription,
+                today=today,
+            )
+
+            candidates.append(result)
+
+            classification = result["classification"]
+            classification_counts[classification] = (
+                classification_counts.get(classification, 0) + 1
+            )
+
+    eligible_count = sum(1 for c in candidates if c["safe_to_apply"] is True)
+
+    return {
+        "today": today.isoformat(),
+        "checked_count": len(candidates),
+        "eligible_count": eligible_count,
+        "classification_counts": classification_counts,
+        "candidates": candidates,
+    }
+
+def get_inspection_fee_removal_dashboard_data():
+    audit_result = find_expired_inspection_fee_candidates()
+
+    run_logs = []
+
+    latest_log = InspectionFeeRemovalLog.query.order_by(
+        InspectionFeeRemovalLog.created_at.desc()
+    ).first()
+
+    if latest_log:
+        run_id = latest_log.run_id
+
+        run_logs = InspectionFeeRemovalLog.query.filter_by(
+            run_id=run_id
+        ).all()
+
+    last_run_time = None
+    last_run_time_toronto = None
+    ran_today = False
+
+    success_count = sum(1 for r in run_logs if r.status == "success")
+    failed_count = sum(1 for r in run_logs if r.status == "failed")
+
+    if latest_log:
+        last_run_time = latest_log.created_at
+
+        if last_run_time.tzinfo is None:
+            last_run_time = last_run_time.replace(tzinfo=timezone.utc)
+
+        last_run_time_toronto = last_run_time.astimezone(TORONTO_TZ)
+
+        now_toronto = datetime.now(TORONTO_TZ).date()
+
+        ran_today = last_run_time_toronto.date() == now_toronto
+
+    recent_logs = []
+
+    for log in run_logs:
+        created_at = log.created_at
+
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+
+        created_at_toronto = created_at.astimezone(TORONTO_TZ)
+
+        recent_logs.append({
+            "created_at": created_at_toronto.strftime("%Y-%m-%d %I:%M %p"),
+            "status": log.status,
+            "subscription_id": log.subscription_id,
+            "inspection_item_id": log.inspection_item_id,
+            "reason_or_error": log.reason or log.error or "-",
+        })
+
+    return {
+        "audit": audit_result,
+        "today_status": {
+            "ran_today": ran_today,
+            "last_run_time": (
+                last_run_time_toronto.strftime("%Y-%m-%d %I:%M %p")
+                if last_run_time_toronto else None
+            ),
+            "success_count": success_count,
+            "failed_count": failed_count,
+        },
+        "recent_logs": recent_logs,
+    }
+
+def get_contract_end_50yr_dashboard_data():
+    audit_result = find_contract_end_50yr_candidates()
+
+    run_logs = []
+
+    latest_log = ContractEnd50yrLog.query.order_by(
+        ContractEnd50yrLog.created_at.desc()
+    ).first()
+
+    if latest_log:
+        run_id = latest_log.run_id
+
+        run_logs = ContractEnd50yrLog.query.filter_by(
+            run_id=run_id
+        ).all()
+
+    last_run_time = None
+    last_run_time_toronto = None
+    ran_today = False
+
+    success_count = sum(1 for r in run_logs if r.status == "success")
+    failed_count = sum(1 for r in run_logs if r.status == "failed")
+
+    if latest_log:
+        last_run_time = latest_log.created_at
+
+        if last_run_time.tzinfo is None:
+            last_run_time = last_run_time.replace(tzinfo=timezone.utc)
+
+        last_run_time_toronto = last_run_time.astimezone(TORONTO_TZ)
+
+        now_toronto = datetime.now(TORONTO_TZ).date()
+
+        ran_today = last_run_time_toronto.date() == now_toronto
+
+    recent_logs = []
+
+    for log in run_logs:
+        created_at = log.created_at
+
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+
+        created_at_toronto = created_at.astimezone(TORONTO_TZ)
+
+        recent_logs.append({
+            "created_at": created_at_toronto.strftime("%Y-%m-%d %I:%M %p"),
+            "status": log.status,
+            "subscription_id": log.subscription_id,
+            "reason_or_error": log.reason or log.error or "-",
+        })
+
+    return {
+        "audit": audit_result,
+        "today_status": {
+            "ran_today": ran_today,
+            "last_run_time": (
+                last_run_time_toronto.strftime("%Y-%m-%d %I:%M %p")
+                if last_run_time_toronto else None
+            ),
+            "success_count": success_count,
+            "failed_count": failed_count,
+        },
+        "recent_logs": recent_logs,
+    }
+
+@main.route("/admin/inspection-fee-removal-dashboard")
+def inspection_fee_removal_dashboard():
+    if not logged_in_or_dev():
+        return redirect("/login")
+
+    data = get_inspection_fee_removal_dashboard_data()
+
+    return render_template(
+        "inspection_fee_removal_dashboard.html",
+        data=data
+    )
+
+@main.route("/admin/contract-end-50yr-dashboard")
+def contract_end_50yr_dashboard():
+    if not logged_in_or_dev():
+        return redirect("/login")
+
+    data = get_contract_end_50yr_dashboard_data()
+
+    return render_template(
+        "contract_end_50yr_dashboard.html",
         data=data
     )
