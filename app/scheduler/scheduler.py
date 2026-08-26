@@ -276,14 +276,14 @@ def start_scheduler(app):
     print("SCHEDULER PID:", os.getpid())
 
     # Annual 3% price increase — runs once a year
-    # Run every day at 00:05 (12:05 AM)server time
+    # Run every day at 6:05 AM server time
     scheduler.add_job(
         func=job_wrapper,
         # Run this job based on a time schedule (like a calendar rule)
         trigger="cron",
         month=6,
         day=1,
-        hour=0,
+        hour=6,
         minute=5,
         id="annual_increase_job",
         # testing
@@ -291,36 +291,36 @@ def start_scheduler(app):
         # seconds=20,
     )
 
-    # Daily late fee + carry forward run — runs every day at 12:30 AM
+    # Daily late fee + carry forward run — runs every day at 7:05 AM
     scheduler.add_job(
         func=overdue_billing_job_wrapper,
         trigger="cron",
-        hour=0,
-        minute=30,
+        hour=7,
+        minute=5,
         # testing
         # trigger="interval",
         # seconds=20,
         id="overdue_billing_job",
     )
 
-    # Daily inspection fee removal — runs every day at 1:00 AM
+    # Daily inspection fee removal — runs every day at 8:05 AM
     scheduler.add_job(
         func=inspection_fee_removal_job_wrapper,
         trigger="cron",
-        hour=1,
-        minute=0,
+        hour=8,
+        minute=5,
         # testing
         # trigger="interval",
         # seconds=20,
         id="inspection_fee_removal_job",
     )
 
-    # Daily 50-year contract end — runs every day at 1:30 AM
+    # Daily 50-year contract end — runs every day at 9:05 AM
     scheduler.add_job(
         func=contract_end_50yr_job_wrapper,
         trigger="cron",
-        hour=1,
-        minute=30,
+        hour=9,
+        minute=5,
         # testing
         # trigger="interval",
         # seconds=20,
