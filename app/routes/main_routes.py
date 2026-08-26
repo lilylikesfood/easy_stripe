@@ -2004,6 +2004,9 @@ def cents_to_money(cents):
 # check invoice item metadata
 @main.route("/admin/debug-invoice-item/<invoice_item_id>")
 def debug_invoice_item(invoice_item_id):
+    if not logged_in_or_dev():
+        return redirect("/login")
+    
     stripe.api_key= current_app.config["STRIPE_SECRET_KEY"]
 
     invoice_item= stripe.InvoiceItem.retrieve(invoice_item_id)
@@ -4888,6 +4891,9 @@ def audit_invoice_due_dates():
 # debug stripe object (not guessing)
 @main.route("/debug-invoice")
 def debug_invoice(): 
+    if not logged_in_or_dev():
+        return redirect("/login")
+    
     invoices= stripe.Invoice.list(limit=1)
 
     invoice= invoices.data[0]
@@ -5226,6 +5232,8 @@ REQUIRED_INSPECTION_METADATA_KEYS = [
 # audit inspection fee
 @main.route("/admin/audit-inspection-fees")
 def audit_inspection_fees(): 
+    if not logged_in_or_dev():
+        return redirect("/login")
 
     subscriptions= stripe.Subscription.list(
         status="active",
@@ -5361,6 +5369,9 @@ def audit_inspection_fees():
 # Show me exactly what I'm about to do before I actually touch customer subscriptions
 @main.route("/admin/preview-inspection-metadata")
 def preview_inspection_metadata():
+    if not logged_in_or_dev():
+        return redirect("/login")
+    
     subscriptions = stripe.Subscription.list(
         status="active",
         limit=100,
@@ -5423,6 +5434,9 @@ def preview_inspection_metadata():
 # summary of preview for weird results
 @main.route("/admin/preview-inspection-metadata-summary")
 def preview_inspection_metadata_summary():
+    if not logged_in_or_dev():
+        return redirect("/login")
+    
     subscriptions = stripe.Subscription.list(
         status="active",
         limit=100,
@@ -5497,6 +5511,9 @@ def preview_inspection_metadata_summary():
 # categorize weird cases
 @main.route("/admin/preview-inspection-weird-categories")
 def preview_inspection_weird_categories():
+    if not logged_in_or_dev():
+        return redirect("/login")
+    
     subscriptions = stripe.Subscription.list(
         status="active",
         limit=100,
@@ -5600,6 +5617,9 @@ def preview_inspection_weird_categories():
 # CSV report of weird cases
 @main.route("/admin/export-inspection-weird-cases") 
 def export_inspection_weird_cases():
+    if not logged_in_or_dev():
+        return redirect("/login")
+    
     subscriptions = stripe.Subscription.list(
         status="active",
         limit=100,
@@ -5736,6 +5756,9 @@ def export_inspection_weird_cases():
 # debug-subscription-lifecycle
 @main.route("/admin/debug-subscription-lifecycle/<subscription_id>")
 def debug_subscription_lifecycle(subscription_id):
+    if not logged_in_or_dev():
+        return redirect("/login")
+    
     subscription = stripe.Subscription.retrieve(
         subscription_id,
         expand=["customer", "schedule"]
@@ -5769,6 +5792,9 @@ def debug_subscription_lifecycle(subscription_id):
 # preview-inspection-metadata-apply
 @main.route("/admin/preview-inspection-metadata-apply")
 def preview_inspection_metadata_apply():
+    if not logged_in_or_dev():
+        return redirect("/login")
+    
     subscriptions = stripe.Subscription.list(
         status="active",
         limit=100,
@@ -6716,6 +6742,8 @@ def apply_missing_inspection_metadata():
 # product audit
 @main.route("/admin/audit-products")
 def audit_products(): 
+    if not logged_in_or_dev():
+        return redirect("/login")
 
     products= stripe.Product.list(
         active=True,
@@ -8932,6 +8960,9 @@ def debug_subscription_item(subscription_item_id):
 # Preview migration from fixed subscription endings to open-ended ("Forever") subscriptions
 @main.route("/admin/preview-contract-end-migration", methods=["GET"])
 def preview_contract_end_migration():
+    if not logged_in_or_dev():
+        return redirect("/login")
+    
     """
     READ-ONLY preview.
 
@@ -9565,6 +9596,9 @@ def preview_contract_end_migration():
 # than a simple one-phase cancel schedule
 @main.route("/admin/audit-manual-review-schedules", methods=["GET"])
 def audit_manual_review_schedules():
+    if not logged_in_or_dev():
+        return redirect("/login")
+    
     """
     READ-ONLY audit.
 
@@ -10823,6 +10857,9 @@ def classify_expired_inspection_fee_subscription(subscription, customer_descript
 # Preview route of inspection fee
 @main.route("/admin/preview-expired-inspection-fees")
 def preview_expired_inspection_fees():
+    if not logged_in_or_dev():
+        return redirect("/login")
+    
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
     target_subscription_id = request.args.get("subscription_id")
@@ -11962,6 +11999,9 @@ def create_carry_forward_tax_test_data():
 
 @main.route("/admin/preview-carry-forward-one/<invoice_id>")
 def preview_carry_forward_one(invoice_id):
+    if not logged_in_or_dev():
+        return redirect("/login")
+    
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
     try:
@@ -12383,6 +12423,9 @@ def preview_payment_reminders():
 # run it once for investigation, not as part of normal reminder workflow cuz paid could potentially contain thousands of invoices
 @main.route("/admin/debug-invoice-status-counts", methods=["GET"])
 def debug_invoice_status_counts():
+    if not logged_in_or_dev():
+        return redirect("/login")
+    
     stripe.api_key = current_app.config["STRIPE_SECRET_KEY"]
 
     statuses = [
