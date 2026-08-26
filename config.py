@@ -14,3 +14,5 @@ class Config:
     STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 
     STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+    WTF_CSRF_ENABLED = os.getenv("DISABLE_CSRF_FOR_DEV") != "true"

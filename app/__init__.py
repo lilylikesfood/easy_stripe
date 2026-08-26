@@ -10,6 +10,10 @@ import os
 
 from dotenv import load_dotenv
 
+from flask_wtf import CSRFProtect
+
+csrf = CSRFProtect()
+
 load_dotenv()
 
 def create_app():
@@ -21,6 +25,8 @@ def create_app():
     app.secret_key = os.getenv("SECRET_KEY", "dev-key")
 
     db.init_app(app)
+
+    csrf.init_app(app)
 
     # A database model should not depend on whether a web route happens to use it.
     from app.models.billing_log import BillingIncreaseLog

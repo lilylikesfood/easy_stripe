@@ -42,6 +42,7 @@
         <p>{{ data.audit.summary.eligible_count }} invoices are eligible right now. </p>
 
         <form method="POST" action="/admin/apply-late-fees">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input type="hidden" name="confirm" value="APPLY">
             <input type="hidden" name="mode" value="live">
             <input type="hidden" name="redirect_to_dashboard" value="true">

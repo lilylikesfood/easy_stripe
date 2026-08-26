@@ -42,6 +42,7 @@
         <p>{{ data.audit.summary.eligible_count }} invoices are eligible right now.</p>
 
         <form method="POST" action="/admin/apply-carry-forwards">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input type="hidden" name="confirm" value="APPLY">
             <input type="hidden" name="mode" value="live">
             <input type="hidden" name="max_apply" value="100">
